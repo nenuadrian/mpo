@@ -221,13 +221,45 @@ def evaluate_policy(policy: GaussianPolicy, env, device, n_eval_episodes: int = 
     return returns
 
 
+def checkpoint(
+    checkpoint_dir: str,
+    episode: int,
+    global_step: int,
+    q: QNetwork,
+    q_target: QNetwork,
+    pi: GaussianPolicy,
+    pi_old: GaussianPolicy,
+    q_optimizer: torch.optim.Optimizer,
+    pi_optimizer: torch.optim.Optimizer,
+):
+    try:
+        checkpoint = {
+            "episode": episode + 1,
+            "global_step": global_step,
+            "q_state_dict": q.state_dict(),
+            "q_target_state_dict": q_target.state_dict(),
+            "pi_state_dict": pi.state_dict(),
+            "pi_old_state_dict": pi_old.state_dict(),
+            "q_optimizer_state_dict": q_optimizer.state_dict(),
+            "pi_optimizer_state_dict": pi_optimizer.state_dict(),
+        }
+        ckpt_path = os.path.join(checkpoint_dir, f"checkpoint_ep{episode+1}.pt")
+        torch.save(checkpoint, ckpt_path)
+        # overwrite latest for convenience
+        torch.save(checkpoint, os.path.join(checkpoint_dir, "checkpoint_latest.pt"))
+    except Exception as e:
+        # keep training even if checkpointing fails
+        print(f"[Checkpoint] failed to save checkpoint: {e}")
+
+
 def train_mpo(config: MPOConfig, device: torch.device, writer: SummaryWriter):
+    checkpoint_dir = os.path.join(config.log_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     eta = config.eta
 
     env = gymnasium.make("HalfCheetah-v5")
-    env.reset(seed=config.seed)
 
-    # create a separate eval env to avoid interfering with training env state
     eval_env = gymnasium.make("HalfCheetah-v5")
     eval_env.reset(seed=config.seed + 1007)
 
@@ -261,130 +293,128 @@ def train_mpo(config: MPOConfig, device: torch.device, writer: SummaryWriter):
         gamma=0.99,
         device=device,
     )
+    obs, _ = env.reset(seed=config.seed)
+    obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+
+    while len(replay_buffer) < config.min_replay_size:
+        with torch.no_grad():
+            action_tensor, _ = pi_old.sample(obs)
+            action = action_tensor.cpu().numpy()[0]
+        next_obs, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
+        replay_buffer.push(obs.cpu().numpy()[0], action, reward, done, 0.0, next_obs)
+
+        if done:
+            next_obs, _ = env.reset()
+        obs = torch.tensor(next_obs, dtype=torch.float32, device=device).unsqueeze(0)
+
+    print("[Warmup] Done.")
+
     global_step = 0
     for episode in range(config.num_training_episodes):
         print("[Train] Starting episode %d ..." % (episode + 1))
         writer.add_scalar("info/episode", episode, global_step)
-        obs = torch.tensor(
-            env.reset()[0], dtype=torch.float32, device=device
-        ).unsqueeze(0)
+
+        obs, _ = env.reset()
+        obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         done = False
         ep_return = 0.0
-        # start timer for this episode
         start_time = time.time()
+
         while not done:
-            global_step += 1
-            action = None
             with torch.no_grad():
                 action_tensor, _ = pi_old.sample(obs)
                 action = action_tensor.cpu().numpy()[0]
-            next_states, reward, terminated, truncated, _ = env.step(action)
-            ep_return += float(reward)
+            next_obs, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
+            ep_return += float(reward)
+
             replay_buffer.push(
-                obs.cpu().numpy()[0],
-                action,
-                reward,
-                done,
-                0.0,
-                next_states,
+                obs.cpu().numpy()[0], action, reward, done, 0.0, next_obs
             )
-            obs = torch.tensor(
-                next_states, dtype=torch.float32, device=device
-            ).unsqueeze(0)
+            global_step += 1
 
-            # Trigger training when replay has enough data
-            if len(replay_buffer) >= config.min_replay_size:
-                print(
-                    "[Train] Replay buffer batch of %d ..." % (config.min_replay_size)
+            obs = torch.tensor(next_obs, dtype=torch.float32, device=device).unsqueeze(
+                0
+            )
+            # Run a block of optimization steps (each step samples a mini-batch)
+            for opt_iter in range(config.num_optimization_steps):
+                # Sample a mini-batch B of N (s, a, r) pairs from replay
+                states, acts, rewards, dones, next_states, logp_mu = (
+                    replay_buffer.sample(config.batch_size)
                 )
-                # Run a block of optimization steps (each step samples a mini-batch)
-                for opt_iter in range(config.num_optimization_steps):
 
-                    # Sample a mini-batch B of N (s, a, r) pairs from replay
-                    states, acts, rewards, dones, next_states, logp_mu = (
-                        replay_buffer.sample(config.batch_size)
-                    )
+                q_sa = q(states, acts)
 
-                    q_sa = q(states, acts)
+                with torch.no_grad():
+                    next_actions, _ = pi.sample(next_states)
+                    q_next = q_target(next_states, next_actions)
+                    target_q = rewards + 0.99 * (1.0 - dones) * q_next
 
-                    with torch.no_grad():
-                        next_actions, _ = pi.sample(next_states)
-                        q_next = q_target(next_states, next_actions)
-                        target_q = rewards + 0.99 * (1.0 - dones) * q_next
+                loss_q = F.mse_loss(q_sa, target_q)
 
-                    loss_q = F.mse_loss(q_sa, target_q)
+                q_optimizer.zero_grad()
+                loss_q.backward()
+                q_optimizer.step()
 
-                    q_optimizer.zero_grad()
-                    loss_q.backward()
-                    q_optimizer.step()
+                for tp, p in zip(q_target.parameters(), q.parameters()):
+                    tp.data.mul_(1.0 - config.tau).add_(config.tau * p.data)
 
-                    for tp, p in zip(q_target.parameters(), q.parameters()):
-                        tp.data.mul_(1.0 - config.tau).add_(config.tau * p.data)
+                # Use E-step that can solve for eta (dual) robustly
+                actions_e, q_dist, kl_np, eta = policy_evaluation_e_step(
+                    states,
+                    pi_old,
+                    q,
+                    config.num_candidate_actions,
+                    eta=eta,
+                    solve_dual=True,
+                    kl_target=config.kl_epsilon,
+                    eta_bounds=(1e-8, 1e6),
+                    max_iters=50,
+                    tol=1e-4,
+                )
 
-                    # Use E-step that can solve for eta (dual) robustly
-                    actions_e, q_dist, kl_np, eta = policy_evaluation_e_step(
-                        states,
-                        pi_old,
-                        q,
-                        config.num_candidate_actions,
-                        eta=eta,
-                        solve_dual=True,
-                        kl_target=config.kl_epsilon,
-                        eta_bounds=(1e-8, 1e6),
-                        max_iters=50,
-                        tol=1e-4,
-                    )
+                pi_loss = policy_evaluation_m_step(
+                    pi,
+                    states,
+                    actions_e,
+                    q_dist,
+                    entropy_coeff=config.entropy_coeff,
+                )
 
-                    pi_loss = policy_evaluation_m_step(
-                        pi,
-                        states,
-                        actions_e,
-                        q_dist,
-                        entropy_coeff=config.entropy_coeff,
-                    )
+                pi_optimizer.zero_grad()
+                pi_loss.backward()
+                pi_optimizer.step()
 
-                    pi_optimizer.zero_grad()
-                    pi_loss.backward()
-                    pi_optimizer.step()
-
-                writer.add_scalar("loss/loss_q", loss_q.item(), global_step)
-                writer.add_scalar("info/kl_np", kl_np, global_step)
-                writer.add_scalar("info/eta", eta, global_step)
-                writer.add_scalar("loss/pi_loss", pi_loss.item(), global_step)
-            if config.policy_old_sync_frequency > 0:
-                if global_step % config.policy_old_sync_frequency == 0:
-                    pi_old.load_state_dict(pi.state_dict())
-                    writer.add_scalar("info/policy_old_synced", 1.0, global_step)
-                else:
-                    writer.add_scalar("info/policy_old_synced", 0.0, global_step)
+            writer.add_scalar("loss/loss_q", loss_q.item(), global_step)
+            writer.add_scalar("info/kl_np", kl_np, global_step)
+            writer.add_scalar("info/eta", eta, global_step)
+            writer.add_scalar("loss/pi_loss", pi_loss.item(), global_step)
+        if config.policy_old_sync_frequency > 0:
+            if global_step % config.policy_old_sync_frequency == 0:
+                pi_old.load_state_dict(pi.state_dict())
+                writer.add_scalar("info/policy_old_synced", 1.0, global_step)
+            else:
+                writer.add_scalar("info/policy_old_synced", 0.0, global_step)
 
         episode_duration = time.time() - start_time
-        writer.add_scalar("time/episode_duration", episode_duration, global_step)
+        writer.add_scalar("time/ep_duration", episode_duration, global_step)
         writer.add_scalar("rewards/ep_return", ep_return, global_step)
         print(
-            f"[Train] episode={episode+1} global_step={global_step} ep_return={ep_return:.3f} duration={episode_duration:.3f}s"
+            f"[Train] episode={episode+1} global_step={global_step} ep_return={ep_return:.3f} ep_duration={episode_duration:.3f}s"
         )
 
-        try:
-            checkpoint = {
-                "episode": episode + 1,
-                "global_step": global_step,
-                "q_state_dict": q.state_dict(),
-                "q_target_state_dict": q_target.state_dict(),
-                "pi_state_dict": pi.state_dict(),
-                "pi_old_state_dict": pi_old.state_dict(),
-                "q_optimizer_state_dict": q_optimizer.state_dict(),
-                "pi_optimizer_state_dict": pi_optimizer.state_dict(),
-            }
-            ckpt_path = os.path.join(checkpoint_dir, f"checkpoint_ep{episode+1}.pt")
-            torch.save(checkpoint, ckpt_path)
-            # overwrite latest for convenience
-            torch.save(checkpoint, os.path.join(checkpoint_dir, "checkpoint_latest.pt"))
-            writer.add_text("info/checkpoint_saved", ckpt_path, global_step)
-        except Exception as e:
-            # keep training even if checkpointing fails
-            print(f"[Checkpoint] failed to save checkpoint: {e}")
+        checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            episode=episode,
+            global_step=global_step,
+            q=q,
+            q_target=q_target,
+            pi=pi,
+            pi_old=pi_old,
+            q_optimizer=q_optimizer,
+            pi_optimizer=pi_optimizer,
+        )
 
         # Periodic evaluation: log to tensorboard, wandb, and console
         if (episode + 1) % config.eval_freq == 0:
