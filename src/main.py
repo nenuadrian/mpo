@@ -284,7 +284,7 @@ def main():
             global_step += 1
             action = None
             with torch.no_grad():
-                action_tensor, _ = pi_old.sample(obs)
+                action_tensor, logp_mu = pi_old.sample(obs)
                 action = action_tensor.cpu().numpy()[0]
             next_states, reward, terminated, truncated, _ = env.step(action)
             ep_return += float(reward)
@@ -294,7 +294,7 @@ def main():
                 action,
                 reward,
                 done,
-                0.0,
+                logp_mu.item(),
                 next_states,
             )
             obs = torch.tensor(
@@ -307,17 +307,44 @@ def main():
                 # Run a block of optimization steps (each step samples a mini-batch)
                 for opt_iter in range(NUM_OPTIMIZATION_STEPS):
                     # Sample a mini-batch B of N (s, a, r) pairs from replay
-                    states, acts, rewards, dones, next_states, logp_mu = (
+                    obs_seq, act_seq, rew_seq, done_seq, next_obs, logp_mu_seq, seq_lens = (
                         replay_buffer.sample(BATCH_SIZE)
                     )
 
-                    q_sa = q(states, acts)
-
                     with torch.no_grad():
-                        next_actions, _ = pi.sample(next_states)
-                        q_next = q_target(next_states, next_actions)
-                        target_q = rewards + 0.99 * (1.0 - dones) * q_next
+                        # [B, T, D_act] -> [B*T, D_act]
+                        flat_obs_seq = obs_seq.view(-1, obs_dim)
+                        flat_act_seq = act_seq.view(-1, act_dim)
+                        flat_logp_pi_seq = pi.log_prob(flat_obs_seq, flat_act_seq)
+                        logp_pi_seq = flat_logp_pi_seq.view(BATCH_SIZE, -1)
 
+                        rho = torch.exp(logp_pi_seq - logp_mu_seq)
+                        c = torch.clamp(rho, max=1.0)
+
+                        # bootstrap from last next_obs
+                        next_a, _ = pi.sample(next_obs)
+                        q_next = q_target(next_obs, next_a)
+                        target_q = q_next
+
+                        # iterate backwards through sequence
+                        for t in reversed(range(replay_buffer.n_step)):
+                            rt = rew_seq[:, t]
+                            ct = c[:, t]
+                            donet = done_seq[:, t]
+
+                            # get Q(s_t, a_t)
+                            qt = q_target(obs_seq[:,t,:], act_seq[:,t,:])
+                            # get V(s_t) by sampling K actions
+                            with torch.no_grad():
+                                next_actions_k, _ = pi.sample(obs_seq[:,t,:].unsqueeze(1).expand(-1, K, -1).reshape(B*K, obs_dim))
+                                q_next_k = q_target(obs_seq[:,t,:].unsqueeze(1).expand(-1, K, -1).reshape(B*K, obs_dim), next_actions_k)
+                                q_next_k = q_next_k.view(B, K, -1)
+                                vt = q_next_k.mean(dim=1)
+
+                            target_q = rt + 0.99 * (1.0 - donet) * (ct * (target_q - qt) + vt).squeeze()
+
+
+                    q_sa = q(obs_seq[:,0,:], act_seq[:,0,:])
                     loss_q = F.mse_loss(q_sa, target_q)
 
                     q_optimizer.zero_grad()
@@ -329,7 +356,7 @@ def main():
 
                     # Use E-step that can solve for eta (dual) robustly
                     actions_e, q_dist, kl_np, eta = policy_evaluation_e_step(
-                        states,
+                        obs_seq[:,0,:],
                         pi_old,
                         q,
                         NUM_CANDIDATE_ACTIONS,
@@ -342,7 +369,7 @@ def main():
                     )
 
                     pi_loss = policy_evaluation_m_step(
-                        pi, states, actions_e, q_dist, entropy_coeff=1e-3
+                        pi, obs_seq[:,0,:], actions_e, q_dist, entropy_coeff=1e-3
                     )
 
                     pi_optimizer.zero_grad()
