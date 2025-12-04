@@ -54,6 +54,7 @@ class MPOConfig:
         self.eval_episodes = eval_episodes
         self.seed = seed
         self.entropy_coeff = entropy_coeff
+        self.env_name = env_name
 
 
 def policy_evaluation_e_step(
