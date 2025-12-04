@@ -112,23 +112,28 @@ def policy_evaluation_e_step(
 
 def policy_evaluation_m_step(
     policy_net: GaussianPolicy,
+    pi_old: GaussianPolicy,
     states: torch.Tensor,
     actions: torch.Tensor,
     weights: torch.Tensor,
-    entropy_coeff: float = 0.0,
+    kl_coeff: float = 1.0,
 ) -> torch.Tensor:
     """
     Continuous-action M-step:
-    Fit pi_theta(a|s) to q(a|s) via weighted log-likelihood.
+    Fit pi_theta(a|s) to q(a|s) via weighted log-likelihood, with KL constraint.
     We compute weighted log-likelihood per state (sum over K) and then average over batch.
     Inputs:
+      policy_net: policy to be optimized
+      pi_old: old policy for KL divergence calculation
       states:  [B, obs_dim]
       actions: [B, K, act_dim]
       weights: [B, K]
+      kl_coeff: coefficient for the KL penalty term
     """
     B, K, act_dim = actions.shape
     obs_dim = states.shape[-1]
 
+    # --- Weighted Log-Likelihood Loss ---
     # Expand and flatten: [B, obs_dim] -> [B, K, obs_dim] -> [B*K, obs_dim]
     states_expanded = states.unsqueeze(1).expand(-1, K, -1).reshape(B * K, obs_dim)
     actions_flat = actions.reshape(B * K, act_dim)
@@ -139,21 +144,35 @@ def policy_evaluation_m_step(
     weighted_ll_per_state = (weights.detach() * log_pi_per).sum(dim=1)  # [B]
     loss_pi = -weighted_ll_per_state.mean()
 
-    # Entropy regularization (approximate using pre-tanh Gaussian entropy)
-    if entropy_coeff is not None and entropy_coeff != 0.0:
-        # policy_net.forward returns (mu, log_std) for pre-tanh Gaussian
-        mu, log_std = policy_net(states_expanded)
-        # Entropy per dim of Normal: 0.5 * (1 + log(2*pi)) + log_std
-        ent_const = 0.5 * (
-            1.0
-            + torch.log(
-                torch.tensor(2.0 * math.pi, device=log_std.device, dtype=log_std.dtype)
-            )
+    # --- KL-divergence penalty ---
+    if kl_coeff > 0.0:
+        # Compute KL(pi || pi_old)
+        with torch.no_grad():
+            mu_old, log_std_old = pi_old(states)
+        mu, log_std = policy_net(states)
+
+
+        # For diagonal Gaussians
+        # KL(N || N_old) = 0.5 * [ log(det(Cov_old)/det(Cov)) - d + tr(Cov_old^-1 * Cov) + (mu_old-mu)^T Cov_old^-1 (mu_old-mu) ]
+        std = torch.exp(log_std)
+        std_old = torch.exp(log_std_old)
+        var = std.pow(2)
+        var_old = std_old.pow(2)
+
+        log_det_cov_old = 2 * log_std_old.sum(dim=-1)
+        log_det_cov = 2 * log_std.sum(dim=-1)
+
+        trace_term = (var / var_old).sum(dim=-1)
+
+        mu_diff_sq = (mu_old - mu).pow(2)
+        mahalanobis_term = (mu_diff_sq / var_old).sum(dim=-1)
+
+        kl_div = 0.5 * (
+            log_det_cov_old - log_det_cov - act_dim + trace_term + mahalanobis_term
         )
-        ent_per_dim = ent_const + log_std
-        ent = ent_per_dim.sum(dim=-1).mean()  # scalar
-        entropy_bonus = -entropy_coeff * ent
-        loss_pi = loss_pi + entropy_bonus
+
+        kl_penalty = kl_coeff * kl_div.mean()
+        loss_pi += kl_penalty
 
     return loss_pi
 
@@ -184,12 +203,14 @@ def evaluate_policy(policy: GaussianPolicy, env, device, n_eval_episodes: int = 
 
 
 def main():
-    args = argparse.ArgumentParser().parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_training_episodes", type=int, default=1000)
+    args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # MPO / training hyper-parameters (descriptive names matching MPO paper)
     BATCH_SIZE = 64  # B: mini-batch size used for sampled updates
-    NUM_TRAINING_EPISODES = 1000  # total episodes to run
+    NUM_TRAINING_EPISODES = args.num_training_episodes
     NUM_CANDIDATE_ACTIONS = 4  # K: candidate actions sampled per state in E-step
     MIN_REPLAY_SIZE = 100  # minimum number of stored transitions before training
     NUM_OPTIMIZATION_STEPS = (
@@ -211,25 +232,6 @@ def main():
     eval_freq = 10  # run evaluations every `eval_freq` training episodes
     eval_episodes = 5  # number of eval episodes per evaluation
 
-    wandb.init(
-        project="mpo_project",
-        config={
-            "batch_size": BATCH_SIZE,
-            "num_training_episodes": NUM_TRAINING_EPISODES,
-            "num_candidate_actions": NUM_CANDIDATE_ACTIONS,
-            "min_replay_size": MIN_REPLAY_SIZE,
-            "num_optimization_steps": NUM_OPTIMIZATION_STEPS,
-            "q_lr": q_lr,
-            "pi_lr": pi_lr,
-            "tau": tau,
-            "dual_lr": dual_lr,
-            "kl_epsilon": kl_epsilon,
-            "seed": seed,
-            "eval_freq": eval_freq,
-            "eval_episodes": eval_episodes,
-        },
-        sync_tensorboard=True,
-    )
     writer = SummaryWriter(log_dir)
 
     env = gymnasium.make("HalfCheetah-v5")
@@ -284,7 +286,7 @@ def main():
             global_step += 1
             action = None
             with torch.no_grad():
-                action_tensor, _ = pi_old.sample(obs)
+                action_tensor, logp_mu = pi_old.sample(obs)
                 action = action_tensor.cpu().numpy()[0]
             next_states, reward, terminated, truncated, _ = env.step(action)
             ep_return += float(reward)
@@ -294,7 +296,7 @@ def main():
                 action,
                 reward,
                 done,
-                0.0,
+                logp_mu.item(),
                 next_states,
             )
             obs = torch.tensor(
@@ -307,17 +309,48 @@ def main():
                 # Run a block of optimization steps (each step samples a mini-batch)
                 for opt_iter in range(NUM_OPTIMIZATION_STEPS):
                     # Sample a mini-batch B of N (s, a, r) pairs from replay
-                    states, acts, rewards, dones, next_states, logp_mu = (
+                    obs_seq, act_seq, rew_seq, done_seq, next_obs, logp_mu_seq, seq_lens = (
                         replay_buffer.sample(BATCH_SIZE)
                     )
 
-                    q_sa = q(states, acts)
-
                     with torch.no_grad():
-                        next_actions, _ = pi.sample(next_states)
-                        q_next = q_target(next_states, next_actions)
-                        target_q = rewards + 0.99 * (1.0 - dones) * q_next
+                        # [B, T, D_act] -> [B*T, D_act]
+                        flat_obs_seq = obs_seq.view(-1, obs_dim)
+                        flat_act_seq = act_seq.view(-1, act_dim)
+                        flat_logp_pi_seq = pi.log_prob(flat_obs_seq, flat_act_seq)
+                        logp_pi_seq = flat_logp_pi_seq.view(BATCH_SIZE, -1)
 
+                        rho = torch.exp(logp_pi_seq - logp_mu_seq)
+                        c = torch.clamp(rho, max=1.0)
+
+                        # bootstrap from last next_obs
+                        next_a, _ = pi.sample(next_obs)
+                        q_next = q_target(next_obs, next_a)
+                        target_q = q_next
+
+                        # iterate backwards through sequence
+                        for t in reversed(range(replay_buffer.n_step)):
+                            rt = rew_seq[:, t]
+                            ct = c[:, t]
+                            donet = done_seq[:, t]
+
+                            # get Q(s_t, a_t)
+                            qt = q_target(obs_seq[:,t,:], act_seq[:,t,:])
+                            # get V(s_t) by sampling K actions
+                            with torch.no_grad():
+                                B, K, act_dim = act_seq.shape
+                                obs_dim = obs_seq.shape[-1]
+                                next_actions_k, _ = pi.sample(obs_seq[:,t,:].unsqueeze(1).expand(-1, NUM_CANDIDATE_ACTIONS, -1).reshape(B*NUM_CANDIDATE_ACTIONS, obs_dim))
+                                q_next_k = q_target(obs_seq[:,t,:].unsqueeze(1).expand(-1, NUM_CANDIDATE_ACTIONS, -1).reshape(B*NUM_CANDIDATE_ACTIONS, obs_dim), next_actions_k)
+                                q_next_k = q_next_k.view(B, NUM_CANDIDATE_ACTIONS, -1)
+                                vt = q_next_k.mean(dim=1)
+
+                            mask = (t < seq_lens).float()
+                            target_q = rt + 0.99 * (1.0 - donet) * (ct * (target_q - qt) + vt).squeeze()
+                            target_q = mask * target_q + (1.0 - mask) * q_next
+
+
+                    q_sa = q(obs_seq[:,0,:], act_seq[:,0,:])
                     loss_q = F.mse_loss(q_sa, target_q)
 
                     q_optimizer.zero_grad()
@@ -329,7 +362,7 @@ def main():
 
                     # Use E-step that can solve for eta (dual) robustly
                     actions_e, q_dist, kl_np, eta = policy_evaluation_e_step(
-                        states,
+                        obs_seq[:,0,:],
                         pi_old,
                         q,
                         NUM_CANDIDATE_ACTIONS,
@@ -342,7 +375,7 @@ def main():
                     )
 
                     pi_loss = policy_evaluation_m_step(
-                        pi, states, actions_e, q_dist, entropy_coeff=1e-3
+                        pi, pi_old, obs_seq[:,0,:], actions_e, q_dist, kl_coeff=0.1
                     )
 
                     pi_optimizer.zero_grad()
@@ -400,7 +433,6 @@ def main():
             )
 
     writer.close()
-    wandb.finish()
 
 
 if __name__ == "__main__":
