@@ -18,11 +18,12 @@ from q_network import QNetwork
 class MPOConfig:
     def __init__(
         self,
+        env_name="HalfCheetah-v5",
         batch_size=64,
         num_training_episodes=1000,
         num_candidate_actions=4,
         min_replay_size=100,
-        num_optimization_steps=1000,
+        num_optimization_steps_per_step=2,
         q_lr=0.0005,
         pi_lr=0.0005,
         tau=0.005,
@@ -40,7 +41,7 @@ class MPOConfig:
         self.num_training_episodes = num_training_episodes
         self.num_candidate_actions = num_candidate_actions
         self.min_replay_size = min_replay_size
-        self.num_optimization_steps = num_optimization_steps
+        self.num_optimization_steps_per_step = num_optimization_steps_per_step
         self.q_lr = q_lr
         self.pi_lr = pi_lr
         self.tau = tau
@@ -258,9 +259,9 @@ def train_mpo(config: MPOConfig, device: torch.device, writer: SummaryWriter):
 
     eta = config.eta
 
-    env = gymnasium.make("HalfCheetah-v5")
+    env = gymnasium.make(config.env_name)
 
-    eval_env = gymnasium.make("HalfCheetah-v5")
+    eval_env = gymnasium.make(config.env_name)
     eval_env.reset(seed=config.seed + 1007)
 
     obs_dim = env.observation_space.shape[0]
@@ -338,7 +339,7 @@ def train_mpo(config: MPOConfig, device: torch.device, writer: SummaryWriter):
                 0
             )
             # Run a block of optimization steps (each step samples a mini-batch)
-            for opt_iter in range(config.num_optimization_steps):
+            for opt_iter in range(config.num_optimization_steps_per_step):
                 # Sample a mini-batch B of N (s, a, r) pairs from replay
                 states, acts, rewards, dones, next_states, logp_mu = (
                     replay_buffer.sample(config.batch_size)

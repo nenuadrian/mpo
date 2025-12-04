@@ -10,11 +10,12 @@ from algorithm import train_mpo, MPOConfig
 
 def main():
     parser = argparse.ArgumentParser(description="Train MPO")
+    parser.add_argument("--env_name", type=str, default="HalfCheetah-v5")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_training_episodes", type=int, default=1000)
     parser.add_argument("--num_candidate_actions", type=int, default=4)
     parser.add_argument("--min_replay_size", type=int, default=100)
-    parser.add_argument("--num_optimization_steps", type=int, default=1000)
+    parser.add_argument("--num_optimization_steps_per_step", type=int, default=2)
     parser.add_argument("--q_lr", type=float, default=0.0005)
     parser.add_argument("--pi_lr", type=float, default=0.0005)
     parser.add_argument("--tau", type=float, default=0.005)
@@ -31,10 +32,12 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Build MPOConfig from parsed CLI args
     config = MPOConfig(**vars(args))
 
-    # Log all CLI flags to wandb
+    print("Experiment Configuration:")
+    for k, v in vars(args).items():
+        print(f"  {k}: {v}")
+
     wandb.init(project="mpo_project", config=vars(args), sync_tensorboard=True)
     writer = SummaryWriter(config.log_dir)
 
