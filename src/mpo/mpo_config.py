@@ -20,7 +20,9 @@ class MPOConfig:
         seed=42,
         entropy_coeff=1e-3,
         checkpoint_ep_freq=50,
-        e_step_solve_dual=False,
+        e_step_solve_dual=True,
+        pi_max_grad_norm=0.5,
+        q_max_grad_norm=1.0,
         *args,
         **kwargs,
     ):
@@ -43,3 +45,6 @@ class MPOConfig:
         self.entropy_coeff = entropy_coeff
         self.env_name = env_name
         self.checkpoint_ep_freq = checkpoint_ep_freq
+        self.e_step_solve_dual = e_step_solve_dual
+        self.pi_max_grad_norm = pi_max_grad_norm
+        self.q_max_grad_norm = q_max_grad_norm

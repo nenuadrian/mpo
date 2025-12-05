@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 from mpo.gaussian_policy import GaussianPolicy
 from mpo.replay_buffer import NStepReplayBuffer
 from mpo.q_network import QNetwork
-from mpo.utils import evaluate_policy, checkpoint_if_needed
+from mpo.utils import evaluate_policy, checkpoint_if_needed, compute_grad_stats
 from mpo.mpo_config import MPOConfig
 
 
@@ -228,8 +228,6 @@ def train_mpo(
 
     replay_buffer = warmup_replay_buffer(env, device, config, pi_old)
 
-    print("[Warmup] Done.")
-
     global_step = 0
     for episode in range(config.num_training_episodes):
         print("[Train] Starting episode %d ..." % (episode + 1))
@@ -275,6 +273,32 @@ def train_mpo(
 
                 q_optimizer.zero_grad()
                 loss_q.backward()
+
+                q_grad_stats = compute_grad_stats(q.parameters())
+                writer.add_scalar(
+                    "train/grad_norm_q", q_grad_stats["grad_norm"], global_step
+                )
+                writer.add_scalar(
+                    "train/grad_max_q", q_grad_stats["grad_max"], global_step
+                )
+
+                if config.q_max_grad_norm is not None and config.q_max_grad_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(
+                        q.parameters(), config.q_max_grad_norm
+                    )
+
+                q_grad_stats_clipped = compute_grad_stats(q.parameters())
+                writer.add_scalar(
+                    "train/grad_norm_q_clipped",
+                    q_grad_stats_clipped["grad_norm"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/grad_max_q_clipped",
+                    q_grad_stats_clipped["grad_max"],
+                    global_step,
+                )
+
                 q_optimizer.step()
 
                 for tp, p in zip(q_target.parameters(), q.parameters()):
@@ -304,6 +328,33 @@ def train_mpo(
 
                 pi_optimizer.zero_grad()
                 pi_loss.backward()
+
+                pi_grad_stats = compute_grad_stats(pi.parameters())
+                writer.add_scalar(
+                    "train/grad_norm_pi", pi_grad_stats["grad_norm"], global_step
+                )
+                writer.add_scalar(
+                    "train/grad_max_pi", pi_grad_stats["grad_max"], global_step
+                )
+
+                if (
+                    config.pi_max_grad_norm is not None
+                    and config.pi_max_grad_norm > 0.0
+                ):
+                    torch.nn.utils.clip_grad_norm_(
+                        pi.parameters(), config.pi_max_grad_norm
+                    )
+
+                pi_grad_stats_clipped = compute_grad_stats(pi.parameters())
+                writer.add_scalar(
+                    "train/grad_norm_pi_clipped",
+                    pi_grad_stats_clipped["grad_norm"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/grad_max_pi_clipped", pi_grad_stats["grad_max"], global_step
+                )
+
                 pi_optimizer.step()
 
             writer.add_scalar(

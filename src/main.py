@@ -40,6 +40,8 @@ def main():
     parser.add_argument("--entropy_coeff", type=float, default=1e-3)
     parser.add_argument("--e_step_solve_dual", type=bool, default=True)
     parser.add_argument("--checkpoint_ep_freq", type=int, default=50)
+    parser.add_argument("--pi_max_grad_norm", type=float, default=0.5)
+    parser.add_argument("--q_max_grad_norm", type=float, default=1.0)
     parser.add_argument("--wandb_project", type=str, default="mpo_project")
     parser.add_argument("--wandb_entity", type=str, default="adrian-research")
     parser.add_argument("--wandb_group_prefix", type=str, default=None)
@@ -85,7 +87,7 @@ def main():
 
             with open(os.path.join(config.log_dir, "config.json"), "w") as f:
                 json.dump(vars(config), f, indent=4)
-
+            wandb.tensorboard.patch(root_logdir=args.base_log_dir)
             wandb.init(
                 name=experiment_identifier,
                 project=args.wandb_project,

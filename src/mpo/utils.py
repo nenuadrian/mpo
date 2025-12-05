@@ -12,6 +12,30 @@ from mpo.q_network import QNetwork
 from mpo.mpo_config import MPOConfig
 
 
+def compute_grad_stats(params):
+    """Compute L2 grad norm and max-abs grad using torch (returns floats)."""
+    total_sq = None
+    max_abs = None
+    found = False
+    for p in params:
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        g_sq = (g**2).sum()
+        g_max = g.abs().max()
+        if not found:
+            total_sq = g_sq
+            max_abs = g_max
+            found = True
+        else:
+            total_sq = total_sq + g_sq
+            max_abs = torch.max(max_abs, g_max)
+    if not found:
+        return {"grad_norm": 0.0, "grad_max": 0.0}
+    grad_norm = torch.sqrt(total_sq).item()
+    return {"grad_norm": float(grad_norm), "grad_max": float(max_abs.item())}
+
+
 def evaluate_policy(policy: GaussianPolicy, env, device, n_eval_episodes: int = 5):
     """
     Run the policy for n_eval_episodes (stochastic sampling) and return list of episode returns and episode lengths.
