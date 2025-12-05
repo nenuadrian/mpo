@@ -158,6 +158,34 @@ def policy_evaluation_m_step(
     return loss_pi
 
 
+def warmup_replay_buffer(
+    env: gymnasium.Env, min_size: int, device: torch.device, seed: int
+) -> NStepReplayBuffer:
+    replay_buffer = NStepReplayBuffer(
+        capacity=100000,
+        obs_shape=env.observation_space.shape,
+        act_shape=env.action_space.shape,
+        n_step=5,
+        gamma=0.99,
+        device=device,
+    )
+    obs, _ = env.reset(seed=config.seed)
+    obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+
+    while len(replay_buffer) < config.min_replay_size:
+        with torch.no_grad():
+            action_tensor, _ = pi_old.sample(obs)
+            action = action_tensor.cpu().numpy()[0]
+        next_obs, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
+        replay_buffer.push(obs.cpu().numpy()[0], action, reward, done, 0.0, next_obs)
+
+        if done:
+            next_obs, _ = env.reset()
+        obs = torch.tensor(next_obs, dtype=torch.float32, device=device).unsqueeze(0)
+    return replay_buffer
+
+
 def train_mpo(config: MPOConfig, device: torch.device, writer: SummaryWriter):
     checkpoint_dir = os.path.join(config.log_dir, "checkpoints", f"seed_{config.seed}")
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -191,28 +219,9 @@ def train_mpo(config: MPOConfig, device: torch.device, writer: SummaryWriter):
     q_optimizer = torch.optim.Adam(q.parameters(), lr=config.q_lr)
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=config.pi_lr)
 
-    replay_buffer = NStepReplayBuffer(
-        capacity=100000,
-        obs_shape=env.observation_space.shape,
-        act_shape=env.action_space.shape,
-        n_step=5,
-        gamma=0.99,
-        device=device,
+    replay_buffer = warmup_replay_buffer(
+        env, config.min_replay_size, device, config.seed
     )
-    obs, _ = env.reset(seed=config.seed)
-    obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-
-    while len(replay_buffer) < config.min_replay_size:
-        with torch.no_grad():
-            action_tensor, _ = pi_old.sample(obs)
-            action = action_tensor.cpu().numpy()[0]
-        next_obs, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-        replay_buffer.push(obs.cpu().numpy()[0], action, reward, done, 0.0, next_obs)
-
-        if done:
-            next_obs, _ = env.reset()
-        obs = torch.tensor(next_obs, dtype=torch.float32, device=device).unsqueeze(0)
 
     print("[Warmup] Done.")
 
