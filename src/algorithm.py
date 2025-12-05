@@ -13,48 +13,8 @@ from torch.utils.tensorboard import SummaryWriter
 from gaussian_policy import GaussianPolicy
 from replay_buffer import NStepReplayBuffer
 from q_network import QNetwork
-
-
-class MPOConfig:
-    def __init__(
-        self,
-        env_name="HalfCheetah-v5",
-        batch_size=256,
-        num_training_episodes=1000,
-        num_candidate_actions=32,
-        min_replay_size=30_000,
-        num_optimization_steps_per_step=2,
-        q_lr=0.3e-4,
-        pi_lr=0.3e-4,
-        tau=0.005,
-        dual_lr=1e-3,
-        eta=1.0,
-        kl_epsilon=0.2,
-        policy_old_sync_frequency=50,
-        log_dir="./logs/mpo_experiment",
-        eval_freq=10,
-        eval_episodes=5,
-        seed=42,
-        entropy_coeff=1e-3,
-    ):
-        self.batch_size = batch_size
-        self.num_training_episodes = num_training_episodes
-        self.num_candidate_actions = num_candidate_actions
-        self.min_replay_size = min_replay_size
-        self.num_optimization_steps_per_step = num_optimization_steps_per_step
-        self.q_lr = q_lr
-        self.pi_lr = pi_lr
-        self.tau = tau
-        self.dual_lr = dual_lr
-        self.eta = eta
-        self.kl_epsilon = kl_epsilon
-        self.policy_old_sync_frequency = policy_old_sync_frequency
-        self.log_dir = log_dir
-        self.eval_freq = eval_freq
-        self.eval_episodes = eval_episodes
-        self.seed = seed
-        self.entropy_coeff = entropy_coeff
-        self.env_name = env_name
+from utils import evaluate_policy, checkpoint
+from mpo_config import MPOConfig
 
 
 def policy_evaluation_e_step(
@@ -196,62 +156,6 @@ def policy_evaluation_m_step(
         loss_pi = loss_pi + entropy_bonus
 
     return loss_pi
-
-
-def evaluate_policy(policy: GaussianPolicy, env, device, n_eval_episodes: int = 5):
-    """
-    Run the policy for n_eval_episodes (stochastic sampling) and return list of episode returns.
-    """
-    returns = []
-    for _ in range(n_eval_episodes):
-        obs = torch.tensor(
-            env.reset()[0], dtype=torch.float32, device=device
-        ).unsqueeze(0)
-        done = False
-        ep_ret = 0.0
-        while not done:
-            with torch.no_grad():
-                action_tensor, _ = policy.sample(obs)
-                action = action_tensor.cpu().numpy()[0]
-            next_obs, reward, terminated, truncated, _ = env.step(action)
-            ep_ret += float(reward)
-            done = terminated or truncated
-            obs = torch.tensor(next_obs, dtype=torch.float32, device=device).unsqueeze(
-                0
-            )
-        returns.append(ep_ret)
-    return returns
-
-
-def checkpoint(
-    checkpoint_dir: str,
-    episode: int,
-    global_step: int,
-    q: QNetwork,
-    q_target: QNetwork,
-    pi: GaussianPolicy,
-    pi_old: GaussianPolicy,
-    q_optimizer: torch.optim.Optimizer,
-    pi_optimizer: torch.optim.Optimizer,
-):
-    try:
-        checkpoint = {
-            "episode": episode + 1,
-            "global_step": global_step,
-            "q_state_dict": q.state_dict(),
-            "q_target_state_dict": q_target.state_dict(),
-            "pi_state_dict": pi.state_dict(),
-            "pi_old_state_dict": pi_old.state_dict(),
-            "q_optimizer_state_dict": q_optimizer.state_dict(),
-            "pi_optimizer_state_dict": pi_optimizer.state_dict(),
-        }
-        ckpt_path = os.path.join(checkpoint_dir, f"checkpoint_ep{episode+1}.pt")
-        torch.save(checkpoint, ckpt_path)
-        # overwrite latest for convenience
-        torch.save(checkpoint, os.path.join(checkpoint_dir, "checkpoint_latest.pt"))
-    except Exception as e:
-        # keep training even if checkpointing fails
-        print(f"[Checkpoint] failed to save checkpoint: {e}")
 
 
 def train_mpo(config: MPOConfig, device: torch.device, writer: SummaryWriter):

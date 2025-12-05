@@ -5,7 +5,8 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 import wandb
 
-from algorithm import train_mpo, MPOConfig
+from algorithm import train_mpo
+from mpo_config import MPOConfig
 
 
 def main():
@@ -29,11 +30,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--entropy_coeff", type=float, default=1e-3)
     args = parser.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     config = MPOConfig(**vars(args))
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     print("Experiment Configuration:")
     for k, v in vars(args).items():
         print(f"  {k}: {v}")
