@@ -10,11 +10,11 @@ import gymnasium
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 
-from gaussian_policy import GaussianPolicy
-from replay_buffer import NStepReplayBuffer
-from q_network import QNetwork
-from utils import evaluate_policy, checkpoint
-from mpo_config import MPOConfig
+from mpo.gaussian_policy import GaussianPolicy
+from mpo.replay_buffer import NStepReplayBuffer
+from mpo.q_network import QNetwork
+from mpo.utils import evaluate_policy, checkpoint_if_needed
+from mpo.mpo_config import MPOConfig
 
 
 def policy_evaluation_e_step(
@@ -186,10 +186,9 @@ def warmup_replay_buffer(
     return replay_buffer
 
 
-def train_mpo(config: MPOConfig, device: torch.device, writer: SummaryWriter):
-    checkpoint_dir = os.path.join(config.log_dir, "checkpoints", f"seed_{config.seed}")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
+def train_mpo(
+    config: MPOConfig, device: torch.device, writer: SummaryWriter
+) -> GaussianPolicy:
     eta = config.eta
 
     env = gymnasium.make(config.env_name)
@@ -317,18 +316,17 @@ def train_mpo(config: MPOConfig, device: torch.device, writer: SummaryWriter):
             f"[Train] episode={episode+1} global_step={global_step} ep_return={ep_return:.3f} ep_duration={episode_duration:.3f}s"
         )
 
-        if (episode + 1) % config.checkpoint_ep_freq == 0:
-            checkpoint(
-                checkpoint_dir=checkpoint_dir,
-                episode=episode,
-                global_step=global_step,
-                q=q,
-                q_target=q_target,
-                pi=pi,
-                pi_old=pi_old,
-                q_optimizer=q_optimizer,
-                pi_optimizer=pi_optimizer,
-            )
+        checkpoint_if_needed(
+            config=config,
+            episode=episode,
+            global_step=global_step,
+            q=q,
+            q_target=q_target,
+            pi=pi,
+            pi_old=pi_old,
+            q_optimizer=q_optimizer,
+            pi_optimizer=pi_optimizer,
+        )
 
         # Periodic evaluation: log to tensorboard, wandb, and console
         if (episode + 1) % config.eval_freq == 0:
@@ -341,3 +339,5 @@ def train_mpo(config: MPOConfig, device: torch.device, writer: SummaryWriter):
                 f"[Eval] episode={episode+1} global_step={global_step} "
                 f"eval_mean={eval_mean:.3f} eval_returns={[round(r,2) for r in eval_returns]}"
             )
+
+    return pi

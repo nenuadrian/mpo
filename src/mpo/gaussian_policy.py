@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from mlp import MLP
+from mpo.mlp import MLP
 
 
 class GaussianPolicy(nn.Module):
