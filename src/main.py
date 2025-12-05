@@ -30,6 +30,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--entropy_coeff", type=float, default=1e-3)
     parser.add_argument("--checkpoint_ep_freq", type=int, default=50)
+    parser.add_argument("--wandb_project", type=str, default="mpo_project")
+    parser.add_argument("--wandb_entity", type=str, default="adrian-research")
     args = parser.parse_args()
     config = MPOConfig(**vars(args))
 
@@ -39,7 +41,13 @@ def main():
     for k, v in vars(args).items():
         print(f"  {k}: {v}")
 
-    wandb.init(project="mpo_project", config=vars(args), sync_tensorboard=True)
+    wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        group=f"mpo_{args.env_name}",
+        config=vars(args),
+        sync_tensorboard=True,
+    )
     writer = SummaryWriter(config.log_dir)
 
     train_mpo(config, device, writer)

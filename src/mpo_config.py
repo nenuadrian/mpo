@@ -20,6 +20,8 @@ class MPOConfig:
         seed=42,
         entropy_coeff=1e-3,
         checkpoint_ep_freq=50,
+        *args,
+        **kwargs,
     ):
         self.batch_size = batch_size
         self.num_training_episodes = num_training_episodes
