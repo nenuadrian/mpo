@@ -215,6 +215,14 @@ def train_mpo(
     pi_old = GaussianPolicy(obs_dim, act_dim, action_low, action_high).to(device)
     pi_old.load_state_dict(pi.state_dict())
 
+    writer.add_text("model/q_network", str(q))
+    writer.add_text("model/policy_network", str(pi))
+
+    with open(os.path.join(config.log_dir, "q_network_model_summary.txt"), "w") as f:
+        f.write(str(q))
+    with open(os.path.join(config.log_dir, "pi_network_model_summary.txt"), "w") as f:
+        f.write(str(pi))
+
     q_optimizer = torch.optim.Adam(q.parameters(), lr=config.q_lr)
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=config.pi_lr)
 
@@ -230,16 +238,16 @@ def train_mpo(
         obs, _ = env.reset()
         obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         done = False
-        ep_return = 0.0
-        start_time = time.time()
-
+        ep_reward = 0.0
+        ep_length = 0
         while not done:
+            ep_length += 1
             with torch.no_grad():
                 action_tensor, _ = pi_old.sample(obs)
                 action = action_tensor.cpu().numpy()[0]
             next_obs, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
-            ep_return += float(reward)
+            ep_reward += float(reward)
 
             replay_buffer.push(
                 obs.cpu().numpy()[0], action, reward, done, 0.0, next_obs
@@ -279,7 +287,7 @@ def train_mpo(
                     q,
                     config.num_candidate_actions,
                     eta=eta,
-                    solve_dual=True,
+                    solve_dual=config.e_step_solve_dual,
                     kl_target=config.kl_epsilon,
                     eta_bounds=(1e-8, 1e6),
                     max_iters=50,
@@ -298,22 +306,30 @@ def train_mpo(
                 pi_loss.backward()
                 pi_optimizer.step()
 
-            writer.add_scalar("loss/loss_q", loss_q.item(), global_step)
-            writer.add_scalar("info/kl_np", kl_np, global_step)
-            writer.add_scalar("info/eta", eta, global_step)
-            writer.add_scalar("loss/pi_loss", pi_loss.item(), global_step)
+            writer.add_scalar(
+                "train/learning_rate_q", q_optimizer.param_groups[0]["lr"], global_step
+            )
+            writer.add_scalar(
+                "train/learning_rate_pi",
+                pi_optimizer.param_groups[0]["lr"],
+                global_step,
+            )
+            writer.add_scalar("train/q_sa", q_sa.mean().item(), global_step)
+            writer.add_scalar("train/loss_q", loss_q.item(), global_step)
+            writer.add_scalar("train/kl_np", kl_np, global_step)
+            writer.add_scalar("train/eta", eta, global_step)
+            writer.add_scalar("train/pi_loss", pi_loss.item(), global_step)
         if config.policy_old_sync_frequency > 0:
             if global_step % config.policy_old_sync_frequency == 0:
                 pi_old.load_state_dict(pi.state_dict())
-                writer.add_scalar("info/policy_old_synced", 1.0, global_step)
+                writer.add_scalar("train/policy_old_synced", 1.0, global_step)
             else:
-                writer.add_scalar("info/policy_old_synced", 0.0, global_step)
+                writer.add_scalar("train/policy_old_synced", 0.0, global_step)
 
-        episode_duration = time.time() - start_time
-        writer.add_scalar("time/ep_duration", episode_duration, global_step)
-        writer.add_scalar("rewards/ep_return", ep_return, global_step)
+        writer.add_scalar("train/ep_length", ep_length, global_step)
+        writer.add_scalar("train/ep_reward", ep_reward, global_step)
         print(
-            f"[Train] episode={episode+1} global_step={global_step} ep_return={ep_return:.3f} ep_duration={episode_duration:.3f}s"
+            f"[Train] episode={episode+1} global_step={global_step} ep_length={ep_length:.3f}s"
         )
 
         checkpoint_if_needed(

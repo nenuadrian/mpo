@@ -20,6 +20,7 @@ class MPOConfig:
         seed=42,
         entropy_coeff=1e-3,
         checkpoint_ep_freq=50,
+        e_step_solve_dual=False,
         *args,
         **kwargs,
     ):
