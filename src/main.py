@@ -18,7 +18,6 @@ def main():
         "--env_names",
         type=str,
         default="HalfCheetah-v5",
-        nargs=",",
         help="Comma-separated list of environment names to train on",
     )
     parser.add_argument("--env_iterations", type=int, default=1)
@@ -47,12 +46,13 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-
-    for env_name in args.env_names:
+    env_names = [name.strip() for name in args.env_names.split(",")]
+    for env_name in env_names:
         for iteration in range(args.env_iterations):
-            print(f"Starting iteration {iteration + 1}/{args.env_iterations}")
+            print(
+                f"Training on environment: {env_name}. Starting iteration {iteration + 1}/{args.env_iterations}"
+            )
             start_time = time.time()
-            print(f"Training on environment: {env_name}")
 
             seed = (
                 torch.randint(0, 10000, (1,)).item()
