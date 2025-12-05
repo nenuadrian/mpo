@@ -9,6 +9,44 @@ import imageio
 from gaussian_policy import GaussianPolicy
 
 
+def _make_offscreen_env(env_name: str):
+    """
+    Try to create a gymnasium MuJoCo env with an offscreen GL backend.
+    Tries MUJOCO_GL in order: 'egl', 'osmesa', 'glfw'. Raises RuntimeError
+    with diagnostic if none work.
+    """
+    import gymnasium
+
+    last_err = None
+    for backend in ("egl", "osmesa", "glfw"):
+        os.environ["MUJOCO_GL"] = backend
+        try:
+            env = gymnasium.make(env_name, render_mode="rgb_array")
+            # Try a quick reset + render to ensure backend works
+            try:
+                obs, _ = env.reset()
+                frame = env.render()
+            except Exception:
+                # some envs only create context later; treat make as success
+                pass
+            print(f"[generate_video] using MUJOCO_GL={backend}")
+            return env
+        except Exception as e:
+            last_err = e
+            print(f"[generate_video] backend {backend} failed: {e}")
+            try:
+                env.close()
+            except Exception:
+                pass
+    raise RuntimeError(
+        "Failed to initialize an offscreen MuJoCo OpenGL context. "
+        "Tried MUJOCO_GL backends 'egl','osmesa','glfw'.\n"
+        "Last error: "
+        + str(last_err)
+        + "\nInstall/configure EGL or OSMesa (or run with a display) and retry."
+    )
+
+
 def load_policy_from_checkpoint(ckpt_path: str, policy: torch.nn.Module):
     ckpt = torch.load(ckpt_path, map_location="cpu")
     # Prefer 'pi_state_dict' then 'pi_old_state_dict'
@@ -50,8 +88,8 @@ def main():
     ckpt_path = args.checkpoint
     assert os.path.isfile(ckpt_path), f"Checkpoint not found: {ckpt_path}"
 
-    # Create env that returns rgb frames
-    env = gymnasium.make(args.env_name, render_mode="rgb_array")
+    # Create env that returns rgb frames. Use helper that tries offscreen backends.
+    env = _make_offscreen_env(args.env_name)
     obs0, _ = env.reset()
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
@@ -73,7 +111,11 @@ def main():
             done = False
             steps = 0
             # render initial frame (some envs require rendering after reset)
-            frame = env.render()
+            try:
+                frame = env.render()
+            except Exception as e:
+                frame = None
+                print(f"[generate_video] warning: initial render failed: {e}")
             if frame is not None:
                 # ensure uint8
                 if frame.dtype != np.uint8:
@@ -101,7 +143,14 @@ def main():
                 done = terminated or truncated
                 obs = next_obs
 
-                frame = env.render()
+                try:
+                    frame = env.render()
+                except Exception as e:
+                    frame = None
+                    print(
+                        f"[generate_video] warning: render failed at step {steps}: {e}"
+                    )
+
                 if frame is not None:
                     if frame.dtype != np.uint8:
                         frame = np.clip(frame * 255.0, 0, 255).astype(np.uint8)
