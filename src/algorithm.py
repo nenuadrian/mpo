@@ -159,7 +159,7 @@ def policy_evaluation_m_step(
 
 
 def warmup_replay_buffer(
-    env: gymnasium.Env, min_size: int, device: torch.device, seed: int
+    env: gymnasium.Env, device: torch.device, config: MPOConfig
 ) -> NStepReplayBuffer:
     replay_buffer = NStepReplayBuffer(
         capacity=100000,
@@ -219,9 +219,7 @@ def train_mpo(config: MPOConfig, device: torch.device, writer: SummaryWriter):
     q_optimizer = torch.optim.Adam(q.parameters(), lr=config.q_lr)
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=config.pi_lr)
 
-    replay_buffer = warmup_replay_buffer(
-        env, config.min_replay_size, device, config.seed
-    )
+    replay_buffer = warmup_replay_buffer(env, device, config)
 
     print("[Warmup] Done.")
 
