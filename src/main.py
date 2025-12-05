@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--eval_episodes", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--entropy_coeff", type=float, default=1e-3)
+    parser.add_argument("--checkpoint_ep_freq", type=int, default=50)
     args = parser.parse_args()
     config = MPOConfig(**vars(args))
 

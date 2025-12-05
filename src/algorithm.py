@@ -310,17 +310,18 @@ def train_mpo(config: MPOConfig, device: torch.device, writer: SummaryWriter):
             f"[Train] episode={episode+1} global_step={global_step} ep_return={ep_return:.3f} ep_duration={episode_duration:.3f}s"
         )
 
-        checkpoint(
-            checkpoint_dir=checkpoint_dir,
-            episode=episode,
-            global_step=global_step,
-            q=q,
-            q_target=q_target,
-            pi=pi,
-            pi_old=pi_old,
-            q_optimizer=q_optimizer,
-            pi_optimizer=pi_optimizer,
-        )
+        if (episode + 1) % config.checkpoint_ep_freq == 0:
+            checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                episode=episode,
+                global_step=global_step,
+                q=q,
+                q_target=q_target,
+                pi=pi,
+                pi_old=pi_old,
+                q_optimizer=q_optimizer,
+                pi_optimizer=pi_optimizer,
+            )
 
         # Periodic evaluation: log to tensorboard, wandb, and console
         if (episode + 1) % config.eval_freq == 0:
