@@ -87,7 +87,6 @@ def main():
 
             with open(os.path.join(config.log_dir, "config.json"), "w") as f:
                 json.dump(vars(config), f, indent=4)
-            wandb.tensorboard.patch(root_logdir=args.base_log_dir)
             wandb.init(
                 name=experiment_identifier,
                 project=args.wandb_project,
