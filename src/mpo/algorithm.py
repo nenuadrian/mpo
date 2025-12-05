@@ -334,10 +334,12 @@ def train_mpo(
                 pi, eval_env, device, n_eval_episodes=config.eval_episodes
             )
             eval_mean = float(np.mean(eval_returns))
-            writer.add_scalar("eval/ep_return_mean", eval_mean, global_step)
+            eval_length_mean = float(np.mean([len(r) for r in eval_returns]))
+            writer.add_scalar("eval/mean_reward", eval_mean, global_step)
+            writer.add_scalar("eval/mean_ep_length", eval_length_mean, global_step)
             print(
                 f"[Eval] episode={episode+1} global_step={global_step} "
-                f"eval_mean={eval_mean:.3f} eval_returns={[round(r,2) for r in eval_returns]}"
+                f"eval_mean={eval_mean:.3f} eval_length_mean={eval_length_mean:.3f}"
             )
 
     return pi

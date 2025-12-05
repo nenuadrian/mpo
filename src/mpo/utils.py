@@ -14,27 +14,31 @@ from mpo.mpo_config import MPOConfig
 
 def evaluate_policy(policy: GaussianPolicy, env, device, n_eval_episodes: int = 5):
     """
-    Run the policy for n_eval_episodes (stochastic sampling) and return list of episode returns.
+    Run the policy for n_eval_episodes (stochastic sampling) and return list of episode returns and episode lengths.
     """
     returns = []
+    lengths = []
     for _ in range(n_eval_episodes):
         obs = torch.tensor(
             env.reset()[0], dtype=torch.float32, device=device
         ).unsqueeze(0)
         done = False
         ep_ret = 0.0
+        ep_len = 0
         while not done:
             with torch.no_grad():
                 action_tensor, _ = policy.sample(obs)
                 action = action_tensor.cpu().numpy()[0]
             next_obs, reward, terminated, truncated, _ = env.step(action)
             ep_ret += float(reward)
+            ep_len += 1
             done = terminated or truncated
             obs = torch.tensor(next_obs, dtype=torch.float32, device=device).unsqueeze(
                 0
             )
         returns.append(ep_ret)
-    return returns
+        lengths.append(ep_len)
+    return returns, lengths
 
 
 def checkpoint_if_needed(
