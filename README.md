@@ -13,3 +13,7 @@ python src/generate_video.py logs/mpo_experiment/checkpoints/checkpoint_ep309.pt
 ## Eval
 
 ![MPO Training](assets/graph.png)
+
+## Cheeting cheetah
+
+![MPO Video](assets/cheetah.gif)
