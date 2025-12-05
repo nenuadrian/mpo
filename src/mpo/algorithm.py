@@ -231,7 +231,7 @@ def train_mpo(
     global_step = 0
     for episode in range(config.num_training_episodes):
         print("[Train] Starting episode %d ..." % (episode + 1))
-        writer.add_scalar("info/episode", episode, global_step)
+        writer.add_scalar("train/episode", episode, global_step)
 
         obs, _ = env.reset()
         obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
