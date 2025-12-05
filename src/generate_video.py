@@ -6,6 +6,8 @@ import torch
 import gymnasium
 import imageio
 
+from gaussian_policy import GaussianPolicy
+
 
 def load_policy_from_checkpoint(ckpt_path: str, policy: torch.nn.Module):
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -56,10 +58,8 @@ def main():
     action_low = env.action_space.low
     action_high = env.action_space.high
 
-    # Lazy import of project policy class (same codebase)
-    from gaussian_policy import GaussianPolicy
-
     policy = GaussianPolicy(obs_dim, act_dim, action_low, action_high)
+    print(f"Loading policy from checkpoint: {ckpt_path}")
     load_policy_from_checkpoint(ckpt_path, policy)
     policy.to(args.device)
     policy.eval()
@@ -67,6 +67,7 @@ def main():
     writer = imageio.get_writer(args.output, fps=args.fps)
 
     try:
+        print(f"Recording {args.episodes} episodes to {args.output}...")
         for ep in range(args.episodes):
             obs, _ = env.reset()
             done = False
