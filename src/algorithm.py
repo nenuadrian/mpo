@@ -159,7 +159,7 @@ def policy_evaluation_m_step(
 
 
 def train_mpo(config: MPOConfig, device: torch.device, writer: SummaryWriter):
-    checkpoint_dir = os.path.join(config.log_dir, "checkpoints")
+    checkpoint_dir = os.path.join(config.log_dir, "checkpoints", f"seed_{config.seed}")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     eta = config.eta
