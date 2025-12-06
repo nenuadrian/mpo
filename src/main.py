@@ -96,6 +96,7 @@ def main():
                     else f"mpo_{env_name}"
                 ),
                 config=vars(args),
+                dir=config.log_dir,
             )
 
             pi = train_mpo(config, device)

@@ -245,7 +245,7 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
                 obs.cpu().numpy()[0], action, reward, done, 0.0, next_obs
             )
             global_step += 1
-            wandb.log({"debug/global_step": global_step}, step=global_step)
+            wandb.log({"train/global_step": global_step}, step=global_step)
 
             obs = torch.tensor(next_obs, dtype=torch.float32, device=device).unsqueeze(
                 0
