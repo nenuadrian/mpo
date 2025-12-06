@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import gymnasium
 import numpy as np
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 from mpo.gaussian_policy import GaussianPolicy
 from mpo.replay_buffer import NStepReplayBuffer
@@ -186,9 +186,7 @@ def warmup_replay_buffer(
     return replay_buffer
 
 
-def train_mpo(
-    config: MPOConfig, device: torch.device, writer: SummaryWriter
-) -> GaussianPolicy:
+def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
     eta = config.eta
 
     env = gymnasium.make(config.env_name)
@@ -215,13 +213,9 @@ def train_mpo(
     pi_old = GaussianPolicy(obs_dim, act_dim, action_low, action_high).to(device)
     pi_old.load_state_dict(pi.state_dict())
 
-    writer.add_text("model/q_network", str(q))
-    writer.add_text("model/policy_network", str(pi))
-
-    with open(os.path.join(config.log_dir, "q_network_model_summary.txt"), "w") as f:
-        f.write(str(q))
-    with open(os.path.join(config.log_dir, "pi_network_model_summary.txt"), "w") as f:
-        f.write(str(pi))
+    if wandb.run:
+        wandb.run.summary["model/q_network"] = str(q)
+        wandb.run.summary["model/policy_network"] = str(pi)
 
     q_optimizer = torch.optim.Adam(q.parameters(), lr=config.q_lr)
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=config.pi_lr)
@@ -231,7 +225,7 @@ def train_mpo(
     global_step = 0
     for episode in range(config.num_training_episodes):
         print("[Train] Starting episode %d ..." % (episode + 1))
-        writer.add_scalar("train/episode", episode, global_step)
+        wandb.log({"train/episode": episode}, step=global_step)
 
         obs, _ = env.reset()
         obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
@@ -251,6 +245,7 @@ def train_mpo(
                 obs.cpu().numpy()[0], action, reward, done, 0.0, next_obs
             )
             global_step += 1
+            wandb.log({"debug/global_step": global_step}, step=global_step)
 
             obs = torch.tensor(next_obs, dtype=torch.float32, device=device).unsqueeze(
                 0
@@ -275,11 +270,12 @@ def train_mpo(
                 loss_q.backward()
 
                 q_grad_stats = compute_grad_stats(q.parameters())
-                writer.add_scalar(
-                    "train/grad_norm_q", q_grad_stats["grad_norm"], global_step
-                )
-                writer.add_scalar(
-                    "train/grad_max_q", q_grad_stats["grad_max"], global_step
+                wandb.log(
+                    {
+                        "train/grad_norm_q": q_grad_stats["grad_norm"],
+                        "train/grad_max_q": q_grad_stats["grad_max"],
+                    },
+                    step=global_step,
                 )
 
                 if config.q_max_grad_norm is not None and config.q_max_grad_norm > 0.0:
@@ -288,15 +284,12 @@ def train_mpo(
                     )
 
                 q_grad_stats_clipped = compute_grad_stats(q.parameters())
-                writer.add_scalar(
-                    "train/grad_norm_q_clipped",
-                    q_grad_stats_clipped["grad_norm"],
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/grad_max_q_clipped",
-                    q_grad_stats_clipped["grad_max"],
-                    global_step,
+                wandb.log(
+                    {
+                        "train/grad_norm_q_clipped": q_grad_stats_clipped["grad_norm"],
+                        "train/grad_max_q_clipped": q_grad_stats_clipped["grad_max"],
+                    },
+                    step=global_step,
                 )
 
                 q_optimizer.step()
@@ -330,11 +323,12 @@ def train_mpo(
                 pi_loss.backward()
 
                 pi_grad_stats = compute_grad_stats(pi.parameters())
-                writer.add_scalar(
-                    "train/grad_norm_pi", pi_grad_stats["grad_norm"], global_step
-                )
-                writer.add_scalar(
-                    "train/grad_max_pi", pi_grad_stats["grad_max"], global_step
+                wandb.log(
+                    {
+                        "train/grad_norm_pi": pi_grad_stats["grad_norm"],
+                        "train/grad_max_pi": pi_grad_stats["grad_max"],
+                    },
+                    step=global_step,
                 )
 
                 if (
@@ -346,39 +340,41 @@ def train_mpo(
                     )
 
                 pi_grad_stats_clipped = compute_grad_stats(pi.parameters())
-                writer.add_scalar(
-                    "train/grad_norm_pi_clipped",
-                    pi_grad_stats_clipped["grad_norm"],
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/grad_max_pi_clipped", pi_grad_stats["grad_max"], global_step
+                wandb.log(
+                    {
+                        "train/grad_norm_pi_clipped": pi_grad_stats_clipped[
+                            "grad_norm"
+                        ],
+                        "train/grad_max_pi_clipped": pi_grad_stats_clipped["grad_max"],
+                    },
+                    step=global_step,
                 )
 
                 pi_optimizer.step()
 
-            writer.add_scalar(
-                "train/learning_rate_q", q_optimizer.param_groups[0]["lr"], global_step
+            wandb.log(
+                {
+                    "train/learning_rate_q": q_optimizer.param_groups[0]["lr"],
+                    "train/learning_rate_pi": pi_optimizer.param_groups[0]["lr"],
+                    "train/q_sa": q_sa.mean().item(),
+                    "train/loss_q": loss_q.item(),
+                    "train/kl_np": kl_np,
+                    "train/eta": eta,
+                    "train/pi_loss": pi_loss.item(),
+                },
+                step=global_step,
             )
-            writer.add_scalar(
-                "train/learning_rate_pi",
-                pi_optimizer.param_groups[0]["lr"],
-                global_step,
-            )
-            writer.add_scalar("train/q_sa", q_sa.mean().item(), global_step)
-            writer.add_scalar("train/loss_q", loss_q.item(), global_step)
-            writer.add_scalar("train/kl_np", kl_np, global_step)
-            writer.add_scalar("train/eta", eta, global_step)
-            writer.add_scalar("train/pi_loss", pi_loss.item(), global_step)
         if config.policy_old_sync_frequency > 0:
             if global_step % config.policy_old_sync_frequency == 0:
                 pi_old.load_state_dict(pi.state_dict())
-                writer.add_scalar("train/policy_old_synced", 1.0, global_step)
+                sync_flag = 1.0
             else:
-                writer.add_scalar("train/policy_old_synced", 0.0, global_step)
-
-        writer.add_scalar("train/ep_length", ep_length, global_step)
-        writer.add_scalar("train/ep_reward", ep_reward, global_step)
+                sync_flag = 0.0
+            wandb.log({"train/policy_old_synced": sync_flag}, step=global_step)
+        wandb.log(
+            {"train/ep_length": ep_length, "train/ep_reward": ep_reward},
+            step=global_step,
+        )
         print(
             f"[Train] episode={episode+1} global_step={global_step} ep_length={ep_length:.3f}s"
         )
@@ -402,8 +398,13 @@ def train_mpo(
             )
             eval_mean = float(np.mean(eval_returns))
             eval_length_mean = float(np.mean([len(r) for r in eval_returns]))
-            writer.add_scalar("eval/mean_reward", eval_mean, global_step)
-            writer.add_scalar("eval/mean_ep_length", eval_length_mean, global_step)
+            wandb.log(
+                {
+                    "eval/mean_reward": eval_mean,
+                    "eval/mean_ep_length": eval_length_mean,
+                },
+                step=global_step,
+            )
             print(
                 f"[Eval] episode={episode+1} global_step={global_step} "
                 f"eval_mean={eval_mean:.3f} eval_length_mean={eval_length_mean:.3f}"

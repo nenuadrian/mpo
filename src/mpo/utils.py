@@ -6,6 +6,7 @@ import numpy as np
 import gymnasium
 import imageio
 import torch.nn as nn
+import wandb
 
 from mpo.gaussian_policy import GaussianPolicy
 from mpo.q_network import QNetwork
@@ -77,6 +78,7 @@ def checkpoint_if_needed(
     pi_optimizer: torch.optim.Optimizer,
 ) -> bool:
     if (episode + 1) % config.checkpoint_ep_freq != 0:
+        wandb.log({"train/checkpoint_saved": 0}, step=global_step)
         return False
 
     checkpoint_dir = os.path.join(config.log_dir, "checkpoints")
@@ -95,6 +97,7 @@ def checkpoint_if_needed(
         ckpt_path = os.path.join(checkpoint_dir, f"checkpoint_ep{episode+1}.pt")
         torch.save(checkpoint, ckpt_path)
         torch.save(checkpoint, os.path.join(checkpoint_dir, "checkpoint_latest.pt"))
+        wandb.log({"train/checkpoint_ep": episode + 1}, step=global_step)
     except Exception as e:
         print(f"[ERROR] failed to save checkpoint: {e}")
         return False

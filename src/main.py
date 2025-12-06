@@ -4,7 +4,6 @@ import json
 import time
 
 import torch
-from torch.utils.tensorboard import SummaryWriter
 import wandb
 
 from mpo.algorithm import train_mpo
@@ -97,11 +96,9 @@ def main():
                     else f"mpo_{env_name}"
                 ),
                 config=vars(args),
-                sync_tensorboard=True,
             )
-            writer = SummaryWriter(os.path.join(config.log_dir, "tb_logs"))
 
-            pi = train_mpo(config, device, writer)
+            pi = train_mpo(config, device)
 
             try:
                 generate_video(
@@ -117,7 +114,6 @@ def main():
             except Exception as e:
                 print(f"[ERROR] Warning: video generation failed: {e}")
 
-            writer.close()
             wandb.finish()
             end_time = time.time()
             print(
