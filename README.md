@@ -1,5 +1,7 @@
 # MPO From Scratch
 
+[![Tests](https://github.com/nenuadrian/mpo/actions/workflows/tests.yml/badge.svg)](https://github.com/nenuadrian/mpo/actions/workflows/tests.yml)
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
