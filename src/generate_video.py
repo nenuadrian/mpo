@@ -7,7 +7,7 @@ import gymnasium
 import imageio
 
 from mpo.gaussian_policy import GaussianPolicy
-from mpo.util import load_policy_from_checkpoint, make_offscreen_env, generate_video
+from mpo.utils import load_policy_from_checkpoint, make_offscreen_env, generate_video
 
 def main():
     parser = argparse.ArgumentParser(description="Generate video from MPO checkpoint")
