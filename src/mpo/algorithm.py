@@ -18,6 +18,8 @@ from mpo.utils import (
     checkpoint_if_needed,
     compute_grad_stats,
     setup_logging,
+    compute_weights_and_temperature_loss_torch,
+    compute_nonparametric_kl_from_normalized_weights_torch,
 )
 from mpo.mpo_config import MPOConfig
 
@@ -27,17 +29,25 @@ def policy_evaluation_e_step(
     pi_old: nn.Module,
     q: nn.Module,
     K: int,
-    eta: float,
-    solve_dual: bool = False,
-    kl_target: float = None,
-    eta_bounds=(1e-8, 1e6),
-    max_iters: int = 40,
-    tol: float = 1e-4,
+    temperature: torch.Tensor,
 ):
     """
-    E-step: sample K actions per state, compute q_dist ∝ π_old(a_k) * exp(Q/eta).
-    If solve_dual is True, binary-search eta so that avg KL(q || π_old) ≈ kl_target.
-    Returns: actions [B,K,act_dim], q_dist [B,K], kl (float), eta (float)
+    E-step: sample K actions per state and construct a non-parametric policy
+    via Acme-style tempered Q / temperature dual.
+
+    Args:
+      states: [B, obs_dim]
+      pi_old: behavior / target policy (GaussianPolicy)
+      q: Q-network
+      K: number of action samples per state
+      temperature: positive scalar tensor (after softplus of log-temperature)
+
+    Returns:
+      actions: [B, K, act_dim] sampled from pi_old
+      q_dist: [B, K] normalized weights (non-parametric policy)
+      kl_np: float, estimated discrete KL(q_nonparametric || π_old over samples)
+      temperature_loss: scalar dual loss for updating log-temperature
+      temperature_value: float temperature (for logging)
     """
     B, obs_dim = states.shape
 
@@ -45,74 +55,43 @@ def policy_evaluation_e_step(
         states_expanded = states.unsqueeze(1).expand(-1, K, -1)
         states_flat = states_expanded.reshape(B * K, obs_dim)
 
-        # Sample actions but re-evaluate log-prob via log_prob to ensure tanh correction is applied.
+        # Sample actions under pi_old, then re-evaluate log-probs for KL stats.
         actions_flat, _ = pi_old.sample(states_flat)
         log_pi_flat = pi_old.log_prob(states_flat, actions_flat)  # [B*K]
 
-        q_flat = q(states_flat, actions_flat)
+        q_flat = q(states_flat, actions_flat)  # [B*K]
 
         actions = actions_flat.view(B, K, -1)
-        q_vals = q_flat.view(B, K)
+        q_vals = q_flat.view(K, B)  # [K, B] for helper, transpose below as needed
         log_pi_old = log_pi_flat.view(B, K)
 
-        # Center Q per state for numerical stability
-        q_centered = q_vals - q_vals.max(dim=-1, keepdim=True).values
+    # Use Acme-style helper (no grad into Q) to get non-parametric weights
+    # and the dual loss for the temperature. q_values is [K,B]; our q_vals is
+    # [K,B] already, so this is consistent.
+    normalized_weights, temperature_loss = compute_weights_and_temperature_loss_torch(
+        q_values=q_vals,
+        epsilon=float(1.0),  # actual epsilon handled via config in training loop
+        temperature=temperature,
+    )
 
-        # Normalize π_old over SAME candidate set
-        log_pi_old_norm = log_pi_old - torch.logsumexp(log_pi_old, dim=-1, keepdim=True)
+    # Transpose back to [B,K] to align with rest of code.
+    q_dist = normalized_weights.t()  # [B, K]
 
-        def compute_q_dist_and_kl(local_eta):
-            # compute discrete q over candidates for given eta
-            log_q_tilde = log_pi_old + q_centered / local_eta  # [B, K]
-            log_q = log_q_tilde - torch.logsumexp(log_q_tilde, dim=-1, keepdim=True)
-            q_dist_local = torch.exp(log_q)  # [B, K]
-            # discrete KL(q || π_old) per state, then mean over states
-            kl_per_state = torch.sum(q_dist_local * (log_q - log_pi_old_norm), dim=-1)
-            kl_mean = kl_per_state.mean().item()
-            return q_dist_local, kl_mean
+    # KL diagnostic between non-parametric q and discrete π_old over samples.
+    with torch.no_grad():
+        # Discrete π_old over the candidate set (per-state normalization).
+        log_pi_old_norm = log_pi_old - torch.logsumexp(
+            log_pi_old, dim=-1, keepdim=True
+        )
+        pi_old_disc = torch.exp(log_pi_old_norm)  # [B, K]
 
-        # If requested, solve for eta using binary search so avg KL ≈ kl_target
-        solved_eta = float(eta)
-        if solve_dual:
-            assert (
-                kl_target is not None
-            ), "kl_target must be provided when solve_dual=True"
-            lo, hi = float(eta_bounds[0]), float(eta_bounds[1])
+        # Non-parametric KL using helper; returns [B]
+        kl_np_vec = compute_nonparametric_kl_from_normalized_weights_torch(
+            normalized_weights
+        )  # [B], still in [K,B] convention
+        kl_np = float(kl_np_vec.mean().item())
 
-            # Evaluate KL at lo and hi
-            _, kl_lo = compute_q_dist_and_kl(lo)
-            _, kl_hi = compute_q_dist_and_kl(hi)
-
-            # If kl_lo already <= target, choose lo; if kl_hi > target try expanding hi
-            if kl_lo <= kl_target:
-                solved_eta = lo
-            else:
-                # expand hi until KL(hi) <= target or hit cap
-                expand_iters = 0
-                while kl_hi > kl_target and expand_iters < 10:
-                    hi *= 10.0
-                    _, kl_hi = compute_q_dist_and_kl(hi)
-                    expand_iters += 1
-                # Binary search in [lo, hi]
-                for _ in range(max_iters):
-                    mid = 0.5 * (lo + hi)
-                    _, kl_mid = compute_q_dist_and_kl(mid)
-                    if abs(kl_mid - kl_target) <= tol:
-                        solved_eta = mid
-                        break
-                    # KL decreases with eta, so if kl_mid > target -> need larger eta
-                    if kl_mid > kl_target:
-                        lo = mid
-                    else:
-                        hi = mid
-                    solved_eta = mid
-            # clamp solved eta
-            solved_eta = float(np.clip(solved_eta, eta_bounds[0], eta_bounds[1]))
-
-        # compute final q_dist and kl using solved_eta
-        q_dist, kl_np = compute_q_dist_and_kl(solved_eta)
-
-    return actions.detach(), q_dist, kl_np, solved_eta
+    return actions.detach(), q_dist, kl_np, temperature_loss, float(temperature.item())
 
 
 def policy_evaluation_m_step(
@@ -167,7 +146,7 @@ def warmup_replay_buffer(
     env: gymnasium.Env, device: torch.device, config: MPOConfig, pi_old: nn.Module
 ) -> NStepReplayBuffer:
     replay_buffer = NStepReplayBuffer(
-        capacity=100000,
+        capacity=config.replay_buffer_size,
         obs_shape=env.observation_space.shape,
         act_shape=env.action_space.shape,
         n_step=5,
@@ -192,8 +171,6 @@ def warmup_replay_buffer(
 
 
 def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
-    eta = config.eta
-
     env = gymnasium.make(config.env_name)
 
     eval_env = gymnasium.make(config.env_name)
@@ -224,6 +201,14 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
 
     q_optimizer = torch.optim.Adam(q.parameters(), lr=config.q_lr)
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=config.pi_lr)
+
+    # Dual variable: log-temperature (scalar) with softplus transform.
+    # Initialize near log(config.eta) to keep behavior similar to original.
+    init_log_temperature = math.log(max(config.eta, 1e-3))
+    log_temperature = torch.nn.Parameter(
+        torch.tensor([init_log_temperature], dtype=torch.float32, device=device)
+    )
+    dual_optimizer = torch.optim.Adam([log_temperature], lr=config.dual_lr)
 
     replay_buffer = warmup_replay_buffer(env, device, config, pi_old)
 
@@ -305,19 +290,25 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
                 for tp, p in zip(q_target.parameters(), q.parameters()):
                     tp.data.mul_(1.0 - config.tau).add_(config.tau * p.data)
 
-                # Use E-step that can solve for eta (dual) robustly
-                actions_e, q_dist, kl_np, eta = policy_evaluation_e_step(
-                    states,
-                    pi_old,
-                    q,
-                    config.num_candidate_actions,
-                    eta=eta,
-                    solve_dual=config.e_step_solve_dual,
-                    kl_target=config.kl_epsilon,
-                    eta_bounds=(1e-8, 1e6),
-                    max_iters=50,
-                    tol=1e-4,
+                # E-step with learnable temperature (dual variable).
+                temperature = torch.nn.functional.softplus(log_temperature) + 1e-8
+                # Avoid extremely small or huge temperature values
+                temperature = F.softplus(log_temperature) + 1e-8
+                temperature = torch.clamp(temperature, 1e-3, 50.0)
+                actions_e, q_dist, kl_np, temperature_loss, temperature_value = (
+                    policy_evaluation_e_step(
+                        states,
+                        pi_old,
+                        q,
+                        config.num_candidate_actions,
+                        temperature=temperature,
+                    )
                 )
+
+                # Update dual variable (temperature) via its own optimizer.
+                dual_optimizer.zero_grad()
+                temperature_loss.backward(retain_graph=True)
+                dual_optimizer.step()
 
                 pi_loss = policy_evaluation_m_step(
                     pi,
@@ -367,7 +358,9 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
                     "train/q_sa": q_sa.mean().item(),
                     "train/loss_q": loss_q.item(),
                     "train/kl_np": kl_np,
-                    "train/eta": eta,
+                    "train/temperature": temperature_value,
+                    "train/temperature_loss": float(temperature_loss.item()),
+                    "train/log_temperature": float(log_temperature.detach().cpu().item()),
                     "train/pi_loss": pi_loss.item(),
                 },
                 step=global_step,

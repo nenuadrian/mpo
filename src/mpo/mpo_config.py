@@ -23,6 +23,7 @@ class MPOConfig:
         e_step_solve_dual=True,
         pi_max_grad_norm=0.5,
         q_max_grad_norm=1.0,
+        replay_buffer_size=1000000,
         *args,
         **kwargs,
     ):
@@ -48,3 +49,4 @@ class MPOConfig:
         self.e_step_solve_dual = e_step_solve_dual
         self.pi_max_grad_norm = pi_max_grad_norm
         self.q_max_grad_norm = q_max_grad_norm
+        self.replay_buffer_size = replay_buffer_size

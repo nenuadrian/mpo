@@ -9,7 +9,8 @@ import imageio
 from mpo.gaussian_policy import GaussianPolicy
 from mpo.utils import load_policy_from_checkpoint, make_offscreen_env, generate_video
 
-def main():
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Generate video from MPO checkpoint")
     parser.add_argument("checkpoint", type=str, help="Path to checkpoint .pt file")
     parser.add_argument(
@@ -31,7 +32,7 @@ def main():
         help="Use policy mean deterministically instead of sampling",
     )
     parser.add_argument("--device", type=str, default="cpu", help="torch device")
-    args = parser.parse_args()
+    args = parser.parse_args(args=argv)
 
     ckpt_path = args.checkpoint
     assert os.path.isfile(ckpt_path), f"Checkpoint not found: {ckpt_path}"

@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import math
 
 import torch
 import numpy as np
@@ -301,3 +302,53 @@ def load_policy_from_checkpoint(ckpt_path: str, policy: torch.nn.Module):
         state = ckpt.get("state_dict", ckpt)
     policy.load_state_dict(state)
     return ckpt
+
+
+def compute_weights_and_temperature_loss_torch(
+    q_values: torch.Tensor,
+    epsilon: float,
+    temperature: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    PyTorch equivalent of Acme's compute_weights_and_temperature_loss.
+
+    Args:
+      q_values: [K, B] Q-values for K sampled actions per state.
+      epsilon: scalar KL constraint target.
+      temperature: positive scalar dual variable (already in primal space).
+
+    Returns:
+      normalized_weights: [K, B] softmax-normalized weights (no grad).
+      temperature_loss: scalar temperature (dual) loss for backprop.
+    """
+    # Ensure we don't propagate gradients through Q into the temperature update.
+    tempered_q = (q_values.detach()) / temperature
+
+    # Softmax over action-sample dimension K.
+    normalized_weights = torch.softmax(tempered_q, dim=0).detach()
+
+    # Dual loss: epsilon + E[logsumexp(Q/τ) - log K], multiplied by τ.
+    # dim=0 -> over K actions; mean over batch B.
+    q_logsumexp = torch.logsumexp(tempered_q, dim=0)  # [B]
+    log_num_actions = math.log(q_values.shape[0])
+    loss_temperature_inner = float(epsilon) + q_logsumexp.mean() - log_num_actions
+    temperature_loss = temperature * loss_temperature_inner
+    return normalized_weights, temperature_loss
+
+
+def compute_nonparametric_kl_from_normalized_weights_torch(
+    normalized_weights: torch.Tensor,
+) -> torch.Tensor:
+    """
+    PyTorch equivalent of Acme's compute_nonparametric_kl_from_normalized_weights.
+
+    Args:
+      normalized_weights: [K, B] normalized discrete distribution over K actions.
+
+    Returns:
+      kl: [B] estimated KL(q_nonparametric || uniform over K actions).
+    """
+    K = normalized_weights.shape[0]
+    num_action_samples = float(K)
+    integrand = torch.log(num_action_samples * normalized_weights + 1e-8)
+    return torch.sum(normalized_weights * integrand, dim=0)
