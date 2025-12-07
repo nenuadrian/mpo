@@ -99,12 +99,25 @@ def main():
                 dir=config.log_dir,
             )
 
-            pi = train_mpo(config, device)
+            train_mpo(config, device)
 
             try:
+                env = make_offscreen_env(env_name)
+                policy = GaussianPolicy(
+                    env.observation_space.shape[0],
+                    env.action_space.shape[0],
+                    env.action_space.low,
+                    env.action_space.high,
+                )
+                ckpt_path = os.path.join(
+                    config.log_dir, "checkpoints", "checkpoint_maxeval.pt"
+                )
+                print(f"Loading policy from checkpoint: {ckpt_path}")
+                load_policy_from_checkpoint(ckpt_path, policy)
                 generate_video(
                     env_name=env_name,
-                    policy=pi,
+                    env=env,
+                    policy=policy,
                     output_path=os.path.join(config.log_dir, "video.mp4"),
                     num_episodes=2,
                     max_steps=1000,
