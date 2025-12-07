@@ -17,3 +17,15 @@ python src/generate_video.py logs/mpo_experiment/checkpoints/checkpoint_ep309.pt
 ## Cheeting cheetah
 
 ![MPO Video](assets/cheetah.gif)
+
+## visualize
+
+```bash
+python src/visualize.py --project-metric "ppo6::eval/mean_reward" --project-metric "custom_mpo6::eval/mean_reward" --entity "adrian-research" --cache-dir logs --show-individual
+```
+
+## Tests
+
+```bash
+python -m pytest tests
+```
