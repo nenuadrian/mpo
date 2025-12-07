@@ -13,7 +13,12 @@ import wandb
 from mpo.gaussian_policy import GaussianPolicy
 from mpo.replay_buffer import NStepReplayBuffer
 from mpo.q_network import QNetwork
-from mpo.utils import evaluate_policy, checkpoint_if_needed, compute_grad_stats
+from mpo.utils import (
+    evaluate_policy,
+    checkpoint_if_needed,
+    compute_grad_stats,
+    setup_logging,
+)
 from mpo.mpo_config import MPOConfig
 
 
@@ -222,9 +227,12 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
 
     replay_buffer = warmup_replay_buffer(env, device, config, pi_old)
 
+    logger = setup_logging(config.log_dir)
+
     global_step = 0
+    max_eval_return = -float("inf")
     for episode in range(config.num_training_episodes):
-        print("[Train] Starting episode %d ..." % (episode + 1))
+        logger.info("Starting episode %d ...", episode + 1)
         wandb.log({"train/episode": episode}, step=global_step)
 
         obs, _ = env.reset()
@@ -375,12 +383,41 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
             {"train/ep_length": ep_length, "train/ep_reward": ep_reward},
             step=global_step,
         )
-        print(
-            f"[Train] episode={episode+1} global_step={global_step} ep_length={ep_length:.3f}s"
+        logger.info(
+            "episode=%d global_step=%d ep_length=%.3f",
+            episode + 1,
+            global_step,
+            ep_length,
         )
+
+        checkpoint_max_eval_return = False
+        if (episode + 1) % config.eval_freq == 0:
+            eval_returns = evaluate_policy(
+                pi, eval_env, device, n_eval_episodes=config.eval_episodes
+            )
+            eval_mean = float(np.mean(eval_returns))
+            if eval_mean > max_eval_return:
+                max_eval_return = eval_mean
+                checkpoint_max_eval_return = True
+            eval_length_mean = float(np.mean([len(r) for r in eval_returns]))
+            wandb.log(
+                {
+                    "eval/mean_reward": eval_mean,
+                    "eval/mean_ep_length": eval_length_mean,
+                },
+                step=global_step,
+            )
+            logger.info(
+                "Eval: episode=%d global_step=%d eval_mean=%.3f eval_length_mean=%.3f",
+                episode + 1,
+                global_step,
+                eval_mean,
+                eval_length_mean,
+            )
 
         checkpoint_if_needed(
             config=config,
+            checkpoint_max_eval_return=checkpoint_max_eval_return,
             episode=episode,
             global_step=global_step,
             q=q,
@@ -390,24 +427,5 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
             q_optimizer=q_optimizer,
             pi_optimizer=pi_optimizer,
         )
-
-        # Periodic evaluation: log to tensorboard, wandb, and console
-        if (episode + 1) % config.eval_freq == 0:
-            eval_returns = evaluate_policy(
-                pi, eval_env, device, n_eval_episodes=config.eval_episodes
-            )
-            eval_mean = float(np.mean(eval_returns))
-            eval_length_mean = float(np.mean([len(r) for r in eval_returns]))
-            wandb.log(
-                {
-                    "eval/mean_reward": eval_mean,
-                    "eval/mean_ep_length": eval_length_mean,
-                },
-                step=global_step,
-            )
-            print(
-                f"[Eval] episode={episode+1} global_step={global_step} "
-                f"eval_mean={eval_mean:.3f} eval_length_mean={eval_length_mean:.3f}"
-            )
 
     return pi

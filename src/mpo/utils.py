@@ -1,5 +1,6 @@
 import os
 import sys
+import logging
 
 import torch
 import numpy as np
@@ -7,6 +8,26 @@ import gymnasium
 import imageio
 import torch.nn as nn
 import wandb
+
+LOGGER_NAME = "mpo"
+logger = logging.getLogger(LOGGER_NAME)
+
+
+def setup_logging(log_dir: str, filename: str = "training.log") -> logging.Logger:
+    os.makedirs(log_dir, exist_ok=True)
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    file_handler = logging.FileHandler(os.path.join(log_dir, filename))
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    logger.propagate = False
+    return logger
+
 
 from mpo.gaussian_policy import GaussianPolicy
 from mpo.q_network import QNetwork
@@ -76,9 +97,12 @@ def checkpoint_if_needed(
     pi_old: GaussianPolicy,
     q_optimizer: torch.optim.Optimizer,
     pi_optimizer: torch.optim.Optimizer,
+    checkpoint_max_eval_return: bool = False,
 ) -> bool:
-    if (episode + 1) % config.checkpoint_ep_freq != 0:
-        wandb.log({"train/checkpoint_saved": 0}, step=global_step)
+    if (
+        episode + 1
+    ) % config.checkpoint_ep_freq != 0 and not checkpoint_max_eval_return:
+        wandb.log({"train/checkpoint_ep": 0}, step=global_step)
         return False
 
     checkpoint_dir = os.path.join(config.log_dir, "checkpoints")
@@ -94,12 +118,17 @@ def checkpoint_if_needed(
             "q_optimizer_state_dict": q_optimizer.state_dict(),
             "pi_optimizer_state_dict": pi_optimizer.state_dict(),
         }
-        ckpt_path = os.path.join(checkpoint_dir, f"checkpoint_ep{episode+1}.pt")
+        if checkpoint_max_eval_return:
+            checkpoint_name = f"checkpoint_maxeval.pt"
+        else:
+            checkpoint_name = f"checkpoint_ep{episode+1}.pt"
+        ckpt_path = os.path.join(checkpoint_dir, checkpoint_name)
         torch.save(checkpoint, ckpt_path)
         torch.save(checkpoint, os.path.join(checkpoint_dir, "checkpoint_latest.pt"))
+        logger.info("Saved checkpoint to %s", ckpt_path)
         wandb.log({"train/checkpoint_ep": episode + 1}, step=global_step)
     except Exception as e:
-        print(f"[ERROR] failed to save checkpoint: {e}")
+        logger.error("Failed to save checkpoint: %s", e)
         return False
     return True
 
@@ -152,17 +181,19 @@ def make_offscreen_env(env_name: str):
                 # It's fine; env creation itself worked
                 pass
 
-            print(
-                f"[make_offscreen_env] using MUJOCO_GL={backend_name} "
-                f"on platform={platform}"
+            logger.info(
+                "using MUJOCO_GL=%s on platform=%s",
+                backend_name,
+                platform,
             )
             return env
-
         except Exception as e:
             last_err = e
-            print(
-                f"[make_offscreen_env] backend {backend_name} failed on "
-                f"{platform}: {e}"
+            logger.warning(
+                "backend %s failed on %s: %s",
+                backend_name,
+                platform,
+                e,
             )
             try:
                 env.close()
@@ -200,7 +231,7 @@ def generate_video(
     writer = imageio.get_writer(output_path, fps=fps)
 
     try:
-        print(f"Recording {num_episodes} episodes to {output_path}...")
+        logger.info("Recording %d episodes to %s...", num_episodes, output_path)
         for ep in range(num_episodes):
             obs, _ = env.reset()
             done = False
@@ -210,7 +241,7 @@ def generate_video(
                 frame = env.render()
             except Exception as e:
                 frame = None
-                print(f"[generate_video] warning: initial render failed: {e}")
+                logger.warning("initial render failed: %s", e)
             if frame is not None:
                 # ensure uint8
                 if frame.dtype != np.uint8:
@@ -242,9 +273,7 @@ def generate_video(
                     frame = env.render()
                 except Exception as e:
                     frame = None
-                    print(
-                        f"[generate_video] warning: render failed at step {steps}: {e}"
-                    )
+                    logger.warning("render failed at step %d: %s", steps, e)
 
                 if frame is not None:
                     if frame.dtype != np.uint8:
@@ -253,13 +282,11 @@ def generate_video(
 
                 steps += 1
 
-            print(f"Episode {ep+1} recorded, steps={steps}")
-
+            logger.info("Episode %d recorded, steps=%d", ep + 1, steps)
     finally:
         writer.close()
         env.close()
-
-    print(f"Saved video to: {output_path}")
+    logger.info("Saved video to: %s", output_path)
 
 
 def load_policy_from_checkpoint(ckpt_path: str, policy: torch.nn.Module):
