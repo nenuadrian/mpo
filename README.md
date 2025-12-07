@@ -3,7 +3,7 @@
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb "imageio[ffmpeg]"
+pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb "imageio[ffmpeg]" pytest
 
 python src/main.py --static_seed 42 --num_training_episodes 10000 --env_names HalfCheetah-v5,Walker2d-v5 --env_iterations 3
 
