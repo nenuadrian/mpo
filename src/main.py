@@ -64,7 +64,7 @@ def main():
 
             experiment_identifier = (
                 env_name
-                + "_iter"
+                + "__iter"
                 + str(iteration + 1)
                 + f"_seed{seed}"
                 + "_"
