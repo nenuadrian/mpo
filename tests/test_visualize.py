@@ -136,7 +136,7 @@ def test_visualize_multiple_projects_with_envelopes(monkeypatch, tmp_path, capsy
         str(output_path),
         "--smoothing-window",
         "1",
-        "--show-individual"
+        "--show-individual",
     ]
     monkeypatch.setattr(sys, "argv", argv)
 
@@ -146,13 +146,6 @@ def test_visualize_multiple_projects_with_envelopes(monkeypatch, tmp_path, capsy
     # basic file output checks
     assert output_path.exists() and output_path.stat().st_size > 0
     assert "from 2 project(s)" in captured.out
-
-    import shutil
-
-    shutil.copyfile(
-        output_path,
-        "/Users/user/Desktop/test_visualize_multiple_projects_with_envelopes2.png",
-    )
 
     # ensure per-project run counts were reported (pluralized by the script)
     assert "entityA/projectA [metric_A] -> 5 runs" in captured.out
