@@ -13,6 +13,11 @@ class MPOConfig:
         dual_lr=1e-3,
         eta=1.0,
         kl_epsilon=0.2,
+        epsilon_mean=2.5e-3,
+        epsilon_stddev=1e-6,
+        temperature_min=1e-3,
+        temperature_max=50.0,
+        target_q_num_samples=8,
         policy_old_sync_frequency=50,
         log_dir="./logs/mpo_experiment",
         eval_freq=10,
@@ -38,6 +43,11 @@ class MPOConfig:
         self.dual_lr = dual_lr
         self.eta = eta
         self.kl_epsilon = kl_epsilon
+        self.epsilon_mean = epsilon_mean
+        self.epsilon_stddev = epsilon_stddev
+        self.temperature_min = temperature_min
+        self.temperature_max = temperature_max
+        self.target_q_num_samples = target_q_num_samples
         self.policy_old_sync_frequency = policy_old_sync_frequency
         self.log_dir = log_dir
         self.eval_freq = eval_freq

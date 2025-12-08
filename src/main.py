@@ -7,8 +7,9 @@ import torch
 import wandb
 
 from mpo.algorithm import train_mpo
+from mpo.gaussian_policy import GaussianPolicy
 from mpo.mpo_config import MPOConfig
-from mpo.utils import generate_video
+from mpo.utils import generate_video, make_offscreen_env, load_policy_from_checkpoint
 
 
 def main():
@@ -31,6 +32,11 @@ def main():
     parser.add_argument("--dual_lr", type=float, default=1e-3)
     parser.add_argument("--eta", type=float, default=1.0)
     parser.add_argument("--kl_epsilon", type=float, default=0.2)
+    parser.add_argument("--epsilon_mean", type=float, default=2.5e-3)
+    parser.add_argument("--epsilon_stddev", type=float, default=1e-6)
+    parser.add_argument("--temperature_min", type=float, default=1e-3)
+    parser.add_argument("--temperature_max", type=float, default=50.0)
+    parser.add_argument("--target_q_num_samples", type=int, default=8)
     parser.add_argument("--policy_old_sync_frequency", type=int, default=1000)
     parser.add_argument("--base_log_dir", type=str, default="./logs/mpo_experiment")
     parser.add_argument("--eval_freq", type=int, default=10)
