@@ -37,5 +37,7 @@ python -m pytest tests
 ### visualise
 
 ```bash
-python ./plot_acme_results.py --metric episode_return --file "Cartpole_Balance::results/mpo-tf-cartpole-balance.csv" --file "Hopper_Stand::results/mpo-tf-hopper-stand.csv" --file "Walker_Walk::results/mpo-tf-walker-walk.csv" --file "Walker_Run::results/mpo-tf-walker-run.csv"
+python src/plot_acme_results.py --output acme-results/metric_plot.png --metric episode_return --file "Cartpole_Balance::acme-results/mpo-tf-cartpole-balance.csv" --file "Hopper_Stand::acme-results/mpo-tf-hopper-stand.csv" --file "Walker_Walk::acme-results/mpo-tf-walker-walk.csv" --file "Walker_Run::acme-results/mpo-tf-walker-run.csv" --file "Reacher_Easy::acme-results/mpo-tf-reacher-easy.csv" --file "Reacher_HArd::acme-results/mpo-tf-reacher-hard.csv"
 ```
+
+![Acme Results](acme-results/metric_plot.png)

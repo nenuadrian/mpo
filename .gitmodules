@@ -1,0 +1,9 @@
+[submodule "acme"]
+	path = acme
+	url = git@github.com:nenuadrian/acme.git
+[submodule "stable-baselines3"]
+	path = stable-baselines3
+	url = git@github.com:nenuadrian/stable-baselines3.git
+[submodule "rl-baselines3-zoo"]
+	path = rl-baselines3-zoo
+	url = git@github.com:nenuadrian/rl-baselines3-zoo.git
