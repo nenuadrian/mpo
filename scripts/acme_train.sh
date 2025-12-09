@@ -25,7 +25,7 @@ for pair in "${pairs[@]}"; do
 
   echo "Running: ${domain}/${task}"
 
-  python acme/examples/tf/control_suite/lp_mpo.py \
+  python src/train_acme_lp_mpo_tf.py \
     --domain "${domain}" \
     --task "${task}" \
     --max_actor_steps 10000000 > logs/logs-$domain-$task.log 2>&1
