@@ -775,7 +775,7 @@ def parse_args():
         help="Comma-separated list of environment names to train on",
     )
     parser.add_argument("--env_iterations", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=200000)
+    parser.add_argument("--max_steps", type=int, default=500000)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--replay_size", type=int, default=100000)
     parser.add_argument("--n_step", type=int, default=5)
