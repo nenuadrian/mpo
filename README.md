@@ -1,35 +1,41 @@
-# MPO From Scratch
+# On implementing Maximum a Posteriori Policy Optimization (MPO)
+
+## Implementing from scratch in PyTorch
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb "imageio[ffmpeg]" "shimmy[bsuite,atari,dm-control]"
 
-python src/train.py --num_training_episodes 10000 --env_names HalfCheetah-v5,Walker2d-v5 --env_iterations 3
+python src/train_custom_pytorch_mpo.py --num_training_episodes 10000 --env_names HalfCheetah-v5,Walker2d-v5 --env_iterations 3
 
 python src/generate_video.py logs/mpo_experiment/checkpoints/checkpoint_ep309.pt --env_name HalfCheetah-v5 --output mpo_halfcheetah.mp4
 ```
 
-## Eval
+### Eval
 
 ![MPO Training](assets/graph.png)
 
-## Cheeting cheetah
+### Cheeting cheetah
 
 ![MPO Video](assets/cheetah.gif)
 
-## visualize
+### visualize
 
 ```bash
 python src/visualize.py --project-metric "ppo6::eval/mean_reward" --project-metric "custom_mpo6::eval/mean_reward" --entity "adrian-research" --cache-dir logs --show-individual
 ```
 
-## Acme
+## Using Google DeepMind Acme
+
+Very difficult to get it to build. TensorFlow version is only one that I was able to get working.
+
+Combined all code necessary in `src/train_acme_lp_mpo_tf.py`. But still need a lot of the tricks I have documented in my `acme` fork.
 
 ### visualise
 
 ```bash
-python src/plot_acme_results.py --output acme-results/metric_plot.png --metric episode_return --file "Cartpole_Balance::acme-results/mpo-tf-cartpole-balance.csv" --file "Hopper_Stand::acme-results/mpo-tf-hopper-stand.csv" --file "Walker_Walk::acme-results/mpo-tf-walker-walk.csv" --file "Walker_Run::acme-results/mpo-tf-walker-run.csv" --file "Reacher_Easy::acme-results/mpo-tf-reacher-easy.csv" --file "Reacher_Hard::acme-results/mpo-tf-reacher-hard.csv"
+python src/plot_acme_results.py --output results/acme/metric_plot.png --metric episode_return --file "Cartpole_Balance::results/acme/mpo-tf-cartpole-balance.csv" --file "Hopper_Stand::results/acme/mpo-tf-hopper-stand.csv" --file "Hopper_Hop::results/acme/mpo-tf-hopper-hop.csv" --file "Walker_Walk::results/acme/mpo-tf-walker-walk.csv" --file "Walker_Run::results/acme/mpo-tf-walker-run.csv" --file "Walker_Stand::results/acme/mpo-tf-walker-stand.csv" --file "Reacher_Easy::results/acme/mpo-tf-reacher-easy.csv" --file "Reacher_Hard::results/acme/mpo-tf-reacher-hard.csv"
 ```
 
-![Acme Results](acme-results/metric_plot.png)
+![Acme Results](results/acme/metric_plot.png)

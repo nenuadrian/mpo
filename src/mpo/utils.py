@@ -219,15 +219,11 @@ def generate_video(
     max_steps: int = 1000,
     fps: int = 30,
     deterministic: bool = False,
-    env: gymnasium.Env = None,
+    env: gymnasium.Env | None = None,
     device: str = "cpu",
 ):
     if env is None:
         env = make_offscreen_env(env_name)
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-    action_low = env.action_space.low
-    action_high = env.action_space.high
     obs0, _ = env.reset()
     writer = imageio.get_writer(output_path, fps=fps)
 

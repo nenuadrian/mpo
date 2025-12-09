@@ -1,10 +1,6 @@
 import argparse
 import os
 
-import numpy as np
-import torch
-import gymnasium
-import imageio
 
 from mpo.gaussian_policy import GaussianPolicy
 from mpo.utils import load_policy_from_checkpoint, make_offscreen_env, generate_video

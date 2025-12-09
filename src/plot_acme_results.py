@@ -83,7 +83,7 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="./results/metric_plot.png",
+        default="./results/acme/metric_plot.png",
         help="If set, save the figure to this path instead of (or in addition to) showing it.",
     )
 
