@@ -605,11 +605,18 @@ class MPOAgent:
         return fetches
 
 
-def make_env(domain: str, task: str):
-    import shimmy
+def make_env(env_name: str):
+    # dm_control names are like "dm_control/domain-task-v0" or you pass "cartpole::balance"
+    if env_name.startswith("dm_control/") or "::" in env_name:
+        import shimmy
 
-    name = f"dm_control/{domain}-{task}-v0"
-    return gym.make(name)
+        if "::" in env_name:
+            domain, task = env_name.split("::")
+            return gym.make(f"dm_control/{domain}-{task}-v0")
+        else:
+            return gym.make(env_name)
+    else:
+        return gym.make(env_name)
 
 
 def flatten_observation(obs):
@@ -623,8 +630,7 @@ def flatten_observation(obs):
 
 
 def train(
-    domain: str,
-    task: str,
+    env_name: str,
     max_steps: int,
     batch_size: int,
     replay_size: int,
@@ -648,9 +654,9 @@ def train(
         "cuda" if torch.cuda.is_available() and device_str == "cuda" else "cpu"
     )
 
-    env = make_env(domain, task)
+    env = make_env(env_name)
     # separate environment for evaluation (keeps train env state intact)
-    eval_env = make_env(domain, task) if eval_freq and eval_episodes > 0 else None
+    eval_env = make_env(env_name) if eval_freq and eval_episodes > 0 else None
     obs0, _ = env.reset()
     obs_flat = flatten_observation(obs0)
     # determine obs and action dims
@@ -810,7 +816,6 @@ if __name__ == "__main__":
     args = parse_args()
     env_names = args.env_names.split(",")
     for env_name in env_names:
-        domain, task = env_name.split("::")
         for iteration in range(args.env_iterations):
             print(
                 f"Training on environment: {env_name}. Starting iteration {iteration + 1}/{args.env_iterations}"
@@ -856,8 +861,7 @@ if __name__ == "__main__":
             )
 
             train(
-                domain=domain,
-                task=task,
+                env_name=env_name,
                 max_steps=args.max_steps,
                 batch_size=args.batch_size,
                 replay_size=args.replay_size,
