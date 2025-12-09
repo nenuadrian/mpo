@@ -746,19 +746,19 @@ def train(
             std_r = float(np.std(eval_returns))
             mean_len = float(np.mean(eval_lengths))
             eval_log = {
-                "eval/mean_return": mean_r,
+                "eval/mean_reward": mean_r,
                 "eval/std_return": std_r,
-                "eval/mean_length": mean_len,
+                "eval/mean_ep_length": mean_len,
             }
             wandb.log(eval_log, step=step)
             print(
-                f"[Eval @ step {step}] mean_return={mean_r:.2f} std={std_r:.2f} mean_len={mean_len:.1f}"
+                f"[Eval @ step {step}] mean_reward={mean_r:.2f} std={std_r:.2f} mean_len={mean_len:.1f}"
             )
 
         if stats is not None and step % 100 == 0:
             elapsed = time.time() - start_time
             print(
-                f"Step {step} | Learn step {stats['learn_steps']} | critic_loss={stats['critic_loss']:.6f} | Ep Return {episode_return:.2f} | Ep Length {episode_len} | elapsed={elapsed:.1f}s"
+                f"Step {step} | Learn step {stats['train/learn_steps']} | critic_loss={stats['train/critic_loss']:.6f} | Ep Return {episode_return:.2f} | Ep Length {episode_len} | elapsed={elapsed:.1f}s"
             )
 
     env.close()
