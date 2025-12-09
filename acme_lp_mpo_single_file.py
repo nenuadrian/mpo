@@ -28,7 +28,10 @@ import dm_env
 import reverb
 import tensorflow_probability as tfp
 from acme import wrappers
-
+from dm_control import suite  # pylint: disable=g-import-not-at-top
+from acme.wrappers import (
+    mujoco as mujoco_wrappers,
+)
 
 from typing import Optional, Tuple
 
@@ -1388,7 +1391,7 @@ def make_networks(
     }
 
 
-def make_environment(
+def _make_environment(
     evaluation: bool = False,
     domain_name: str = "cartpole",
     task_name: str = "balance",
@@ -1399,10 +1402,6 @@ def make_environment(
 ) -> dm_env.Environment:
     """Implements a control suite environment factory."""
     # Load dm_suite lazily not require Mujoco license when not using it.
-    from dm_control import suite  # pylint: disable=g-import-not-at-top
-    from acme.wrappers import (
-        mujoco as mujoco_wrappers,
-    )  # pylint: disable=g-import-not-at-top
 
     # Load raw control suite environment.
     environment = suite.load(domain_name, task_name)
@@ -1431,7 +1430,7 @@ def make_environment(
 
 def main(_):
     make_environment = functools.partial(
-        make_environment, domain_name=_DOMAIN.value, task_name=_TASK.value
+        _make_environment, domain_name=_DOMAIN.value, task_name=_TASK.value
     )
 
     program_builder = DistributedMPO(
