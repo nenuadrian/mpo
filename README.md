@@ -42,6 +42,8 @@ python src/plot_acme_results.py --output results/acme/metric_plot.png --metric e
 
 ## Implementing based on Acme in PyTorch
 
+Python 3.10/3.11 is recommended.
+
 ```bash
 python3 -m venv .venv_acme_pytorch
 source .venv_acme_pytorch/bin/activate
