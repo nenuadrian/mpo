@@ -596,7 +596,7 @@ class MPOAgent:
         # policy update using MPO loss
         # Use detached target embeddings (o_t) for policy computation so the policy head
         # updates but not the observation encoder (mirrors TF stop_gradient on o_t).
-        emb_o_t = obs_emb.detach()
+        emb_o_t = emb_next.detach()
         online_mean, online_scale = self.policy_head(emb_o_t)
         # target mean/scale already computed as t_mean/t_scale (from above, no_grad)
         # compute MPO loss with sampled_actions and q_samples
