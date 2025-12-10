@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import wandb
 import shimmy
+import torch.distributions as dist
 
 
 # Cross-entropy loss: - E_{nonparametric}[ log pi_online(sampled_action) ]
@@ -319,19 +320,14 @@ class MPOLoss(nn.Module):
             fixed_mean_mean, fixed_mean_scale, N, sampled_actions, normalized_weights
         )
 
-        # KL computations: KL(target || fixed) per-dim
-        def kl_diag(m_p, s_p, m_q, s_q):
-            # Correct KL(P || Q) for diagonal normals with stddevs s_p, s_q
-            var_p = s_p**2
-            var_q = s_q**2
-            # KL = log(s_q/s_p) + (var_p + (m_p - m_q)^2) / (2 * var_q) - 0.5
-            term = (
-                torch.log(s_q / s_p) + (var_p + (m_p - m_q) ** 2) / (2.0 * var_q) - 0.5
-            )
-            return term  # [B,D]
+        # KL computations: KL(target || fixed) per-dim using PyTorch distributions
+        # Create distributions: P is the "fixed" (online decomposed), Q is the target
+        dist_fixed_std = dist.Normal(fixed_std_mean, fixed_std_scale)  # P for mean KL
+        dist_target = dist.Normal(target_mean, target_scale)  # Q for mean KL
+        kl_mean = dist.kl_divergence(dist_fixed_std, dist_target)  # KL(P || Q) [B, D]
 
-        kl_mean = kl_diag(fixed_std_mean, fixed_std_scale, target_mean, target_scale)
-        kl_std = kl_diag(fixed_mean_mean, fixed_mean_scale, target_mean, target_scale)
+        dist_fixed_mean = dist.Normal(fixed_mean_mean, fixed_mean_scale)  # P for std KL
+        kl_std = dist.kl_divergence(dist_fixed_mean, dist_target)  # KL(P || Q) [B, D]
 
         if not self.per_dim:
             kl_mean = kl_mean.sum(dim=-1, keepdim=True)  # [B,1]
