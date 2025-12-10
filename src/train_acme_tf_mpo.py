@@ -3,10 +3,10 @@
 import functools
 from typing import List, Optional, Dict, Tuple, Union, Sequence, Callable
 import time
-import copy
 import threading
 import collections
 import random
+import types as py_types
 
 import tree
 import dm_env
@@ -36,7 +36,6 @@ from acme import adders as acme_adders
 from acme.tf import utils as tf2_utils
 from acme.utils import observers as observers_lib
 from acme.utils import signals
-import types as py_types
 
 
 tfd = tfp.distributions
@@ -373,292 +372,6 @@ class SimpleNStepAdder:
     def reset(self):
         self._buffer = []
         self._first = True
-
-
-class AcmeMPO:
-    """Program definition for MPO."""
-
-    def __init__(
-        self,
-        environment_factory: Callable[[], dm_env.Environment],
-        network_factory: Callable[[specs.BoundedArray], Dict[str, snt.Module]],
-        environment_spec: Optional[specs.EnvironmentSpec] = None,
-        batch_size: int = 256,
-        prefetch_size: int = 4,
-        min_replay_size: int = 1000,
-        max_replay_size: int = 1000000,
-        samples_per_insert: Optional[float] = 32.0,
-        n_step: int = 5,
-        num_samples: int = 20,
-        additional_discount: float = 0.99,
-        target_policy_update_period: int = 100,
-        target_critic_update_period: int = 100,
-        variable_update_period: int = 1000,
-        max_actor_steps: Optional[int] = None,
-        log_every: float = 10.0,
-    ):
-
-        if environment_spec is None:
-            environment_spec = specs.make_environment_spec(environment_factory())
-
-        self._environment_factory = environment_factory
-        self._network_factory = network_factory
-        self._environment_spec = environment_spec
-        self._batch_size = batch_size
-        self._prefetch_size = prefetch_size
-        self._min_replay_size = min_replay_size
-        self._max_replay_size = max_replay_size
-        self._samples_per_insert = samples_per_insert
-        self._n_step = n_step
-        self._additional_discount = additional_discount
-        self._num_samples = num_samples
-        self._target_policy_update_period = target_policy_update_period
-        self._target_critic_update_period = target_critic_update_period
-        self._variable_update_period = variable_update_period
-        self._max_actor_steps = max_actor_steps
-        self._log_every = log_every
-
-    def replay(self):
-        """Return in-memory replay buffer."""
-        return ReplayBuffer(
-            max_size=self._max_replay_size, min_size_to_sample=self._min_replay_size
-        )
-
-    def counter(self):
-        return Runner(counting.Counter())
-
-    def coordinator(self, counter: counting.Counter, max_actor_steps: int):
-        return lp_utils.StepsLimiter(counter, max_actor_steps)
-
-    def learner(
-        self,
-        replay: ReplayBuffer,
-        counter: counting.Counter,
-    ):
-        """The Learning part of the agent. The replay arg is now a ReplayBuffer."""
-
-        act_spec = self._environment_spec.actions
-        obs_spec = self._environment_spec.observations
-
-        # Create online and target networks.
-        online_networks = self._network_factory(act_spec)
-        target_networks = self._network_factory(act_spec)
-
-        # Make sure observation networks are Sonnet Modules.
-        observation_network = online_networks.get("observation", tf.identity)
-        observation_network = tf2_utils.to_sonnet_module(observation_network)
-        online_networks["observation"] = observation_network
-        target_observation_network = target_networks.get("observation", tf.identity)
-        target_observation_network = tf2_utils.to_sonnet_module(
-            target_observation_network
-        )
-        target_networks["observation"] = target_observation_network
-
-        # Get embedding spec and create observation network variables.
-        emb_spec = tf2_utils.create_variables(observation_network, [obs_spec])
-
-        tf2_utils.create_variables(online_networks["policy"], [emb_spec])
-        tf2_utils.create_variables(online_networks["critic"], [emb_spec, act_spec])
-        tf2_utils.create_variables(target_networks["observation"], [obs_spec])
-        tf2_utils.create_variables(target_networks["policy"], [emb_spec])
-        tf2_utils.create_variables(target_networks["critic"], [emb_spec, act_spec])
-
-        # Create a generator that samples minibatches from the replay buffer.
-        def dataset_generator():
-            while True:
-                batch = replay.sample_batch(self._batch_size)
-                # previously we used reverb dataset elements with `.data`. MPOLearner now
-                # consumes transitions directly, so yield the transition namespace.
-                yield batch
-
-        dataset_iterable = dataset_generator()
-
-        # Create a counter and logger for bookkeeping steps and performance.
-        counter = counting.Counter(counter, "learner")
-        logger = loggers.make_default_logger(
-            "learner", time_delta=self._log_every, steps_key="learner_steps"
-        )
-
-        # Return the learning agent.
-        return MPOLearner(
-            policy_network=online_networks["policy"],
-            critic_network=online_networks["critic"],
-            observation_network=observation_network,
-            target_policy_network=target_networks["policy"],
-            target_critic_network=target_networks["critic"],
-            target_observation_network=target_observation_network,
-            discount=self._additional_discount,
-            num_samples=self._num_samples,
-            target_policy_update_period=self._target_policy_update_period,
-            target_critic_update_period=self._target_critic_update_period,
-            dataset=dataset_iterable,
-            counter=counter,
-            logger=logger,
-        )
-
-    def actor(
-        self,
-        replay: ReplayBuffer,
-        variable_source: acme.VariableSource,
-        counter: counting.Counter,
-    ) -> EnvironmentLoop:
-        """The actor process (single-process) using SimpleNStepAdder."""
-        action_spec = self._environment_spec.actions
-        observation_spec = self._environment_spec.observations
-
-        environment = self._environment_factory()
-        agent_networks = self._network_factory(action_spec)
-
-        behavior_modules = [
-            agent_networks.get("observation", tf.identity),
-            agent_networks.get("policy"),
-            StochasticSamplingHead(),
-        ]
-        behavior_network = snt.Sequential(behavior_modules)
-
-        tf2_utils.create_variables(behavior_network, [observation_spec])
-        policy_variables = {"policy": behavior_network.variables}
-
-        variable_client = tf2_variable_utils.VariableClient(
-            variable_source,
-            policy_variables,
-            update_period=self._variable_update_period,
-        )
-
-        variable_client.update_and_wait()
-
-        adder = SimpleNStepAdder(
-            replay, n_step=self._n_step, discount=self._additional_discount
-        )
-
-        actor = FeedForwardActor(
-            policy_network=behavior_network,
-            adder=adder,
-            variable_client=variable_client,
-        )
-
-        counter = counting.Counter(counter, "actor")
-        logger = loggers.make_default_logger(
-            "actor",
-            save_data=False,
-            time_delta=self._log_every,
-            steps_key="actor_steps",
-        )
-
-        return EnvironmentLoop(environment, actor, counter, logger)
-
-    def evaluator(
-        self,
-        variable_source: acme.VariableSource,
-        counter: counting.Counter,
-    ):
-        """The evaluation process (single-process)."""
-        action_spec = self._environment_spec.actions
-        observation_spec = self._environment_spec.observations
-
-        environment = self._environment_factory()
-        agent_networks = self._network_factory(action_spec)
-
-        evaluator_modules = [
-            agent_networks.get("observation", tf.identity),
-            agent_networks.get("policy"),
-            StochasticMeanHead(),
-        ]
-
-        if isinstance(action_spec, specs.BoundedArray):
-            evaluator_modules += [ClipToSpec(action_spec)]
-        evaluator_network = snt.Sequential(evaluator_modules)
-
-        tf2_utils.create_variables(evaluator_network, [observation_spec])
-        policy_variables = {"policy": evaluator_network.variables}
-
-        variable_client = tf2_variable_utils.VariableClient(
-            variable_source,
-            policy_variables,
-            update_period=self._variable_update_period,
-        )
-
-        variable_client.update_and_wait()
-
-        evaluator = FeedForwardActor(
-            policy_network=evaluator_network, variable_client=variable_client
-        )
-
-        counter = counting.Counter(counter, "evaluator")
-        logger = loggers.make_default_logger(
-            "evaluator", time_delta=self._log_every, steps_key="evaluator_steps"
-        )
-
-        return EnvironmentLoop(environment, evaluator, counter, logger)
-
-
-class FeedForwardActor(core.Actor):
-    """A feed-forward actor.
-
-    An actor based on a feed-forward policy which takes non-batched observations
-    and outputs non-batched actions. It also allows adding experiences to replay
-    and updating the weights from the policy on the learner.
-    """
-
-    def __init__(
-        self,
-        policy_network: snt.Module,
-        adder: Optional[acme_adders.Adder] = None,
-        variable_client: Optional[tf2_variable_utils.VariableClient] = None,
-    ):
-        """Initializes the actor.
-
-        Args:
-          policy_network: the policy to run.
-          adder: the adder object to which allows to add experiences to a
-            dataset/replay buffer.
-          variable_client: object which allows to copy weights from the learner copy
-            of the policy to the actor copy (in case they are separate).
-        """
-
-        # Store these for later use.
-        self._adder = adder
-        self._variable_client = variable_client
-        self._policy_network = policy_network
-
-    @tf.function
-    def _policy(self, observation: types.NestedTensor) -> types.NestedTensor:
-        # Add a dummy batch dimension and as a side effect convert numpy to TF.
-        batched_observation = tf2_utils.add_batch_dim(observation)
-
-        # Compute the policy, conditioned on the observation.
-        policy = self._policy_network(batched_observation)
-
-        # Sample from the policy if it is stochastic.
-        action = policy.sample() if isinstance(policy, tfd.Distribution) else policy
-
-        return action
-
-    def select_action(self, observation: types.NestedArray) -> types.NestedArray:
-        # Pass the observation through the policy network.
-        action = self._policy(observation)
-
-        # Return a numpy array with squeezed out batch dimension.
-        return tf2_utils.to_numpy_squeeze(action)
-
-    def observe_first(self, timestep: dm_env.TimeStep):
-        if self._adder:
-            self._adder.add_first(timestep)
-
-    def observe(self, action: types.NestedArray, next_timestep: dm_env.TimeStep):
-        if self._adder:
-            self._adder.add(action, next_timestep)
-
-    def update(self, wait: bool = False):
-        if self._variable_client:
-            self._variable_client.update(wait)
-
-
-class StochasticMeanHead(snt.Module):
-    """Simple sonnet module to produce the mean of a tfp.Distribution."""
-
-    def __call__(self, distribution: tfd.Distribution):
-        return distribution.mean()
 
 
 class AcmeMPO:
@@ -1974,4 +1687,181 @@ class NearZeroInitializedLinear(snt.Linear):
         super().__init__(output_size, w_init=tf.initializers.VarianceScaling(scale))
 
 
-class Critic
+class CriticMultiplexer(snt.Module):
+    """Module connecting a critic torso to (transformed) observations/actions.
+
+    This takes as input a `critic_network`, an `observation_network`, and an
+    `action_network` and returns another network whose outputs are given by
+    `critic_network(observation_network(o), action_network(a))`.
+
+    The observations and actions passed to this module are assumed to have a batch
+    dimension that match.
+
+    Notes:
+    - Either the `observation_` or `action_network` can be `None`, in which case
+      the observation or action, resp., are passed to the critic network as is.
+    - If all `critic_`, `observation_` and `action_network` are `None`, this
+      module reduces to a simple `tf2_utils.batch_concat()`.
+    """
+
+    def __init__(
+        self,
+        critic_network: Optional[TensorTransformation] = None,
+        observation_network: Optional[TensorTransformation] = None,
+        action_network: Optional[TensorTransformation] = None,
+    ):
+        self._critic_network = critic_network
+        self._observation_network = observation_network
+        self._action_network = action_network
+        super().__init__(name="critic_multiplexer")
+
+    def __call__(
+        self, observation: types.NestedTensor, action: types.NestedTensor
+    ) -> tf.Tensor:
+
+        # Maybe transform observations and actions before feeding them on.
+        if self._observation_network:
+            observation = self._observation_network(observation)
+        if self._action_network:
+            action = self._action_network(action)
+
+        if hasattr(observation, "dtype") and hasattr(action, "dtype"):
+            if observation.dtype != action.dtype:
+                # Observation and action must be the same type for concat to work
+                action = tf.cast(action, observation.dtype)
+
+        # Concat observations and actions, with one batch dimension.
+        outputs = tf2_utils.batch_concat([observation, action])
+
+        # Maybe transform output before returning.
+        if self._critic_network:
+            outputs = self._critic_network(outputs)
+
+        return outputs
+
+
+class ClipToSpec(snt.Module):
+    """Sonnet module clipping inputs to within a BoundedArraySpec."""
+
+    def __init__(self, spec: specs.BoundedArray, name: str = "clip_to_spec"):
+        super().__init__(name=name)
+        self._min = spec.minimum
+        self._max = spec.maximum
+
+    def __call__(self, inputs: tf.Tensor) -> tf.Tensor:
+        return tf.clip_by_value(inputs, self._min, self._max)
+
+
+def make_networks(
+    action_spec: specs.BoundedArray,
+    policy_layer_sizes: Sequence[int] = (256, 256, 256),
+    critic_layer_sizes: Sequence[int] = (512, 512, 256),
+) -> Dict[str, types.TensorTransformation]:
+    """Creates networks used by the agent."""
+
+    num_dimensions = np.prod(action_spec.shape, dtype=int)
+
+    policy_network = snt.Sequential(
+        [
+            LayerNormMLP(policy_layer_sizes, activate_final=True),
+            MultivariateNormalDiagHead(
+                num_dimensions, init_scale=0.7, use_tfd_independent=True
+            ),
+        ]
+    )
+
+    # The multiplexer concatenates the (maybe transformed) observations/actions.
+    multiplexer = CriticMultiplexer(action_network=ClipToSpec(action_spec))
+    critic_network = snt.Sequential(
+        [
+            multiplexer,
+            LayerNormMLP(critic_layer_sizes, activate_final=True),
+            NearZeroInitializedLinear(1),
+        ]
+    )
+
+    return {
+        "policy": policy_network,
+        "critic": critic_network,
+        "observation": tf2_utils.batch_concat,
+    }
+
+
+def _make_environment(
+    evaluation: bool = False,
+    domain_name: str = "cartpole",
+    task_name: str = "balance",
+    num_action_repeats: Optional[int] = None,
+) -> dm_env.Environment:
+    """Implements a control suite environment factory."""
+    # Load raw control suite environment.
+    environment = suite.load(domain_name, task_name)
+
+    environment = wrappers.CanonicalSpecWrapper(environment, clip=True)
+
+    if num_action_repeats:
+        environment = wrappers.ActionRepeatWrapper(
+            environment, num_repeats=num_action_repeats
+        )
+    environment = wrappers.SinglePrecisionWrapper(environment)
+
+    return environment
+
+
+def main(_):
+    make_environment = functools.partial(
+        _make_environment, domain_name=_DOMAIN.value, task_name=_TASK.value
+    )
+
+    program_builder = AcmeMPO(
+        make_environment,
+        make_networks,
+        target_policy_update_period=25,
+        max_actor_steps=_MAX_ACTOR_STEPS.value,
+    )
+
+    # Single-process components:
+    replay = program_builder.replay()
+    counter = counting.Counter()
+    learner = program_builder.learner(replay, counter)
+    # The actor/evaluator expect a variable_source with get_variables(names) -> numpy arrays.
+    # MPOLearner implements get_variables, so we pass 'learner' directly.
+    actor_loop = program_builder.actor(replay, learner, counter)
+    evaluator_loop = program_builder.evaluator(learner, counter)
+
+    # Simple main loop:
+    episode = 0
+    try:
+        while True:
+            # Run one actor episode (collects into replay via SimpleNStepAdder).
+            actor_result = actor_loop.run_episode()
+            episode += 1
+            print(
+                f"Actor episode {episode}: length={actor_result['episode_length']}, return={actor_result['episode_return']}"
+            )
+
+            # Run some learner steps if buffer has enough data. We choose a heuristic:
+            # samples_per_insert governs number of gradient steps per episode.
+            if program_builder._samples_per_insert is not None:
+                learner_steps = max(1, int(program_builder._samples_per_insert))
+            else:
+                learner_steps = 1
+
+            for _ in range(learner_steps):
+                # learner.step() will pull minibatches from replay buffer via dataset generator.
+                learner.step()
+
+            # Periodic evaluation (every N episodes).
+            eval_every_episodes = 10
+            if episode % eval_every_episodes == 0:
+                eval_result = evaluator_loop.run_episode()
+                print(
+                    f"Evaluation after {episode} episodes: length={eval_result['episode_length']}, return={eval_result['episode_return']}"
+                )
+
+    except KeyboardInterrupt:
+        print("Interrupted, exiting...")
+
+
+if __name__ == "__main__":
+    app.run(main)
