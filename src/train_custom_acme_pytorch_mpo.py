@@ -329,12 +329,8 @@ class MPOLoss(nn.Module):
             )
             return term  # [B,D]
 
-        kl_mean = kl_diag(
-            target_mean, target_scale, fixed_std_mean, fixed_std_scale
-        )  # [B,D]
-        kl_std = kl_diag(
-            target_mean, target_scale, fixed_mean_mean, fixed_mean_scale
-        )  # [B,D]
+        kl_mean = kl_diag(fixed_std_mean, fixed_std_scale, target_mean, target_scale)
+        kl_std = kl_diag(fixed_mean_mean, fixed_mean_scale, target_mean, target_scale)
 
         if not self.per_dim:
             kl_mean = kl_mean.sum(dim=-1, keepdim=True)  # [B,1]
@@ -441,6 +437,8 @@ class MPOAgent:
         action_low,
         action_high,
         device: torch.device,
+        lr_dual: float,
+        min_replay_size: int,
         policy_hidden=(256, 256, 256),
         critic_hidden=(512, 512, 256),
         init_scale=0.7,
@@ -453,11 +451,9 @@ class MPOAgent:
         target_critic_update_period=100,
         lr_policy=1e-4,
         lr_critic=1e-4,
-        lr_dual=1e-2,
         clipping=True,
         action_penalization=True,
         per_dim=True,
-        min_replay_size: int = 1000,  # added param
     ):
         self.device = device
         self.obs_dim = obs_dim
@@ -878,7 +874,7 @@ def parse_args():
     parser.add_argument("--target_policy_update_period", type=int, default=25)
     parser.add_argument("--target_critic_update_period", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--dual_lr", type=float, default=1e-2)
+    parser.add_argument("--dual_lr", type=float, default=1e-3)
     parser.add_argument("--wandb_project", type=str, default="mpo_project")
     parser.add_argument("--wandb_entity", type=str, default="adrian-research")
     parser.add_argument("--wandb_group_prefix", type=str, default=None)

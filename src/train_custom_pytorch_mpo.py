@@ -53,8 +53,12 @@ def main():
     parser.add_argument("--wandb_group_prefix", type=str, default=None)
     args = parser.parse_args()
 
-    device_id = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(device_id)
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Using device: {device}")
     env_names = [name.strip() for name in args.env_names.split(",")]
     for env_name in env_names:
@@ -131,7 +135,6 @@ def main():
                     max_steps=1000,
                     fps=30,
                     deterministic=False,
-                    device=device_id,
                 )
             except Exception as e:
                 print(f"[ERROR] Warning: video generation failed: {e}")

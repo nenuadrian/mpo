@@ -24,7 +24,6 @@ def main(argv=None):
         action="store_true",
         help="Use policy mean deterministically instead of sampling",
     )
-    parser.add_argument("--device", type=str, default="cpu", help="torch device")
     args = parser.parse_args(args=argv)
 
     ckpt_path = args.checkpoint
@@ -50,7 +49,6 @@ def main(argv=None):
         max_steps=args.max_steps,
         fps=args.fps,
         deterministic=args.deterministic,
-        device=args.device,
     )
 
 

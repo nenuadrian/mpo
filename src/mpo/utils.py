@@ -220,13 +220,17 @@ def generate_video(
     fps: int = 30,
     deterministic: bool = False,
     env: gymnasium.Env | None = None,
-    device: str = "cpu",
 ):
     if env is None:
         env = make_offscreen_env(env_name)
     obs0, _ = env.reset()
     writer = imageio.get_writer(output_path, fps=fps)
-
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     try:
         logger.info("Recording %d episodes to %s...", num_episodes, output_path)
         for ep in range(num_episodes):
