@@ -137,6 +137,18 @@ class MultivariateNormalDiagHead(nn.Module):
             self.register_buffer("_fixed_scale", torch.tensor(init_scale))
         self.apply(init_weights)
 
+        # Make log-scale start near zero so softplus(0) leads to init_scale after rescaling.
+        if not fixed_scale:
+            with torch.no_grad():
+                # zero weights/bias for predictable initial stddev = init_scale
+                self.log_scale_layer.weight.zero_()
+                if self.log_scale_layer.bias is not None:
+                    self.log_scale_layer.bias.zero_()
+        # make mean bias zero for stable initial means
+        with torch.no_grad():
+            if self.mean_layer.bias is not None:
+                self.mean_layer.bias.zero_()
+
     def forward(self, x):
         mean = self.mean_layer(x)
         if self.tanh_mean:
@@ -162,6 +174,14 @@ class CriticNetwork(nn.Module):
         layers.append(nn.Linear(last, 1))
         self.net = nn.ModuleList(layers)
         self.apply(init_weights)
+
+        # Initialize final linear layer near zero (match TF NearZeroInitializedLinear).
+        with torch.no_grad():
+            final = self.net[-1]
+            # Small uniform init around zero and zero bias.
+            nn.init.uniform_(final.weight, a=-1e-4, b=1e-4)
+            if final.bias is not None:
+                nn.init.zeros_(final.bias)
 
     def forward(self, x):
         for i, layer in enumerate(self.net):
@@ -445,31 +465,35 @@ class MPOAgent:
         self.target_critic_update_period = target_critic_update_period
         self.clipping = clipping
 
-        # policy network: torso -> head
-        self.policy_torso = LayerNormMLP(
+        # observation encoder used by critic (trained by critic)
+        self.obs_encoder = LayerNormMLP(
             obs_dim, tuple(policy_hidden), activate_final=True
         ).to(device)
+
+        # policy head: maps embeddings -> action distribution (trained by policy optimizer)
         self.policy_head = MultivariateNormalDiagHead(
             policy_hidden[-1], action_dim, init_scale=init_scale
         ).to(device)
 
-        # critic: input = obs + action
-        critic_input_dim = obs_dim + action_dim
+        # critic: input = obs_embedding + action (embedding from obs_encoder)
+        critic_input_dim = policy_hidden[-1] + action_dim
         self.critic = CriticNetwork(critic_input_dim, layer_sizes=critic_hidden).to(
             device
         )
 
         # target networks (hard copy)
-        self.target_policy_torso = copy.deepcopy(self.policy_torso).to(device)
+        self.target_obs_encoder = copy.deepcopy(self.obs_encoder).to(device)
         self.target_policy_head = copy.deepcopy(self.policy_head).to(device)
         self.target_critic = copy.deepcopy(self.critic).to(device)
 
         # optimizers
-        self.policy_opt = optim.Adam(
-            list(self.policy_torso.parameters()) + list(self.policy_head.parameters()),
-            lr=lr_policy,
+        # Critic optimizer trains both critic and observation encoder (like TF learner).
+        self.critic_opt = optim.Adam(
+            list(self.obs_encoder.parameters()) + list(self.critic.parameters()),
+            lr=lr_critic,
         )
-        self.critic_opt = optim.Adam(self.critic.parameters(), lr=lr_critic)
+        # Policy optimizer trains only the policy head (policy shouldn't train the obs encoder).
+        self.policy_opt = optim.Adam(list(self.policy_head.parameters()), lr=lr_policy)
 
         # MPO loss with duals (parameters included)
         self.mpo_loss = MPOLoss(
@@ -487,7 +511,7 @@ class MPOAgent:
     def select_action(self, obs: np.ndarray, stochastic: bool = True) -> np.ndarray:
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            emb = self.policy_torso(obs_t)
+            emb = self.obs_encoder(obs_t)
             mean, scale = self.policy_head(emb)
             if stochastic:
                 eps = torch.randn_like(mean)
@@ -519,7 +543,8 @@ class MPOAgent:
 
         # --- compute target Q via target policy sampling ---
         with torch.no_grad():
-            emb_next = self.target_policy_torso(next_obs_b)
+            # Use target observation encoder to get embeddings for next states.
+            emb_next = self.target_obs_encoder(next_obs_b)
             t_mean, t_scale = self.target_policy_head(emb_next)  # (B,D)
             N = self.num_samples
             # sample N actions per batch element
@@ -531,14 +556,12 @@ class MPOAgent:
             al = self.action_low.view(1, 1, -1)
             ah = self.action_high.view(1, 1, -1)
             sampled_actions = torch.clamp(sampled_actions, al, ah)
-            # evaluate target critic on tiled inputs
-            tiled_next_obs = (
-                next_obs_b.unsqueeze(0)
-                .expand(N, -1, -1)
-                .reshape(N * self.batch_size, -1)
+            # evaluate target critic on tiled embeddings + sampled actions
+            tiled_emb_next = (
+                emb_next.unsqueeze(0).expand(N, -1, -1).reshape(N * self.batch_size, -1)
             )
             sampled_actions_resh = sampled_actions.reshape(N * self.batch_size, -1)
-            critic_inputs = torch.cat([tiled_next_obs, sampled_actions_resh], dim=-1)
+            critic_inputs = torch.cat([tiled_emb_next, sampled_actions_resh], dim=-1)
             q_samples = self.target_critic(critic_inputs).view(
                 N, self.batch_size
             )  # (N,B)
@@ -548,19 +571,22 @@ class MPOAgent:
 
         # critic loss (TD)
         target = rewards_b + discounts_b * q_t
-        critic_inputs_tm1 = torch.cat([obs_b, actions_b], dim=-1)
+
         # clamp actions from replay batch before critic eval to keep inputs within action bounds
         actions_b = torch.clamp(
             actions_b, self.action_low.view(1, -1), self.action_high.view(1, -1)
         )
-        critic_inputs_tm1 = torch.cat([obs_b, actions_b], dim=-1)
+        # Use the observation encoder (trained by critic) to get embeddings for current obs.
+        obs_emb = self.obs_encoder(obs_b)
+        critic_inputs_tm1 = torch.cat([obs_emb, actions_b], dim=-1)
         q_tm1 = self.critic(critic_inputs_tm1)
         critic_loss = F.mse_loss(q_tm1, target)
 
         # policy update using MPO loss
-        # use current observations for online policy (was mistakenly using next_obs_b)
-        emb_o = self.policy_torso(obs_b)
-        online_mean, online_scale = self.policy_head(emb_o)
+        # Use detached target embeddings (o_t) for policy computation so the policy head
+        # updates but not the observation encoder (mirrors TF stop_gradient on o_t).
+        emb_o_t = emb_next.detach()
+        online_mean, online_scale = self.policy_head(emb_o_t)
         # target mean/scale already computed as t_mean/t_scale (from above, no_grad)
         # compute MPO loss with sampled_actions and q_samples
         total_loss, stats = self.mpo_loss(
@@ -571,7 +597,10 @@ class MPOAgent:
         self.critic_opt.zero_grad()
         critic_loss.backward()
         if self.clipping:
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 40.0)
+            torch.nn.utils.clip_grad_norm_(
+                list(self.obs_encoder.parameters()) + list(self.critic.parameters()),
+                40.0,
+            )
         self.critic_opt.step()
 
         # update policy and duals together (total_loss contains dual terms)
@@ -580,8 +609,7 @@ class MPOAgent:
         total_loss.backward()
         if self.clipping:
             torch.nn.utils.clip_grad_norm_(
-                list(self.policy_torso.parameters())
-                + list(self.policy_head.parameters()),
+                list(self.policy_head.parameters()),
                 40.0,
             )
         self.policy_opt.step()
@@ -591,11 +619,13 @@ class MPOAgent:
         self._learn_steps += 1
 
         # periodic target hard updates
+        # Update target policy head (periodic).
         if self._learn_steps % self.target_policy_update_period == 0:
-            self.target_policy_torso.load_state_dict(self.policy_torso.state_dict())
             self.target_policy_head.load_state_dict(self.policy_head.state_dict())
+        # Update target critic and the target observation encoder (periodic).
         if self._learn_steps % self.target_critic_update_period == 0:
             self.target_critic.load_state_dict(self.critic.state_dict())
+            self.target_obs_encoder.load_state_dict(self.obs_encoder.state_dict())
 
         fetches = {
             "train/critic_loss": float(critic_loss.item()),
