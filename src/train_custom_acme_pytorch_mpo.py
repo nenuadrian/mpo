@@ -678,7 +678,7 @@ def flatten_observation(obs):
 
 def train(
     env_name: str,
-    max_steps: int,
+    max_actor_steps: int,
     batch_size: int,
     max_replay_size: int,
     n_step: int,
@@ -704,7 +704,7 @@ def train(
 
     env = make_env(env_name)
     # separate environment for evaluation (keeps train env state intact)
-    eval_env = make_env(env_name) if eval_freq and eval_episodes > 0 else None
+    eval_env = make_env(env_name)
     obs0, _ = env.reset()
     obs_flat = flatten_observation(obs0)
     # determine obs and action dims
@@ -743,82 +743,85 @@ def train(
     episode_len = 0
     start_time = time.time()
 
-    for step in range(1, max_steps + 1):
-        action = agent.select_action(obs_flat, stochastic=True)
-        next_obs, reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
-        next_flat = flatten_observation(next_obs)
-        # do not bootstrap from terminal states: use 0.0 discount on terminal steps
-        step_discount = 0.0 if done else 1.0
-        agent.store_transition(
-            obs_flat, action, float(reward), step_discount, next_flat, done
-        )
-        episode_return += float(reward)
-        episode_len += 1
-        obs_flat = next_flat
-
-        if done:
-            obs, _ = env.reset()
-            obs_flat = flatten_observation(obs)
-            print(
-                f"[Step {step}] Episode finished, return={episode_return:.2f}, len={episode_len}"
+    # run until max_actor_steps env steps have been executed
+    step = 0
+    while step < max_actor_steps:
+        # run one episode (or until global step budget exhausted)
+        done = False
+        while not done and step < max_actor_steps:
+            step += 1
+            action = agent.select_action(obs_flat, stochastic=True)
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            next_flat = flatten_observation(next_obs)
+            # do not bootstrap from terminal states: use 0.0 discount on terminal steps
+            step_discount = 0.0 if done else 1.0
+            agent.store_transition(
+                obs_flat, action, float(reward), step_discount, next_flat, done
             )
-            episode_return = 0.0
-            episode_len = 0
+            episode_return += float(reward)
+            episode_len += 1
+            obs_flat = next_flat
 
-        stats = agent.learn_step()
-        if stats is not None:
-            # include episode metrics with the agent stats and log to Weights & Biases
-            log_dict = dict(stats)
-            log_dict.update(
-                {
-                    "train/episode_return": episode_return,
-                    "train/episode_length": episode_len,
+            if done:
+                obs, _ = env.reset()
+                obs_flat = flatten_observation(obs)
+                print(
+                    f"[Step {step}] Episode finished, return={episode_return:.2f}, len={episode_len}"
+                )
+                episode_return = 0.0
+                episode_len = 0
+
+            stats = agent.learn_step()
+            if stats is not None:
+                log_dict = dict(stats)
+                log_dict.update(
+                    {
+                        "train/episode_return": episode_return,
+                        "train/episode_length": episode_len,
+                    }
+                )
+                wandb.log(log_dict, step=step)
+
+            if step % eval_freq == 0:
+                eval_returns = []
+                eval_lengths = []
+                for _ in range(eval_episodes):
+                    o, _ = eval_env.reset()
+                    o_flat = flatten_observation(o)
+                    done_eval = False
+                    ep_ret = 0.0
+                    ep_len = 0
+                    while not done_eval:
+                        a = agent.select_action(o_flat, stochastic=False)
+                        no, r, terminated, truncated, _ = eval_env.step(a)
+                        done_eval = terminated or truncated
+                        o_flat = flatten_observation(no)
+                        ep_ret += float(r)
+                        ep_len += 1
+                    eval_returns.append(ep_ret)
+                    eval_lengths.append(ep_len)
+                mean_r = float(np.mean(eval_returns))
+                std_r = float(np.std(eval_returns))
+                mean_len = float(np.mean(eval_lengths))
+                eval_log = {
+                    "eval/mean_reward": mean_r,
+                    "eval/std_return": std_r,
+                    "eval/mean_ep_length": mean_len,
                 }
-            )
-            wandb.log(log_dict, step=step)
+                wandb.log(eval_log, step=step)
+                print(
+                    f"[Eval @ step {step}] mean_reward={mean_r:.2f} std={std_r:.2f} mean_len={mean_len:.1f}"
+                )
 
-        # periodic evaluation
-        if eval_env is not None and step % eval_freq == 0:
-            eval_returns = []
-            eval_lengths = []
-            for _ in range(eval_episodes):
-                o, _ = eval_env.reset()
-                o_flat = flatten_observation(o)
-                done = False
-                ep_ret = 0.0
-                ep_len = 0
-                while not done:
-                    a = agent.select_action(o_flat, stochastic=False)
-                    no, r, terminated, truncated, _ = eval_env.step(a)
-                    done = terminated or truncated
-                    o_flat = flatten_observation(no)
-                    ep_ret += float(r)
-                    ep_len += 1
-                eval_returns.append(ep_ret)
-                eval_lengths.append(ep_len)
-            mean_r = float(np.mean(eval_returns))
-            std_r = float(np.std(eval_returns))
-            mean_len = float(np.mean(eval_lengths))
-            eval_log = {
-                "eval/mean_reward": mean_r,
-                "eval/std_return": std_r,
-                "eval/mean_ep_length": mean_len,
-            }
-            wandb.log(eval_log, step=step)
-            print(
-                f"[Eval @ step {step}] mean_reward={mean_r:.2f} std={std_r:.2f} mean_len={mean_len:.1f}"
-            )
-
-        if stats is not None and step % 100 == 0:
-            elapsed = time.time() - start_time
-            print(
-                f"Step {step} | Learn step {stats['train/learn_steps']} | critic_loss={stats['train/critic_loss']:.6f} | Ep Return {episode_return:.2f} | Ep Length {episode_len} | elapsed={elapsed:.1f}s"
-            )
+            if stats is not None and step % 100 == 0:
+                elapsed = time.time() - start_time
+                print(
+                    f"Step {step} | Learn step {stats['train/learn_steps']} | critic_loss={stats['train/critic_loss']:.6f} | Ep Return {episode_return:.2f} | Ep Length {episode_len} | elapsed={elapsed:.1f}s"
+                )
 
     env.close()
-    if eval_env is not None:
-        eval_env.close()
+    eval_env.close()
 
 
 def parse_args():
@@ -830,7 +833,7 @@ def parse_args():
         help="Comma-separated list of environment names to train on",
     )
     parser.add_argument("--env_iterations", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=3_000_000)
+    parser.add_argument("--max_actor_steps", type=int, default=3_000_000)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--min_replay_size", type=int, default=1000)
     parser.add_argument("--max_replay_size", type=int, default=1_000_000)
@@ -902,7 +905,7 @@ if __name__ == "__main__":
 
             train(
                 env_name=env_name,
-                max_steps=args.max_steps,
+                max_actor_steps=args.max_actor_steps,
                 batch_size=args.batch_size,
                 max_replay_size=args.max_replay_size,
                 n_step=args.n_step,

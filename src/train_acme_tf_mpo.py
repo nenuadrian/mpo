@@ -892,9 +892,10 @@ class AcmeMPO:
         with program.group("counter"):
             counter = program.add_node(lp.CourierNode(self.counter))
 
-            _ = program.add_node(
-                lp.CourierNode(self.coordinator, counter, self._max_actor_steps)
-            )
+            if self._max_actor_steps:
+                _ = program.add_node(
+                    lp.CourierNode(self.coordinator, counter, self._max_actor_steps)
+                )
 
         with program.group("learner"):
             learner = program.add_node(lp.CourierNode(self.learner, replay, counter))
