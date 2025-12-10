@@ -1,5 +1,17 @@
 # On implementing Maximum a Posteriori Policy Optimization (MPO)
 
+- [On implementing Maximum a Posteriori Policy Optimization (MPO)](#on-implementing-maximum-a-posteriori-policy-optimization-mpo)
+  - [Implementing from scratch in PyTorch](#implementing-from-scratch-in-pytorch)
+    - [Eval](#eval)
+    - [Cheeting cheetah](#cheeting-cheetah)
+    - [visualize](#visualize)
+  - [Using Google DeepMind Acme](#using-google-deepmind-acme)
+    - [visualise](#visualise)
+  - [Implementing based on Acme in PyTorch](#implementing-based-on-acme-in-pytorch)
+    - [visualize Acme in PyTorch](#visualize-acme-in-pytorch)
+  - [Original MPO Paper](#original-mpo-paper)
+
+
 ## Implementing from scratch in PyTorch
 
 ```bash
@@ -38,7 +50,7 @@ Combined all code necessary in `src/train_acme_lp_tf_mpo.py`. But still need a l
 ### visualise
 
 ```bash
-python src/visualize_acme_results.py --output results/acme/metric_plot.png --metric episode_return --file "Cartpole_Balance::results/acme/mpo-tf-cartpole-balance.csv" --file "Hopper_Stand::results/acme/mpo-tf-hopper-stand.csv" --file "Hopper_Hop::results/acme/mpo-tf-hopper-hop.csv" --file "Walker_Walk::results/acme/mpo-tf-walker-walk.csv" --file "Walker_Run::results/acme/mpo-tf-walker-run.csv" --file "Walker_Stand::results/acme/mpo-tf-walker-stand.csv" --file "Reacher_Easy::results/acme/mpo-tf-reacher-easy.csv" --file "Reacher_Hard::results/acme/mpo-tf-reacher-hard.csv" --file "Reacher_Hard::results/acme/mpo-tf-reacher-hard.csv"  --file "Acrobot_Swingup::results/acme/mpo-tf-acrobot-swingup.csv"   --file "Pendulum_Swingup::results/acme/mpo-tf-pendulum-swingup.csv"  --file "Swimmer_Swimmer6::results/acme/mpo-tf-swimmer-swimmer6.csv" 
+python src/visualize_acme_results.py --output results/acme/metric_plot.png --metric episode_return --file "Cartpole_Balance::results/acme/mpo-tf-cartpole-balance.csv" --file "Hopper_Stand::results/acme/mpo-tf-hopper-stand.csv" --file "Hopper_Hop::results/acme/mpo-tf-hopper-hop.csv" --file "Walker_Walk::results/acme/mpo-tf-walker-walk.csv" --file "Walker_Run::results/acme/mpo-tf-walker-run.csv" --file "Walker_Stand::results/acme/mpo-tf-walker-stand.csv" --file "Reacher_Easy::results/acme/mpo-tf-reacher-easy.csv" --file "Reacher_Hard::results/acme/mpo-tf-reacher-hard.csv" --file "Reacher_Hard::results/acme/mpo-tf-reacher-hard.csv"  --file "Acrobot_Swingup::results/acme/mpo-tf-acrobot-swingup.csv"   --file "Pendulum_Swingup::results/acme/mpo-tf-pendulum-swingup.csv"  --file "Swimmer_Swimmer6::results/acme/mpo-tf-swimmer-swimmer6.csv" --file "Swimmer_Swimmer15::results/acme/mpo-tf-swimmer-swimmer15.csv" 
 ```
 
 ![Acme Results](results/acme/metric_plot.png)
@@ -64,3 +76,6 @@ python src/visualize_wandb.py --project-metric "acme_pytorch_3::eval/mean_reward
 
 ![Acme PyTorch Results](results/custom_acme_pytorch.png)
 
+## Original MPO Paper
+
+![MPO Original Results](results/original_mpo_paper.png)
