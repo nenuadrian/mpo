@@ -84,6 +84,9 @@ class Runner(core.Worker):
             while True:
                 self.step()
 
+    def get_directory(self) -> str:
+        return ""
+    
     def __dir__(self):
         return dir(self._wrapped) + ["get_directory"]
 
