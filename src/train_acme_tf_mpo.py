@@ -59,6 +59,38 @@ _TASK = flags.DEFINE_string("task", "balance", "Control suite task name.")
 _DEFAULT_PRIORITY_TABLE = "priority_table"
 
 
+class Runner(core.Worker):
+    """Wrap an object and expose a run method which checkpoints periodically."""
+
+    def __init__(
+        self,
+        wrapped,
+        key: str = "wrapped",
+    ):
+        self._wrapped = wrapped
+
+    # Handle preemption signal. Note that this must happen in the main thread.
+    def _signal_handler(self):
+        pass
+
+    def step(self):
+        if isinstance(self._wrapped, core.Learner):
+            # Learners have a step() method, so alternate between that and ckpt call.
+            self._wrapped.step()
+
+    def run(self):
+        """Runs the checkpointer."""
+        with signals.runtime_terminator(self._signal_handler):
+            while True:
+                self.step()
+
+    def __dir__(self):
+        return dir(self._wrapped) + ["get_directory"]
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+
 class EnvironmentLoop(core.Worker):
     """A simple RL environment loop.
 
@@ -673,6 +705,9 @@ class AcmeMPO:
             signature=NStepTransitionAdder.signature(self._environment_spec),
         )
         return [replay_table]
+
+    def counter(self):
+        return Runner(counting.Counter(), subdirectory="counter")
 
     def coordinator(self, counter: counting.Counter, max_actor_steps: int):
         return lp_utils.StepsLimiter(counter, max_actor_steps)
