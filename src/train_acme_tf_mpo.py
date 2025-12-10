@@ -57,8 +57,7 @@ _MAX_ACTOR_STEPS = flags.DEFINE_integer(
 )
 _DOMAIN = flags.DEFINE_string("domain", "cartpole", "Control suite domain name.")
 _TASK = flags.DEFINE_string("task", "balance", "Control suite task name.")
-_NUM_ACTORS = flags.DEFINE_integer("num_actors", 1, "Number of actors to run.")
-_DEFAULT_PRIORITY_TABLE = 'priority_table'
+_DEFAULT_PRIORITY_TABLE = "priority_table"
 
 
 class NStepTransitionAdder(base.ReverbAdder):
@@ -423,15 +422,13 @@ class StochasticMeanHead(snt.Module):
         return distribution.mean()
 
 
-class DistributedMPO:
+class AcmeMPO:
     """Program definition for MPO."""
 
     def __init__(
         self,
-        environment_factory: Callable[[bool], dm_env.Environment],
+        environment_factory: Callable[[], dm_env.Environment],
         network_factory: Callable[[specs.BoundedArray], Dict[str, snt.Module]],
-        num_actors: int = 1,
-        num_caches: int = 0,
         environment_spec: Optional[specs.EnvironmentSpec] = None,
         batch_size: int = 256,
         prefetch_size: int = 4,
@@ -450,14 +447,12 @@ class DistributedMPO:
     ):
 
         if environment_spec is None:
-            environment_spec = specs.make_environment_spec(environment_factory(False))
+            environment_spec = specs.make_environment_spec(environment_factory())
 
         self._environment_factory = environment_factory
         self._network_factory = network_factory
         self._policy_loss_factory = policy_loss_factory
         self._environment_spec = environment_spec
-        self._num_actors = num_actors
-        self._num_caches = num_caches
         self._batch_size = batch_size
         self._prefetch_size = prefetch_size
         self._min_replay_size = min_replay_size
@@ -586,7 +581,7 @@ class DistributedMPO:
         observation_spec = self._environment_spec.observations
 
         # Create environment and target networks to act with.
-        environment = self._environment_factory(False)
+        environment = self._environment_factory()
         agent_networks = self._network_factory(action_spec)
 
         # Create a stochastic behavior policy.
@@ -647,7 +642,7 @@ class DistributedMPO:
         observation_spec = self._environment_spec.observations
 
         # Create environment and target networks to act with.
-        environment = self._environment_factory(True)
+        environment = self._environment_factory()
         agent_networks = self._network_factory(action_spec)
 
         # Create a stochastic behavior policy.
@@ -711,26 +706,8 @@ class DistributedMPO:
         with program.group("evaluator"):
             program.add_node(lp.CourierNode(self.evaluator, learner, counter))
 
-        if not self._num_caches:
-            # Use our learner as a single variable source.
-            sources = [learner]
-        else:
-            with program.group("cacher"):
-                # Create a set of learner caches.
-                sources = []
-                for _ in range(self._num_caches):
-                    cacher = program.add_node(
-                        lp.CacherNode(
-                            learner, refresh_interval_ms=2000, stale_after_ms=4000
-                        )
-                    )
-                    sources.append(cacher)
-
         with program.group("actor"):
-            # Add actors which pull round-robin from our variable sources.
-            for actor_id in range(self._num_actors):
-                source = sources[actor_id % len(sources)]
-                program.add_node(lp.CourierNode(self.actor, replay, source, counter))
+            program.add_node(lp.CourierNode(self.actor, replay, learner, counter))
 
         return program
 
@@ -1698,23 +1675,12 @@ def _make_environment(
     evaluation: bool = False,
     domain_name: str = "cartpole",
     task_name: str = "balance",
-    from_pixels: bool = False,
-    frames_to_stack: int = 3,
-    flatten_stack: bool = False,
     num_action_repeats: Optional[int] = None,
 ) -> dm_env.Environment:
     """Implements a control suite environment factory."""
-    # Load dm_suite lazily not require Mujoco license when not using it.
-
     # Load raw control suite environment.
     environment = suite.load(domain_name, task_name)
 
-    # Maybe wrap to get pixel observations from environment state.
-    if from_pixels:
-        environment = mujoco_wrappers.MujocoPixelWrapper(environment)
-        environment = wrappers.FrameStackingWrapper(
-            environment, num_frames=frames_to_stack, flatten=flatten_stack
-        )
     environment = wrappers.CanonicalSpecWrapper(environment, clip=True)
 
     if num_action_repeats:
@@ -1722,11 +1688,6 @@ def _make_environment(
             environment, num_repeats=num_action_repeats
         )
     environment = wrappers.SinglePrecisionWrapper(environment)
-
-    if evaluation:
-        # The evaluator in the distributed agent will set this to True so you can
-        # use this clause to, e.g., set up video recording by the evaluator.
-        pass
 
     return environment
 
@@ -1736,12 +1697,11 @@ def main(_):
         _make_environment, domain_name=_DOMAIN.value, task_name=_TASK.value
     )
 
-    program_builder = DistributedMPO(
+    program_builder = AcmeMPO(
         make_environment,
         make_networks,
         target_policy_update_period=25,
         max_actor_steps=_MAX_ACTOR_STEPS.value,
-        num_actors=_NUM_ACTORS.value,
     )
 
     lp.launch(programs=program_builder.build())
