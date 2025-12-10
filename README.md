@@ -58,7 +58,7 @@ Python 3.10/3.11 is recommended.
 ```bash
 python3 -m venv .venv_acme_pytorch
 source .venv_acme_pytorch/bin/activate
-pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb "shimmy[bsuite,atari,dm-control]" opencv-python
+pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb "shimmy[bsuite,atari,dm-control]" opencv-python torchrl
 
 
 python src/train_custom_acme_pytorch_mpo.py --max_actor_steps 300000 --wandb_project acme_pytorch_1 --env_names walker::walk,humanoid::run,cartpole::balance,walker::run,reacher::easy,reacher::hard,hopper::hop,walker::stand,acrobot::swingup,swimmer::swimmer6,swimmer::swimmer15,pendulum::swingup,cheetah::walk,cheetah::run --env_iterations 1

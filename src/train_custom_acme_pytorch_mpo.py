@@ -4,7 +4,7 @@ import copy
 import math
 import random
 import time
-from typing import Deque, Tuple, cast
+from typing import Tuple, cast
 import os
 import json
 
@@ -17,6 +17,16 @@ import torch.optim as optim
 import wandb
 import shimmy
 import torch.distributions as dist
+
+from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage
+from tensordict import TensorDict
+
+
+def init_weights(module):
+    if isinstance(module, nn.Linear):
+        nn.init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
 
 
 # Cross-entropy loss: - E_{nonparametric}[ log pi_online(sampled_action) ]
@@ -32,73 +42,6 @@ def weighted_cross_entropy(means, scales, N, sampled_actions, normalized_weights
     logp = logp.sum(dim=-1)  # [N,B]
     loss = -(logp * normalized_weights).sum(dim=0)  # [B]
     return loss.mean()
-
-
-class NStepTransition:
-    __slots__ = ("obs", "action", "reward", "discount", "next_obs", "done")
-
-    def __init__(self, obs, action, reward, discount, next_obs, done):
-        self.obs = obs
-        self.action = action
-        self.reward = reward
-        self.discount = discount
-        self.next_obs = next_obs
-        self.done = done
-
-
-class NStepReplay:
-    """Ring buffer storing N-step transitions assembled from an on-policy buffer."""
-
-    def __init__(self, max_size: int, n_step: int, gamma: float):
-        self._max_size = max_size
-        self._buffer: Deque[NStepTransition] = collections.deque(maxlen=max_size)
-        self._n_step = n_step
-        self._gamma = gamma
-        self._traj: Deque[Tuple] = collections.deque()
-
-    def append(self, obs, action, reward, discount, next_obs, done):
-        self._traj.append((obs, action, reward, discount, next_obs, done))
-        # create N-step transitions when enough collected or on terminal
-        while len(self._traj) >= self._n_step or (self._traj and self._traj[0][5]):
-            R = 0.0
-            cur_discount = 1.0
-            next_o = None
-            terminal = False
-            for i, (_, _, r, d, nobs, dn) in enumerate(self._traj):
-                R += cur_discount * r
-                cur_discount *= self._gamma * d
-                next_o = nobs
-                terminal = dn
-                if i == self._n_step - 1:
-                    break
-            obs0, a0, _, _, _, _ = self._traj[0]
-            self._buffer.append(
-                NStepTransition(obs0, a0, R, cur_discount, next_o, terminal)
-            )
-            self._traj.popleft()
-            if not self._traj:
-                break
-
-    def sample(self, batch_size: int):
-        idx = np.random.randint(0, len(self._buffer), size=batch_size)
-        batch = [self._buffer[i] for i in idx]
-        obs = np.stack([b.obs for b in batch], axis=0)
-        actions = np.stack([b.action for b in batch], axis=0)
-        rewards = np.stack([b.reward for b in batch], axis=0)
-        discounts = np.stack([b.discount for b in batch], axis=0)
-        next_obs = np.stack([b.next_obs for b in batch], axis=0)
-        dones = np.stack([b.done for b in batch], axis=0)
-        return obs, actions, rewards, discounts, next_obs, dones
-
-    def __len__(self):
-        return len(self._buffer)
-
-
-def init_weights(module):
-    if isinstance(module, nn.Linear):
-        nn.init.xavier_uniform_(module.weight)
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
 
 
 class LayerNormMLP(nn.Module):
@@ -426,6 +369,37 @@ class MPOLoss(nn.Module):
         return loss, stats
 
 
+class NStepAccumulator:
+    __slots__ = ("n_step", "gamma", "_traj")
+
+    def __init__(self, n_step: int, gamma: float):
+        self.n_step = n_step
+        self.gamma = gamma
+        self._traj = collections.deque()
+
+    def push(self, obs, action, reward, discount, next_obs, done):
+        self._traj.append((obs, action, reward, discount, next_obs, done))
+        ready = []
+        while len(self._traj) >= self.n_step or (self._traj and self._traj[0][5]):
+            ret = 0.0
+            cur_discount = 1.0
+            next_o = None
+            terminal = False
+            for idx, (_, _, r, d, nobs, dn) in enumerate(self._traj):
+                ret += cur_discount * r
+                cur_discount *= self.gamma * d
+                next_o = nobs
+                terminal = dn
+                if idx + 1 >= self.n_step:
+                    break
+            obs0, act0, _, _, _, _ = self._traj[0]
+            ready.append((obs0, act0, ret, cur_discount, next_o, terminal))
+            self._traj.popleft()
+            if not self._traj:
+                break
+        return ready
+
+
 class MPOAgent:
     def __init__(
         self,
@@ -436,13 +410,13 @@ class MPOAgent:
         device: torch.device,
         lr_dual: float,
         min_replay_size: int,
+        max_replay_size: int,
         policy_hidden=(256, 256, 256),
         critic_hidden=(512, 512, 256),
         init_scale=0.7,
         gamma=0.99,
         n_step=5,
         batch_size=256,
-        max_replay_size=100000,
         num_samples=20,
         target_policy_update_period=25,
         target_critic_update_period=100,
@@ -506,8 +480,12 @@ class MPOAgent:
         ).to(device)
         self.dual_opt = optim.Adam(self.mpo_loss.parameters(), lr=lr_dual)
 
-        self.replay = NStepReplay(max_size=max_replay_size, n_step=n_step, gamma=gamma)
-
+        # Replace replay buffer setup
+        self.replay = TensorDictReplayBuffer(
+            storage=LazyTensorStorage(max_size=max_replay_size),
+            batch_size=batch_size,
+        )
+        self._nstep_accumulator = NStepAccumulator(n_step=n_step, gamma=gamma)
         self._learn_steps = 0
 
     def select_action(self, obs: np.ndarray, stochastic: bool = True) -> np.ndarray:
@@ -526,22 +504,35 @@ class MPOAgent:
             return action.cpu().numpy()
 
     def store_transition(self, obs, action, reward, discount, next_obs, done):
-        self.replay.append(obs, action, reward, discount, next_obs, done)
+        ready = self._nstep_accumulator.push(
+            obs, action, reward, discount, next_obs, done
+        )
+        for obs_i, act_i, ret_i, disc_i, next_obs_i, done_i in ready:
+            data = TensorDict(
+                {
+                    "obs": torch.tensor(obs_i, dtype=torch.float32),
+                    "action": torch.tensor(act_i, dtype=torch.float32),
+                    "reward": torch.tensor(ret_i, dtype=torch.float32),
+                    "discount": torch.tensor(disc_i, dtype=torch.float32),
+                    "next_obs": torch.tensor(next_obs_i, dtype=torch.float32),
+                    "done": torch.tensor(done_i, dtype=torch.bool),
+                },
+                batch_size=[],
+            )
+            self.replay.add(data)
 
     def learn_step(self):
         if len(self.replay) < max(self.min_replay_size, self.batch_size):
             return None
 
-        obs_b, actions_b, rewards_b, discounts_b, next_obs_b, dones_b = (
-            self.replay.sample(self.batch_size)
-        )
-
+        batch = self.replay.sample()
         device = self.device
-        obs_b = torch.tensor(obs_b, dtype=torch.float32, device=device)
-        actions_b = torch.tensor(actions_b, dtype=torch.float32, device=device)
-        rewards_b = torch.tensor(rewards_b, dtype=torch.float32, device=device)
-        discounts_b = torch.tensor(discounts_b, dtype=torch.float32, device=device)
-        next_obs_b = torch.tensor(next_obs_b, dtype=torch.float32, device=device)
+        obs_b = batch["obs"].to(device)
+        actions_b = batch["action"].to(device)
+        rewards_b = batch["reward"].to(device)
+        discounts_b = batch["discount"].to(device)
+        next_obs_b = batch["next_obs"].to(device)
+        dones_b = batch["done"].to(device)
 
         # --- compute target Q via target policy sampling ---
         with torch.no_grad():
@@ -648,6 +639,9 @@ class MPOAgent:
         )
         fetches.update(stats)
         return fetches
+
+    def __len__(self):
+        return len(self.replay)
 
 
 def make_env(env_name: str, render_mode: str | None = None):
@@ -777,10 +771,6 @@ def train(
 
             if step % eval_freq == 0:
                 eval_returns = []
-                # The code `eval_lengths` is not doing anything as it is just a variable name. It is
-                # not assigned any value or used in any operation.
-                # The code `eval_lengths` is not doing anything as it is just a variable name. It is
-                # not assigned any value or used in any operation.
                 eval_lengths = []
                 eval_steps = 0
                 while eval_steps < max_eval_actor_steps:
@@ -838,10 +828,7 @@ def train(
             "learn_steps": agent._learn_steps,
             "step": step,
             "seed": seed,
-            "replay": [
-                (t.obs, t.action, t.reward, t.discount, t.next_obs, t.done)
-                for t in agent.replay._buffer
-            ],
+            "replay_state": agent.replay.state_dict(),
         }
         torch.save(checkpoint, ckpt_path)
         print(f"Saved checkpoint to {ckpt_path}")
