@@ -22,7 +22,7 @@ def main():
     )
     parser.add_argument("--env_iterations", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--num_training_episodes", type=int, default=1000)
+    parser.add_argument("--max_actor_steps", type=int, default=1500000)
     parser.add_argument("--num_candidate_actions", type=int, default=32)
     parser.add_argument("--min_replay_size", type=int, default=50_000)
     parser.add_argument("--num_optimization_steps_per_step", type=int, default=2)

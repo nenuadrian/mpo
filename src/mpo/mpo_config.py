@@ -3,7 +3,7 @@ class MPOConfig:
         self,
         env_name="HalfCheetah-v5",
         batch_size=256,
-        num_training_episodes=1000,
+        max_actor_steps=1500000,
         num_candidate_actions=32,
         min_replay_size=30_000,
         num_optimization_steps_per_step=2,
@@ -33,7 +33,7 @@ class MPOConfig:
         **kwargs,
     ):
         self.batch_size = batch_size
-        self.num_training_episodes = num_training_episodes
+        self.max_actor_steps = max_actor_steps
         self.num_candidate_actions = num_candidate_actions
         self.min_replay_size = min_replay_size
         self.num_optimization_steps_per_step = num_optimization_steps_per_step

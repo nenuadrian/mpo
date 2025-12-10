@@ -16,9 +16,6 @@ def main(argv=None):
         "--output", type=str, default="video.mp4", help="Output video path"
     )
     parser.add_argument(
-        "--episodes", type=int, default=1, help="Number of episodes to record"
-    )
-    parser.add_argument(
         "--max_steps", type=int, default=1000, help="Max steps per episode"
     )
     parser.add_argument("--fps", type=int, default=30, help="Video FPS")
@@ -50,7 +47,6 @@ def main(argv=None):
         env=env,
         policy=policy,
         output_path=args.output,
-        num_episodes=args.episodes,
         max_steps=args.max_steps,
         fps=args.fps,
         deterministic=args.deterministic,

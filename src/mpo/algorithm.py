@@ -266,8 +266,12 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
 
     global_step = 0
     max_eval_return = -float("inf")
-    for episode in range(config.num_training_episodes):
-        logger.info("Starting episode %d ...", episode + 1)
+    episode = 0
+    while True:
+        episode += 1
+        if global_step >= config.max_actor_steps:
+            break
+        logger.info("Starting episode %d ...", episode)
         wandb.log({"train/episode": episode}, step=global_step)
 
         obs, _ = env.reset()
@@ -482,13 +486,13 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
         )
         logger.info(
             "episode=%d global_step=%d ep_length=%.3f",
-            episode + 1,
+            episode,
             global_step,
             ep_length,
         )
 
         checkpoint_max_eval_return = False
-        if (episode + 1) % config.eval_freq == 0:
+        if episode % config.eval_freq == 0:
             eval_returns, eval_lengths = evaluate_policy(
                 pi, eval_env, device, n_eval_episodes=config.eval_episodes
             )
@@ -506,7 +510,7 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
             )
             logger.info(
                 "Eval: episode=%d global_step=%d eval_mean=%.3f eval_length_mean=%.3f",
-                episode + 1,
+                episode,
                 global_step,
                 eval_mean,
                 eval_length_mean,
