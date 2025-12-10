@@ -707,7 +707,7 @@ class AcmeMPO:
         return [replay_table]
 
     def counter(self):
-        return Runner(counting.Counter(), subdirectory="counter")
+        return Runner(counting.Counter())
 
     def coordinator(self, counter: counting.Counter, max_actor_steps: int):
         return lp_utils.StepsLimiter(counter, max_actor_steps)
