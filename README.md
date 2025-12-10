@@ -45,7 +45,7 @@ python src/visualize_wandb.py --project-metric "ppo6::eval/mean_reward" --projec
 
 Very difficult to get it to build. TensorFlow version is only one that I was able to get working.
 
-Combined all code necessary in `src/train_acme_lp_tf_mpo.py`. But still need a lot of the tricks I have documented in my `acme` fork.
+Combined all code necessary in `src/train_acme_tf_mpo.py`. But still need a lot of the tricks I have documented in my `acme` fork.
 
 ### visualise
 
