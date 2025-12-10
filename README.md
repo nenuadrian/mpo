@@ -40,7 +40,6 @@ python src/visualize_wandb.py --project-metric "ppo6::eval/mean_reward" --projec
 
 ![Custom Results](results/custom_pytorch.png)
 
-
 ## Using Google DeepMind Acme
 
 Very difficult to get it to build. TensorFlow version is only one that I was able to get working.

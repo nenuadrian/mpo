@@ -4,7 +4,7 @@ import copy
 import math
 import random
 import time
-from typing import Deque, Tuple
+from typing import Deque, Tuple, cast
 import os
 import json
 
@@ -177,7 +177,7 @@ class CriticNetwork(nn.Module):
 
         # Initialize final linear layer near zero (match TF NearZeroInitializedLinear).
         with torch.no_grad():
-            final = self.net[-1]
+            final = cast(nn.Linear, self.net[-1])
             # Small uniform init around zero and zero bias.
             nn.init.uniform_(final.weight, a=-1e-4, b=1e-4)
             if final.bias is not None:
@@ -441,7 +441,7 @@ class MPOAgent:
         gamma=0.99,
         n_step=5,
         batch_size=256,
-        replay_size=100000,
+        max_replay_size=100000,
         num_samples=20,
         target_policy_update_period=25,
         target_critic_update_period=100,
@@ -451,6 +451,7 @@ class MPOAgent:
         clipping=True,
         action_penalization=True,
         per_dim=True,
+        min_replay_size: int = 1000,  # added param
     ):
         self.device = device
         self.obs_dim = obs_dim
@@ -464,6 +465,9 @@ class MPOAgent:
         self.target_policy_update_period = target_policy_update_period
         self.target_critic_update_period = target_critic_update_period
         self.clipping = clipping
+
+        # new: store configurable minimum replay size for learning
+        self.min_replay_size = int(min_replay_size)
 
         # observation encoder used by critic (trained by critic)
         self.obs_encoder = LayerNormMLP(
@@ -504,7 +508,7 @@ class MPOAgent:
         self.dual_opt = optim.Adam(self.mpo_loss.parameters(), lr=lr_dual)
 
         # replay
-        self.replay = NStepReplay(max_size=replay_size, n_step=n_step, gamma=gamma)
+        self.replay = NStepReplay(max_size=max_replay_size, n_step=n_step, gamma=gamma)
 
         self._learn_steps = 0
 
@@ -527,7 +531,7 @@ class MPOAgent:
         self.replay.append(obs, action, reward, discount, next_obs, done)
 
     def learn_step(self):
-        if len(self.replay) < max(1000, self.batch_size):
+        if len(self.replay) < max(self.min_replay_size, self.batch_size):
             return None
 
         obs_b, actions_b, rewards_b, discounts_b, next_obs_b, dones_b = (
@@ -676,7 +680,7 @@ def train(
     env_name: str,
     max_steps: int,
     batch_size: int,
-    replay_size: int,
+    max_replay_size: int,
     n_step: int,
     gamma: float,
     num_samples: int,
@@ -688,6 +692,7 @@ def train(
     seed: int,
     eval_freq: int = 0,
     eval_episodes: int = 5,
+    min_replay_size: int = 1000,  # added param
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -720,7 +725,7 @@ def train(
         action_high=action_high,
         device=device,
         batch_size=batch_size,
-        replay_size=replay_size,
+        max_replay_size=max_replay_size,
         n_step=n_step,
         gamma=gamma,
         num_samples=num_samples,
@@ -729,6 +734,7 @@ def train(
         lr_policy=lr,
         lr_critic=lr,
         lr_dual=dual_lr,
+        min_replay_size=min_replay_size,  # pass through
     )
 
     obs, _ = env.reset()
@@ -824,9 +830,10 @@ def parse_args():
         help="Comma-separated list of environment names to train on",
     )
     parser.add_argument("--env_iterations", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=500000)
+    parser.add_argument("--max_steps", type=int, default=3_000_000)
     parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--replay_size", type=int, default=100000)
+    parser.add_argument("--min_replay_size", type=int, default=1000)
+    parser.add_argument("--max_replay_size", type=int, default=1_000_000)
     parser.add_argument("--n_step", type=int, default=5)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--num_samples", type=int, default=20)
@@ -840,18 +847,8 @@ def parse_args():
     parser.add_argument("--wandb_entity", type=str, default="adrian-research")
     parser.add_argument("--wandb_group_prefix", type=str, default=None)
     parser.add_argument("--base_log_dir", type=str, default="./logs/mpo_experiment")
-    parser.add_argument(
-        "--eval_freq",
-        type=int,
-        default=3000,
-        help="Evaluate every N environment steps (0 to disable)",
-    )
-    parser.add_argument(
-        "--eval_episodes",
-        type=int,
-        default=5,
-        help="Number of deterministic episodes per evaluation",
-    )
+    parser.add_argument("--eval_freq", type=int, default=3000)
+    parser.add_argument("--eval_episodes", type=int, default=5)
     return parser.parse_args()
 
 
@@ -907,7 +904,7 @@ if __name__ == "__main__":
                 env_name=env_name,
                 max_steps=args.max_steps,
                 batch_size=args.batch_size,
-                replay_size=args.replay_size,
+                max_replay_size=args.max_replay_size,
                 n_step=args.n_step,
                 gamma=args.gamma,
                 num_samples=args.num_samples,
@@ -919,6 +916,7 @@ if __name__ == "__main__":
                 seed=seed,
                 eval_freq=args.eval_freq,
                 eval_episodes=args.eval_episodes,
+                min_replay_size=args.min_replay_size,  # pass new arg
             )
 
             wandb.finish()
