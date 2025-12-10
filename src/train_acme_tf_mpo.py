@@ -3,11 +3,9 @@
 import functools
 from typing import List, Optional, Dict, Tuple, Union, Sequence, Callable
 import time
-import copy
 
 import tree
 import dm_env
-import reverb
 import operator
 
 from absl import app
@@ -24,7 +22,6 @@ import trfl
 import acme
 from acme.utils import counting
 from acme.utils import loggers
-from acme import datasets
 from acme.tf import variable_utils as tf2_variable_utils
 from acme.utils import lp_utils
 import tensorflow_probability as tfp
@@ -36,9 +33,153 @@ from acme import adders as acme_adders
 from acme.tf import utils as tf2_utils
 from acme.utils import observers as observers_lib
 from acme.utils import signals
-from acme.adders.reverb import base
-from acme.adders.reverb import utils
-from acme.utils import tree_utils
+
+
+class SimpleReplayBuffer:
+    """A tiny in-memory replay buffer for synchronous training.
+
+    Stores transitions (instances of `types.Transition`) as numpy arrays and
+    supports random sampling.
+    """
+
+    def __init__(self, max_size: int = 1000000):
+        self._max_size = int(max_size)
+        self._buf = []
+
+    def add(self, transition: types.Transition):
+        # Keep numpy copies for stable sampling.
+        self._buf.append(
+            tree.map_structure(lambda x: np.array(x, copy=True), transition)
+        )
+        if len(self._buf) > self._max_size:
+            # pop oldest
+            self._buf.pop(0)
+
+    def sample(self, batch_size: int) -> types.Transition:
+        if batch_size > len(self._buf):
+            raise ValueError(
+                "Not enough elements in replay to sample the requested batch"
+            )
+        idxs = np.random.choice(len(self._buf), size=batch_size, replace=False)
+        batch = [self._buf[i] for i in idxs]
+
+        # Collate batch into a Transition with leading batch dimension.
+        def stack_fn(values):
+            return np.stack(values, axis=0)
+
+        # tree.map_structure works across structures; take first element as template
+        template = batch[0]
+        fields = {}
+        for key in template._fields:
+            values = [getattr(b, key) for b in batch]
+            fields[key] = stack_fn(values)
+
+        return types.Transition(**fields)
+
+    def __len__(self):
+        return len(self._buf)
+
+
+class SimpleNStepAdder:
+    """A simple N-step adder that writes transitions into a SimpleReplayBuffer.
+
+    This implements a minimal subset of the original Reverb adder semantics:
+    - `add_first(timestep)` to start an episode
+    - `add(action, next_timestep)` to append steps and write N-step transitions
+    - `reset()` to clear state
+    - `write_last()` to flush remaining shorter transitions at episode end
+    """
+
+    def __init__(self, replay: SimpleReplayBuffer, n_step: int, discount: float):
+        self._replay = replay
+        self.n_step = int(n_step)
+        self._discount = float(discount)
+
+        # history buffers
+        self._observations = []
+        self._actions = []
+        self._rewards = []
+        self._discounts = []
+
+    def add_first(self, timestep: dm_env.TimeStep):
+        self.reset()
+        self._observations.append(timestep.observation)
+
+    def add(self, action, next_timestep: dm_env.TimeStep):
+        # Append action and the following timestep info.
+        self._actions.append(action)
+        self._rewards.append(next_timestep.reward)
+        self._discounts.append(next_timestep.discount)
+        self._observations.append(next_timestep.observation)
+
+        # When we have enough steps, write the oldest full n-step transition.
+        if len(self._actions) >= self.n_step:
+            self._write_n_step(self.n_step)
+
+        # If the buffer grows large beyond n_step, we also write overlapping transitions
+        # by advancing the window.
+        while len(self._actions) > self.n_step:
+            self._write_n_step(self.n_step)
+
+        # If this timestep is terminal, flush remaining shorter transitions.
+        if next_timestep.last():
+            self._write_last()
+
+    def _compute_cumulative_quantities(self, rewards, discounts):
+        # rewards, discounts are lists/arrays of length L
+        L = len(rewards)
+        total_discount = np.array([discounts[0]], dtype=np.float32)
+        n_step_return = np.array(rewards[0], copy=True)
+        # Build arrays properly if rewards are arrays
+        if hasattr(rewards[0], "shape"):
+            n_step_return = np.array(rewards[0], copy=True)
+            total_discount = np.array([discounts[0]], dtype=np.float32)
+        for i in range(1, L):
+            # multiply previous total_discount by self discount
+            total_discount = total_discount * self._discount
+            n_step_return = n_step_return + np.array(rewards[i]) * total_discount
+            total_discount = total_discount * np.array(discounts[i])
+        return n_step_return, total_discount
+
+    def _write_n_step(self, n):
+        # compute n-step return for the first n rewards
+        rewards = [np.array(r) for r in self._rewards[:n]]
+        discounts = [np.array(d) for d in self._discounts[:n]]
+        n_step_return, total_discount = self._compute_cumulative_quantities(
+            rewards, discounts
+        )
+
+        s = self._observations[0]
+        a = self._actions[0]
+        s_n = self._observations[n]
+
+        transition = types.Transition(
+            observation=s,
+            action=a,
+            reward=n_step_return,
+            discount=total_discount,
+            next_observation=s_n,
+            extras=(),
+        )
+        self._replay.add(transition)
+
+        # advance window by one
+        self._observations.pop(0)
+        self._actions.pop(0)
+        self._rewards.pop(0)
+        self._discounts.pop(0)
+
+    def _write_last(self):
+        # Write remaining shorter transitions of sizes n-1, n-2, ...
+        while len(self._actions) > 0:
+            L = len(self._actions)
+            self._write_n_step(L)
+
+    def reset(self):
+        self._observations = []
+        self._actions = []
+        self._rewards = []
+        self._discounts = []
 
 
 tfd = tfp.distributions
@@ -53,7 +194,6 @@ _MAX_ACTOR_STEPS = flags.DEFINE_integer(
 )
 _DOMAIN = flags.DEFINE_string("domain", "cartpole", "Control suite domain name.")
 _TASK = flags.DEFINE_string("task", "balance", "Control suite task name.")
-_DEFAULT_PRIORITY_TABLE = "priority_table"
 
 
 class Runner(core.Worker):
@@ -273,299 +413,6 @@ def _generate_zeros_from_spec(spec: specs.Array) -> np.ndarray:
     return np.zeros(spec.shape, spec.dtype)
 
 
-class NStepTransitionAdder(base.ReverbAdder):
-    """An N-step transition adder.
-
-    This will buffer a sequence of N timesteps in order to form a single N-step
-    transition which is added to reverb for future retrieval.
-
-    For N=1 the data added to replay will be a standard one-step transition which
-    takes the form:
-
-          (s_t, a_t, r_t, d_t, s_{t+1}, e_t)
-
-    where:
-
-      s_t = state observation at time t
-      a_t = the action taken from s_t
-      r_t = reward ensuing from action a_t
-      d_t = environment discount ensuing from action a_t. This discount is
-          applied to future rewards after r_t.
-      e_t [Optional] = extra data that the agent persists in replay.
-
-    For N greater than 1, transitions are of the form:
-
-          (s_t, a_t, R_{t:t+n}, D_{t:t+n}, s_{t+N}, e_t),
-
-    where:
-
-      s_t = State (observation) at time t.
-      a_t = Action taken from state s_t.
-      g = the additional discount, used by the agent to discount future returns.
-      R_{t:t+n} = N-step discounted return, i.e. accumulated over N rewards:
-            R_{t:t+n} := r_t + g * d_t * r_{t+1} + ...
-                             + g^{n-1} * d_t * ... * d_{t+n-2} * r_{t+n-1}.
-      D_{t:t+n}: N-step product of agent discounts g_i and environment
-        "discounts" d_i.
-            D_{t:t+n} := g^{n-1} * d_{t} * ... * d_{t+n-1},
-        For most environments d_i is 1 for all steps except the last,
-        i.e. it is the episode termination signal.
-      s_{t+n}: The "arrival" state, i.e. the state at time t+n.
-      e_t [Optional]: A nested structure of any 'extras' the user wishes to add.
-
-    Notes:
-      - At the beginning and end of episodes, shorter transitions are added.
-        That is, at the beginning of the episode, it will add:
-              (s_0 -> s_1), (s_0 -> s_2), ..., (s_0 -> s_n), (s_1 -> s_{n+1})
-
-        And at the end of the episode, it will add:
-              (s_{T-n+1} -> s_T), (s_{T-n+2} -> s_T), ... (s_{T-1} -> s_T).
-      - We add the *first* `extra` of each transition, not the *last*, i.e.
-          if extras are provided, we get e_t, not e_{t+n}.
-    """
-
-    def __init__(
-        self,
-        client: reverb.Client,
-        n_step: int,
-        discount: float,
-        *,
-        priority_fns: Optional[base.PriorityFnMapping] = None,
-        max_in_flight_items: int = 5,
-    ):
-        """Creates an N-step transition adder.
-
-        Args:
-          client: A `reverb.Client` to send the data to replay through.
-          n_step: The "N" in N-step transition. See the class docstring for the
-            precise definition of what an N-step transition is. `n_step` must be at
-            least 1, in which case we use the standard one-step transition, i.e.
-            (s_t, a_t, r_t, d_t, s_t+1, e_t).
-          discount: Discount factor to apply. This corresponds to the agent's
-            discount in the class docstring.
-          priority_fns: See docstring for BaseAdder.
-          max_in_flight_items: The maximum number of items allowed to be "in flight"
-            at the same time. See `block_until_num_items` in
-            `reverb.TrajectoryWriter.flush` for more info.
-
-        Raises:
-          ValueError: If n_step is less than 1.
-        """
-        # Makes the additional discount a float32, which means that it will be
-        # upcast if rewards/discounts are float64 and left alone otherwise.
-        self.n_step = n_step
-        self._discount = tree.map_structure(np.float32, discount)
-        self._first_idx = 0
-        self._last_idx = 0
-
-        super().__init__(
-            client=client,
-            max_sequence_length=n_step + 1,
-            priority_fns=priority_fns,
-            max_in_flight_items=max_in_flight_items,
-        )
-
-    def add(self, *args, **kwargs):
-        # Increment the indices for the start and end of the window for computing
-        # n-step returns.
-        if self._writer.episode_steps >= self.n_step:
-            self._first_idx += 1
-        self._last_idx += 1
-
-        super().add(*args, **kwargs)
-
-    def reset(
-        self,
-    ):  # pytype: disable=signature-mismatch  # overriding-parameter-count-checks
-        super().reset()
-        self._first_idx = 0
-        self._last_idx = 0
-
-    @property
-    def _n_step(self) -> int:
-        """Effective n-step, which may vary at starts and ends of episodes."""
-        return self._last_idx - self._first_idx
-
-    def _write(self):
-        # Convenient getters for use in tree operations.
-        get_first = lambda x: x[self._first_idx]
-        get_last = lambda x: x[self._last_idx]
-        # Note: this getter is meant to be used on a TrajectoryWriter.history to
-        # obtain its numpy values.
-        get_all_np = lambda x: x[self._first_idx : self._last_idx].numpy()
-
-        # Get the state, action, next_state, as well as possibly extras for the
-        # transition that is about to be written.
-        history = self._writer.history
-        s, a = tree.map_structure(
-            get_first, (history["observation"], history["action"])
-        )
-        s_ = tree.map_structure(get_last, history["observation"])
-
-        # Maybe get extras to add to the transition later.
-        if "extras" in history:
-            extras = tree.map_structure(get_first, history["extras"])
-
-        # Note: at the beginning of an episode we will add the initial N-1
-        # transitions (of size 1, 2, ...) and at the end of an episode (when
-        # called from write_last) we will write the final transitions of size (N,
-        # N-1, ...). See the Note in the docstring.
-        # Get numpy view of the steps to be fed into the priority functions.
-        reward, discount = tree.map_structure(
-            get_all_np, (history["reward"], history["discount"])
-        )
-
-        # Compute discounted return and geometric discount over n steps.
-        n_step_return, total_discount = self._compute_cumulative_quantities(
-            reward, discount
-        )
-
-        # Append the computed n-step return and total discount.
-        # Note: if this call to _write() is within a call to _write_last(), then
-        # this is the only data being appended and so it is not a partial append.
-        self._writer.append(
-            dict(n_step_return=n_step_return, total_discount=total_discount),
-            partial_step=self._writer.episode_steps <= self._last_idx,
-        )
-        # This should be done immediately after self._writer.append so the history
-        # includes the recently appended data.
-        history = self._writer.history
-
-        # Form the n-step transition by using the following:
-        # the first observation and action in the buffer, along with the cumulative
-        # reward and discount computed above.
-        n_step_return, total_discount = tree.map_structure(
-            lambda x: x[-1], (history["n_step_return"], history["total_discount"])
-        )
-        transition = types.Transition(
-            observation=s,
-            action=a,
-            reward=n_step_return,
-            discount=total_discount,
-            next_observation=s_,
-            extras=(extras if "extras" in history else ()),
-        )
-
-        # Calculate the priority for this transition.
-        table_priorities = utils.calculate_priorities(self._priority_fns, transition)
-
-        # Insert the transition into replay along with its priority.
-        for table, priority in table_priorities.items():
-            self._writer.create_item(
-                table=table, priority=priority, trajectory=transition
-            )
-            self._writer.flush(self._max_in_flight_items)
-
-    def _write_last(self):
-        # Write the remaining shorter transitions by alternating writing and
-        # incrementingfirst_idx. Note that last_idx will no longer be incremented
-        # once we're in this method's scope.
-        self._first_idx += 1
-        while self._first_idx < self._last_idx:
-            self._write()
-            self._first_idx += 1
-
-    def _compute_cumulative_quantities(
-        self, rewards: types.NestedArray, discounts: types.NestedArray
-    ) -> Tuple[types.NestedArray, types.NestedArray]:
-
-        # Give the same tree structure to the n-step return accumulator,
-        # n-step discount accumulator, and self.discount, so that they can be
-        # iterated in parallel using tree.map_structure.
-        rewards, discounts, self_discount = tree_utils.broadcast_structures(
-            rewards, discounts, self._discount
-        )
-        flat_rewards = tree.flatten(rewards)
-        flat_discounts = tree.flatten(discounts)
-        flat_self_discount = tree.flatten(self_discount)
-
-        # Copy total_discount as it is otherwise read-only.
-        total_discount = [np.copy(a[0]) for a in flat_discounts]
-
-        # Broadcast n_step_return to have the broadcasted shape of
-        # reward * discount.
-        n_step_return = [
-            np.copy(np.broadcast_to(r[0], np.broadcast(r[0], d).shape))
-            for r, d in zip(flat_rewards, total_discount)
-        ]
-
-        # NOTE: total_discount will have one less self_discount applied to it than
-        # the value of self._n_step. This is so that when the learner/update uses
-        # an additional discount we don't apply it twice. Inside the following loop
-        # we will apply this right before summing up the n_step_return.
-        for i in range(1, self._n_step):
-            for nsr, td, r, d, sd in zip(
-                n_step_return,
-                total_discount,
-                flat_rewards,
-                flat_discounts,
-                flat_self_discount,
-            ):
-                # Equivalent to: `total_discount *= self._discount`.
-                td *= sd
-                # Equivalent to: `n_step_return += reward[i] * total_discount`.
-                nsr += r[i] * td
-                # Equivalent to: `total_discount *= discount[i]`.
-                td *= d[i]
-
-        n_step_return = tree.unflatten_as(rewards, n_step_return)
-        total_discount = tree.unflatten_as(rewards, total_discount)
-        return n_step_return, total_discount
-
-    # TODO(bshahr): make this into a standalone method. Class methods should be
-    # used as alternative constructors or when modifying some global state,
-    # neither of which is done here.
-    @classmethod
-    def signature(
-        cls, environment_spec: specs.EnvironmentSpec, extras_spec: types.NestedSpec = ()
-    ):
-
-        # This function currently assumes that self._discount is a scalar.
-        # If it ever becomes a nested structure and/or a np.ndarray, this method
-        # will need to know its structure / shape. This is because the signature
-        # discount shape is the environment's discount shape and this adder's
-        # discount shape broadcasted together. Also, the reward shape is this
-        # signature discount shape broadcasted together with the environment
-        # reward shape. As long as self._discount is a scalar, it will not affect
-        # either the signature discount shape nor the signature reward shape, so we
-        # can ignore it.
-
-        rewards_spec, step_discounts_spec = tree_utils.broadcast_structures(
-            environment_spec.rewards, environment_spec.discounts
-        )
-        rewards_spec = tree.map_structure(
-            _broadcast_specs, rewards_spec, step_discounts_spec
-        )
-        step_discounts_spec = tree.map_structure(copy.deepcopy, step_discounts_spec)
-
-        transition_spec = types.Transition(
-            environment_spec.observations,
-            environment_spec.actions,
-            rewards_spec,
-            step_discounts_spec,
-            environment_spec.observations,  # next_observation
-            extras_spec,
-        )
-
-        return tree.map_structure_with_path(
-            base.spec_like_to_tensor_spec, transition_spec
-        )
-
-
-def _broadcast_specs(*args: specs.Array) -> specs.Array:
-    """Like np.broadcast, but for specs.Array.
-
-    Args:
-      *args: one or more specs.Array instances.
-
-    Returns:
-      A specs.Array with the broadcasted shape and dtype of the specs in *args.
-    """
-    bc_info = np.broadcast(*tuple(a.generate_value() for a in args))
-    dtype = np.result_type(*tuple(a.dtype for a in args))
-    return specs.Array(shape=bc_info.shape, dtype=dtype)
-
-
 class FeedForwardActor(core.Actor):
     """A feed-forward actor.
 
@@ -679,30 +526,12 @@ class AcmeMPO:
         self._log_every = log_every
 
     def replay(self):
-        """The replay storage."""
-        if self._samples_per_insert is not None:
-            # Create enough of an error buffer to give a 10% tolerance in rate.
-            samples_per_insert_tolerance = 0.1 * self._samples_per_insert
-            error_buffer = self._min_replay_size * samples_per_insert_tolerance
+        """Return an in-process simple replay buffer.
 
-            limiter = reverb.rate_limiters.SampleToInsertRatio(
-                min_size_to_sample=self._min_replay_size,
-                samples_per_insert=self._samples_per_insert,
-                error_buffer=error_buffer,
-            )
-        else:
-            limiter = reverb.rate_limiters.MinSize(
-                min_size_to_sample=self._min_replay_size
-            )
-        replay_table = reverb.Table(
-            name=_DEFAULT_PRIORITY_TABLE,
-            sampler=reverb.selectors.Uniform(),
-            remover=reverb.selectors.Fifo(),
-            max_size=self._max_replay_size,
-            rate_limiter=limiter,
-            signature=NStepTransitionAdder.signature(self._environment_spec),
-        )
-        return [replay_table]
+        For local single-process training we use a lightweight in-memory
+        replay buffer instead of Reverb.
+        """
+        return SimpleReplayBuffer(max_size=self._max_replay_size)
 
     def counter(self):
         return Runner(counting.Counter())
@@ -712,7 +541,7 @@ class AcmeMPO:
 
     def learner(
         self,
-        replay: reverb.Client,
+        replay,
         counter: counting.Counter,
     ):
         """The Learning part of the agent."""
@@ -743,18 +572,14 @@ class AcmeMPO:
         tf2_utils.create_variables(target_networks["policy"], [emb_spec])
         tf2_utils.create_variables(target_networks["critic"], [emb_spec, act_spec])
 
-        # The dataset object to learn from.
-        dataset = datasets.make_reverb_dataset(server_address=replay.server_address)
-        dataset = dataset.batch(self._batch_size, drop_remainder=True)
-        dataset = dataset.prefetch(self._prefetch_size)
-
         # Create a counter and logger for bookkeeping steps and performance.
         counter = counting.Counter(counter, "learner")
         logger = loggers.make_default_logger(
             "learner", time_delta=self._log_every, steps_key="learner_steps"
         )
 
-        # Return the learning agent.
+        # Return the learning agent which will directly sample from the
+        # in-memory replay buffer.
         return MPOLearner(
             policy_network=online_networks["policy"],
             critic_network=online_networks["critic"],
@@ -766,14 +591,15 @@ class AcmeMPO:
             num_samples=self._num_samples,
             target_policy_update_period=self._target_policy_update_period,
             target_critic_update_period=self._target_critic_update_period,
-            dataset=dataset,
+            replay_buffer=replay,
+            batch_size=self._batch_size,
             counter=counter,
             logger=logger,
         )
 
     def actor(
         self,
-        replay: reverb.Client,
+        replay,
         variable_source: acme.VariableSource,
         counter: counting.Counter,
     ) -> EnvironmentLoop:
@@ -809,8 +635,9 @@ class AcmeMPO:
         # assigning variables before running the environment loop.
         variable_client.update_and_wait()
 
-        adder = NStepTransitionAdder(
-            client=replay, n_step=self._n_step, discount=self._additional_discount
+        # Use the simple in-process adder which writes to the in-memory buffer.
+        adder = SimpleNStepAdder(
+            replay=replay, n_step=self._n_step, discount=self._additional_discount
         )
 
         actor = FeedForwardActor(
@@ -897,26 +724,22 @@ class AcmeMPO:
     ):
         """Run the agent topology locally without Launchpad.
 
-        This starts an in-process Reverb server, creates a client, instantiates
-        the learner/actor/evaluator loops and runs the actor loop in the main
+        This creates an in-process replay buffer, instantiates the
+        learner/actor/evaluator loops and runs the actor loop in the main
         thread. Optionally runs the learner (and evaluator) in background
         daemon threads.
         """
-        # Create tables and start an in-process Reverb server.
-        tables = self.replay()
-        server = reverb.Server(tables)
-        client = reverb.Client(server_address=server.server_address)
-
-        # Shared counter for bookkeeping.
+        # Create an in-process replay buffer and shared counter.
+        replay = self.replay()
         counter = counting.Counter()
 
-        # Instantiate learner, evaluator and actor loops.
-        learner = self.learner(client, counter)
+        # Instantiate learner, evaluator and actor loops using the replay buffer.
+        learner = self.learner(replay, counter)
         evaluator_loop = None
         if run_evaluator:
             evaluator_loop = self.evaluator(learner, counter)
 
-        actor_loop = self.actor(client, learner, counter)
+        actor_loop = self.actor(replay, learner, counter)
 
         # If requested, run the learner in a background thread.
         if run_learner_in_thread:
@@ -984,11 +807,7 @@ class AcmeMPO:
                             # If learner fails, continue with acting.
                             pass
 
-        # Cleanly stop server when done.
-        try:
-            server.stop()
-        except Exception:
-            pass
+        # Nothing to clean up for in-process replay buffer.
 
 
 """Implements the MPO losses.
@@ -1465,7 +1284,8 @@ class MPOLearner(acme.Learner):
         num_samples: int,
         target_policy_update_period: int,
         target_critic_update_period: int,
-        dataset: tf.data.Dataset,
+        replay_buffer: SimpleReplayBuffer,
+        batch_size: int,
         observation_network: types.TensorTransformation = tf.identity,
         target_observation_network: types.TensorTransformation = tf.identity,
         policy_optimizer: Optional[snt.Optimizer] = None,
@@ -1487,9 +1307,9 @@ class MPOLearner(acme.Learner):
         self._target_policy_update_period = target_policy_update_period
         self._target_critic_update_period = target_critic_update_period
 
-        # Batch dataset and create iterator.
-        # TODO(b/155086959): Fix type stubs and remove.
-        self._iterator = iter(dataset)  # pytype: disable=wrong-arg-types
+        # Store reference to replay buffer and batch size.
+        self._replay = replay_buffer
+        self._batch_size = batch_size
 
         # Store online and target networks.
         self._policy_network = policy_network
@@ -1532,7 +1352,6 @@ class MPOLearner(acme.Learner):
         # fill the replay buffer.
         self._timestamp = None
 
-    @tf.function
     def _step(self) -> types.Nest:
         # Update target network.
         online_policy_variables = self._policy_network.variables
@@ -1558,12 +1377,20 @@ class MPOLearner(acme.Learner):
         # Increment number of learner steps for periodic update bookkeeping.
         self._num_steps.assign_add(1)
 
-        # Get next batch of data.
-        inputs = next(self._iterator)
+        # Sample a batch from the in-memory replay buffer and convert to
+        # TensorFlow tensors.
+        sampled = self._replay.sample(self._batch_size)
 
-        # Get data from replay (dropping extras if any). Note there is no
-        # extra data here because we do not insert any into Reverb.
-        transitions: types.Transition = inputs.data
+        # Convert numpy arrays to tf.Tensor. `sampled` is a types.Transition of
+        # numpy arrays with leading batch dimension.
+        transitions = types.Transition(
+            observation=tf.convert_to_tensor(sampled.observation),
+            action=tf.convert_to_tensor(sampled.action),
+            reward=tf.convert_to_tensor(sampled.reward),
+            discount=tf.convert_to_tensor(sampled.discount),
+            next_observation=tf.convert_to_tensor(sampled.next_observation),
+            extras=sampled.extras,
+        )
 
         # Cast the additional discount to match the environment discount dtype.
         discount = tf.cast(self._discount, dtype=transitions.discount.dtype)
@@ -1941,7 +1768,7 @@ def main(_):
         max_actor_steps=_MAX_ACTOR_STEPS.value,
     )
 
-    # Run locally without Launchpad using an in-process Reverb server.
+    # Run locally without Launchpad using an in-process replay buffer.
     program_builder.run_local(max_actor_steps=_MAX_ACTOR_STEPS.value)
 
 
