@@ -31,16 +31,9 @@ def init_weights(module):
 
 # Cross-entropy loss: - E_{nonparametric}[ log pi_online(sampled_action) ]
 def weighted_cross_entropy(means, scales, N, sampled_actions, normalized_weights):
-    means_exp = means.unsqueeze(0).expand(N, -1, -1)  # [N,B,D]
-    scales_exp = scales.unsqueeze(0).expand(N, -1, -1)  # [N,B,D]
-    # log prob of Gaussian diagonal
-    logp = -0.5 * (
-        ((sampled_actions - means_exp) / scales_exp) ** 2
-        + 2.0 * torch.log(scales_exp)
-        + math.log(2 * math.pi)
-    )
-    logp = logp.sum(dim=-1)  # [N,B]
-    loss = -(logp * normalized_weights).sum(dim=0)  # [B]
+    online_dist = dist.Independent(dist.Normal(means, scales), 1)
+    logp = online_dist.log_prob(sampled_actions)  # [N, B]
+    loss = -(logp * normalized_weights).sum(dim=0)
     return loss.mean()
 
 
