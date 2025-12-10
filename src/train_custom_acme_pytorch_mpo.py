@@ -287,6 +287,9 @@ class MPOLoss(nn.Module):
                 self._epsilon_penalty + penalty_q_logsumexp.mean() - math.log(float(N))
             ) * penalty_temperature
             normalized_weights = normalized_weights + penalty_w
+            normalized_weights = normalized_weights / (
+                normalized_weights.sum(dim=0, keepdim=True) + 1e-12
+            )
             loss_temperature = loss_temperature + loss_penalty_temp
 
         # Decompose online policy into fixed-std and fixed-mean distributions
@@ -595,7 +598,7 @@ class MPOAgent:
         # policy update using MPO loss
         # Use detached target embeddings (o_t) for policy computation so the policy head
         # updates but not the observation encoder (mirrors TF stop_gradient on o_t).
-        emb_o_t = emb_next.detach()
+        emb_o_t = obs_emb.detach()
         online_mean, online_scale = self.policy_head(emb_o_t)
         # target mean/scale already computed as t_mean/t_scale (from above, no_grad)
         # compute MPO loss with sampled_actions and q_samples
@@ -845,7 +848,6 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--dual_lr", type=float, default=1e-2)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--static_seed", type=int, default=0)
     parser.add_argument("--wandb_project", type=str, default="mpo_project")
     parser.add_argument("--wandb_entity", type=str, default="adrian-research")
     parser.add_argument("--wandb_group_prefix", type=str, default=None)
@@ -865,11 +867,7 @@ if __name__ == "__main__":
             )
             start_time = time.time()
 
-            seed = (
-                torch.randint(0, 10000, (1,)).item()
-                if args.static_seed is None
-                else args.static_seed
-            )
+            seed = torch.randint(0, 10000, (1,)).item()
 
             experiment_identifier = (
                 env_name
