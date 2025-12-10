@@ -220,14 +220,14 @@ class MPOLoss(nn.Module):
         action_dim: int,
         per_dim_constraining: bool = True,
         action_penalization: bool = True,
-        epsilon: float = 1e-1,
-        epsilon_mean: float = 2.5e-3,
-        epsilon_stddev: float = 1e-6,
-        epsilon_penalty: float = 1e-3,
-        init_log_temperature: float = 10.0,
-        init_log_alpha_mean: float = 10.0,
-        init_log_alpha_stddev: float = 1000.0,
-        min_log: float = -18.0,
+        epsilon: float = 0.1,
+        epsilon_mean: float = 0.02,
+        epsilon_stddev: float = 0.02,
+        epsilon_penalty: float = 0.01,
+        init_log_temperature: float = 0.0,
+        init_log_alpha_mean: float = 0.0,
+        init_log_alpha_stddev: float = 0.0,  # was 1000 in acme
+        min_log: float = -10.0,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -266,11 +266,11 @@ class MPOLoss(nn.Module):
     ):
         # ensure positivity with softplus, clamp logs to avoid extreme negatives
         with torch.no_grad():
-            self.log_temperature.data.clamp_(min=self._min_log)
-            self.log_alpha_mean.data.clamp_(min=self._min_log)
-            self.log_alpha_stddev.data.clamp_(min=self._min_log)
+            self.log_temperature.data.clamp_(min=self._min_log, max=10.0)
+            self.log_alpha_mean.data.clamp_(min=self._min_log, max=10.0)
+            self.log_alpha_stddev.data.clamp_(min=self._min_log, max=10.0)
             if self.action_penalization:
-                self.log_penalty_temperature.data.clamp_(min=self._min_log)
+                self.log_penalty_temperature.data.clamp_(min=self._min_log, max=10.0)
 
         temperature = F.softplus(self.log_temperature) + 1e-8  # scalar
         alpha_mean = F.softplus(self.log_alpha_mean) + 1e-8  # (D,) or (1,)
@@ -596,7 +596,7 @@ class MPOAgent:
         # policy update using MPO loss
         # Use detached target embeddings (o_t) for policy computation so the policy head
         # updates but not the observation encoder (mirrors TF stop_gradient on o_t).
-        emb_o_t = emb_next.detach()
+        emb_o_t = self.obs_encoder(next_obs_b).detach()
         online_mean, online_scale = self.policy_head(emb_o_t)
         # target mean/scale already computed as t_mean/t_scale (from above, no_grad)
         # compute MPO loss with sampled_actions and q_samples
@@ -682,18 +682,18 @@ def train(
     max_actor_steps: int,
     batch_size: int,
     max_replay_size: int,
+    min_replay_size: int,
     n_step: int,
     gamma: float,
     num_samples: int,
     target_policy_update_period: int,
     target_critic_update_period: int,
     lr: float,
-    dual_lr: float,
+    lr_dual: float,
     seed: int,
     log_dir: str,
-    eval_freq: int = 0,
-    eval_episodes: int = 5,
-    min_replay_size: int = 1000,
+    max_eval_actor_steps: int,
+    eval_freq: int,
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -738,7 +738,7 @@ def train(
         target_critic_update_period=target_critic_update_period,
         lr_policy=lr,
         lr_critic=lr,
-        lr_dual=dual_lr,
+        lr_dual=lr_dual,
         min_replay_size=min_replay_size,  # pass through
     )
 
@@ -789,14 +789,20 @@ def train(
 
             if step % eval_freq == 0:
                 eval_returns = []
+                # The code `eval_lengths` is not doing anything as it is just a variable name. It is
+                # not assigned any value or used in any operation.
+                # The code `eval_lengths` is not doing anything as it is just a variable name. It is
+                # not assigned any value or used in any operation.
                 eval_lengths = []
-                for _ in range(eval_episodes):
+                eval_steps = 0
+                while eval_steps < max_eval_actor_steps:
                     o, _ = eval_env.reset()
                     o_flat = flatten_observation(o)
                     done_eval = False
                     ep_ret = 0.0
                     ep_len = 0
                     while not done_eval:
+                        eval_steps += 1
                         a = agent.select_action(o_flat, stochastic=False)
                         no, r, terminated, truncated, _ = eval_env.step(a)
                         done_eval = terminated or truncated
@@ -874,13 +880,13 @@ def parse_args():
     parser.add_argument("--target_policy_update_period", type=int, default=25)
     parser.add_argument("--target_critic_update_period", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--dual_lr", type=float, default=1e-3)
+    parser.add_argument("--lr_dual", type=float, default=5e-4)
     parser.add_argument("--wandb_project", type=str, default="mpo_project")
     parser.add_argument("--wandb_entity", type=str, default="adrian-research")
     parser.add_argument("--wandb_group_prefix", type=str, default=None)
     parser.add_argument("--base_log_dir", type=str, default="./logs/mpo_experiment")
     parser.add_argument("--eval_freq", type=int, default=3000)
-    parser.add_argument("--eval_episodes", type=int, default=5)
+    parser.add_argument("--max_eval_actor_steps", type=int, default=3000)
     return parser.parse_args()
 
 
@@ -939,10 +945,10 @@ if __name__ == "__main__":
                 target_policy_update_period=args.target_policy_update_period,
                 target_critic_update_period=args.target_critic_update_period,
                 lr=args.lr,
-                dual_lr=args.dual_lr,
+                lr_dual=args.lr_dual,
                 seed=seed,
                 eval_freq=args.eval_freq,
-                eval_episodes=args.eval_episodes,
+                max_eval_actor_steps=args.max_eval_actor_steps,
                 min_replay_size=args.min_replay_size,
                 log_dir=log_dir,
             )
