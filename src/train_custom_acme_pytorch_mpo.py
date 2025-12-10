@@ -17,6 +17,21 @@ import torch.optim as optim
 import wandb
 
 
+# Cross-entropy loss: - E_{nonparametric}[ log pi_online(sampled_action) ]
+def weighted_cross_entropy(means, scales, N, sampled_actions, normalized_weights):
+    means_exp = means.unsqueeze(0).expand(N, -1, -1)  # [N,B,D]
+    scales_exp = scales.unsqueeze(0).expand(N, -1, -1)  # [N,B,D]
+    # log prob of Gaussian diagonal
+    logp = -0.5 * (
+        ((sampled_actions - means_exp) / scales_exp) ** 2
+        + 2.0 * torch.log(scales_exp)
+        + math.log(2 * math.pi)
+    )
+    logp = logp.sum(dim=-1)  # [N,B]
+    loss = -(logp * normalized_weights).sum(dim=0)  # [B]
+    return loss.mean()
+
+
 class NStepTransition:
     __slots__ = ("obs", "action", "reward", "discount", "next_obs", "done")
 
@@ -296,22 +311,12 @@ class MPOLoss(nn.Module):
         fixed_mean_mean = target_mean
         fixed_mean_scale = online_scale
 
-        # Cross-entropy loss: - E_{nonparametric}[ log pi_online(sampled_action) ]
-        def weighted_cross_entropy(means, scales):
-            means_exp = means.unsqueeze(0).expand(N, -1, -1)  # [N,B,D]
-            scales_exp = scales.unsqueeze(0).expand(N, -1, -1)  # [N,B,D]
-            # log prob of Gaussian diagonal
-            logp = -0.5 * (
-                ((sampled_actions - means_exp) / scales_exp) ** 2
-                + 2.0 * torch.log(scales_exp)
-                + math.log(2 * math.pi)
-            )
-            logp = logp.sum(dim=-1)  # [N,B]
-            loss = -(logp * normalized_weights).sum(dim=0)  # [B]
-            return loss.mean()
-
-        loss_policy_mean = weighted_cross_entropy(fixed_std_mean, fixed_std_scale)
-        loss_policy_std = weighted_cross_entropy(fixed_mean_mean, fixed_mean_scale)
+        loss_policy_mean = weighted_cross_entropy(
+            fixed_std_mean, fixed_std_scale, N, sampled_actions, normalized_weights
+        )
+        loss_policy_std = weighted_cross_entropy(
+            fixed_mean_mean, fixed_mean_scale, N, sampled_actions, normalized_weights
+        )
 
         # KL computations: KL(target || fixed) per-dim
         def kl_diag(m_p, s_p, m_q, s_q):
@@ -508,7 +513,6 @@ class MPOAgent:
         ).to(device)
         self.dual_opt = optim.Adam(self.mpo_loss.parameters(), lr=lr_dual)
 
-        # replay
         self.replay = NStepReplay(max_size=max_replay_size, n_step=n_step, gamma=gamma)
 
         self._learn_steps = 0
@@ -689,17 +693,22 @@ def train(
     target_critic_update_period: int,
     lr: float,
     dual_lr: float,
-    device_str: str,
     seed: int,
+    log_dir: str,
     eval_freq: int = 0,
     eval_episodes: int = 5,
-    min_replay_size: int = 1000,  # added param
+    min_replay_size: int = 1000,
 ):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    device = torch.device(device_str)
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Using device: {device}")
 
     env = make_env(env_name)
@@ -743,7 +752,6 @@ def train(
     episode_len = 0
     start_time = time.time()
 
-    # run until max_actor_steps env steps have been executed
     step = 0
     while step < max_actor_steps:
         # run one episode (or until global step budget exhausted)
@@ -819,9 +827,36 @@ def train(
                 print(
                     f"Step {step} | Learn step {stats['train/learn_steps']} | critic_loss={stats['train/critic_loss']:.6f} | Ep Return {episode_return:.2f} | Ep Length {episode_len} | elapsed={elapsed:.1f}s"
                 )
-
     env.close()
     eval_env.close()
+
+    try:
+        ckpt_dir = os.path.join(log_dir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{int(time.time())}.pt")
+        checkpoint = {
+            "obs_encoder": agent.obs_encoder.state_dict(),
+            "policy_head": agent.policy_head.state_dict(),
+            "critic": agent.critic.state_dict(),
+            "target_obs_encoder": agent.target_obs_encoder.state_dict(),
+            "target_policy_head": agent.target_policy_head.state_dict(),
+            "target_critic": agent.target_critic.state_dict(),
+            "mpo_loss": agent.mpo_loss.state_dict(),
+            "critic_opt": agent.critic_opt.state_dict(),
+            "policy_opt": agent.policy_opt.state_dict(),
+            "dual_opt": agent.dual_opt.state_dict(),
+            "learn_steps": agent._learn_steps,
+            "step": step,
+            "seed": seed,
+            "replay": [
+                (t.obs, t.action, t.reward, t.discount, t.next_obs, t.done)
+                for t in agent.replay._buffer
+            ],
+        }
+        torch.save(checkpoint, ckpt_path)
+        print(f"Saved checkpoint to {ckpt_path}")
+    except Exception as e:
+        print(f"Failed to save checkpoint: {e}")
 
 
 def parse_args():
@@ -844,7 +879,6 @@ def parse_args():
     parser.add_argument("--target_critic_update_period", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--dual_lr", type=float, default=1e-2)
-    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--wandb_project", type=str, default="mpo_project")
     parser.add_argument("--wandb_entity", type=str, default="adrian-research")
     parser.add_argument("--wandb_group_prefix", type=str, default=None)
@@ -910,11 +944,11 @@ if __name__ == "__main__":
                 target_critic_update_period=args.target_critic_update_period,
                 lr=args.lr,
                 dual_lr=args.dual_lr,
-                device_str=args.device,
                 seed=seed,
                 eval_freq=args.eval_freq,
                 eval_episodes=args.eval_episodes,
-                min_replay_size=args.min_replay_size,  # pass new arg
+                min_replay_size=args.min_replay_size,
+                log_dir=log_dir,
             )
 
             wandb.finish()
