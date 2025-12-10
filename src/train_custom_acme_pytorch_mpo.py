@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import wandb
+import shimmy
 
 
 # Cross-entropy loss: - E_{nonparametric}[ log pi_online(sampled_action) ]
@@ -653,18 +654,9 @@ class MPOAgent:
         return fetches
 
 
-def make_env(env_name: str):
-    # dm_control names are like "dm_control/domain-task-v0" or you pass "cartpole::balance"
-    if env_name.startswith("dm_control/") or "::" in env_name:
-        import shimmy
-
-        if "::" in env_name:
-            domain, task = env_name.split("::")
-            return gym.make(f"dm_control/{domain}-{task}-v0")
-        else:
-            return gym.make(env_name)
-    else:
-        return gym.make(env_name)
+def make_env(env_name: str, render_mode: str | None = None):
+    domain, task = env_name.split("::")
+    return gym.make(f"dm_control/{domain}-{task}-v0", render_mode=render_mode)
 
 
 def flatten_observation(obs):
