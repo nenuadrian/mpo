@@ -592,7 +592,8 @@ class MPOAgent:
         # policy update using MPO loss
         # Use detached target embeddings (o_t) for policy computation so the policy head
         # updates but not the observation encoder (mirrors TF stop_gradient on o_t).
-        emb_o_t = self.obs_encoder(next_obs_b).detach()
+        obs_emb_next = self.obs_encoder(next_obs_b)
+        emb_o_t = obs_emb_next.detach()
         online_mean, online_scale = self.policy_head(emb_o_t)
         # target mean/scale already computed as t_mean/t_scale (from above, no_grad)
         # compute MPO loss with sampled_actions and q_samples
@@ -778,25 +779,36 @@ def train(
                 wandb.log(log_dict, step=step)
 
             if step % eval_freq == 0:
-                eval_returns = []
-                eval_lengths = []
-                eval_steps = 0
-                while eval_steps < max_eval_actor_steps:
-                    o, _ = eval_env.reset()
-                    o_flat = flatten_observation(o)
-                    done_eval = False
-                    ep_ret = 0.0
-                    ep_len = 0
-                    while not done_eval:
-                        eval_steps += 1
-                        a = agent.select_action(o_flat, stochastic=False)
-                        no, r, terminated, truncated, _ = eval_env.step(a)
-                        done_eval = terminated or truncated
-                        o_flat = flatten_observation(no)
-                        ep_ret += float(r)
-                        ep_len += 1
-                    eval_returns.append(ep_ret)
-                    eval_lengths.append(ep_len)
+                eval_returns, eval_lengths, eval_steps = [], [], 0
+                train_modes = (
+                    agent.obs_encoder.training,
+                    agent.policy_head.training,
+                    agent.critic.training,
+                )
+                # Disable gradients and restore modes even if eval errors.
+                with torch.inference_mode():
+                    agent.obs_encoder.eval()
+                    agent.policy_head.eval()
+                    agent.critic.eval()
+                    try:
+                        while eval_steps < max_eval_actor_steps:
+                            o, _ = eval_env.reset()
+                            o_flat = flatten_observation(o)
+                            done_eval, ep_ret, ep_len = False, 0.0, 0
+                            while not done_eval:
+                                eval_steps += 1
+                                a = agent.select_action(o_flat, stochastic=False)
+                                no, r, terminated, truncated, _ = eval_env.step(a)
+                                done_eval = terminated or truncated
+                                o_flat = flatten_observation(no)
+                                ep_ret += float(r)
+                                ep_len += 1
+                            eval_returns.append(ep_ret)
+                            eval_lengths.append(ep_len)
+                    finally:
+                        agent.obs_encoder.train(train_modes[0])
+                        agent.policy_head.train(train_modes[1])
+                        agent.critic.train(train_modes[2])
                 mean_r = float(np.mean(eval_returns))
                 std_r = float(np.std(eval_returns))
                 mean_len = float(np.mean(eval_lengths))

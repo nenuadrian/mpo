@@ -1,13 +1,11 @@
 import os
 import sys
 import logging
-import math
 
 import torch
 import numpy as np
 import gymnasium
 import imageio
-import torch.nn as nn
 import wandb
 
 LOGGER_NAME = "mpo"
@@ -57,35 +55,6 @@ def compute_grad_stats(params):
         return {"grad_norm": 0.0, "grad_max": 0.0}
     grad_norm = torch.sqrt(total_sq).item()
     return {"grad_norm": float(grad_norm), "grad_max": float(max_abs.item())}
-
-
-def evaluate_policy(policy: GaussianPolicy, env, device, n_eval_episodes: int = 5):
-    """
-    Run the policy for n_eval_episodes (stochastic sampling) and return list of episode returns and episode lengths.
-    """
-    returns = []
-    lengths = []
-    for _ in range(n_eval_episodes):
-        obs = torch.tensor(
-            env.reset()[0], dtype=torch.float32, device=device
-        ).unsqueeze(0)
-        done = False
-        ep_ret = 0.0
-        ep_len = 0
-        while not done:
-            with torch.no_grad():
-                action_tensor, _ = policy.sample(obs)
-                action = action_tensor.cpu().numpy()[0]
-            next_obs, reward, terminated, truncated, _ = env.step(action)
-            ep_ret += float(reward)
-            ep_len += 1
-            done = terminated or truncated
-            obs = torch.tensor(next_obs, dtype=torch.float32, device=device).unsqueeze(
-                0
-            )
-        returns.append(ep_ret)
-        lengths.append(ep_len)
-    return returns, lengths
 
 
 def checkpoint_if_needed(
@@ -302,53 +271,3 @@ def load_policy_from_checkpoint(ckpt_path: str, policy: torch.nn.Module):
         state = ckpt.get("state_dict", ckpt)
     policy.load_state_dict(state)
     return ckpt
-
-
-def compute_weights_and_temperature_loss_torch(
-    q_values: torch.Tensor,
-    epsilon: float,
-    temperature: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    PyTorch equivalent of Acme's compute_weights_and_temperature_loss.
-
-    Args:
-      q_values: [K, B] Q-values for K sampled actions per state.
-      epsilon: scalar KL constraint target.
-      temperature: positive scalar dual variable (already in primal space).
-
-    Returns:
-      normalized_weights: [K, B] softmax-normalized weights (no grad).
-      temperature_loss: scalar temperature (dual) loss for backprop.
-    """
-    # Ensure we don't propagate gradients through Q into the temperature update.
-    tempered_q = (q_values.detach()) / temperature
-
-    # Softmax over action-sample dimension K.
-    normalized_weights = torch.softmax(tempered_q, dim=0).detach()
-
-    # Dual loss: epsilon + E[logsumexp(Q/τ) - log K], multiplied by τ.
-    # dim=0 -> over K actions; mean over batch B.
-    q_logsumexp = torch.logsumexp(tempered_q, dim=0)  # [B]
-    log_num_actions = math.log(q_values.shape[0])
-    loss_temperature_inner = float(epsilon) + q_logsumexp.mean() - log_num_actions
-    temperature_loss = temperature * loss_temperature_inner
-    return normalized_weights, temperature_loss
-
-
-def compute_nonparametric_kl_from_normalized_weights_torch(
-    normalized_weights: torch.Tensor,
-) -> torch.Tensor:
-    """
-    PyTorch equivalent of Acme's compute_nonparametric_kl_from_normalized_weights.
-
-    Args:
-      normalized_weights: [K, B] normalized discrete distribution over K actions.
-
-    Returns:
-      kl: [B] estimated KL(q_nonparametric || uniform over K actions).
-    """
-    K = normalized_weights.shape[0]
-    num_action_samples = float(K)
-    integrand = torch.log(num_action_samples * normalized_weights + 1e-8)
-    return torch.sum(normalized_weights * integrand, dim=0)

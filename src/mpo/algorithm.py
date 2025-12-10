@@ -7,20 +7,153 @@ import torch.nn.functional as F
 import gymnasium
 import numpy as np
 import wandb
+from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage
+from tensordict import TensorDict
 
 from mpo.gaussian_policy import GaussianPolicy
-from mpo.replay_buffer import NStepReplayBuffer
 from mpo.q_network import QNetwork
 from mpo.utils import (
-    evaluate_policy,
     checkpoint_if_needed,
     compute_grad_stats,
     setup_logging,
-    compute_weights_and_temperature_loss_torch,
-    compute_nonparametric_kl_from_normalized_weights_torch,
 )
 from mpo.mpo_config import MPOConfig
-from mpo.mpo_loss import MPOLoss
+
+
+def evaluate_policy(policy: GaussianPolicy, env, device, n_eval_episodes: int = 5):
+    """
+    Run the policy for n_eval_episodes (stochastic sampling) and return list of episode returns and episode lengths.
+    """
+    returns = []
+    lengths = []
+    prior_mode = policy.training
+    policy.eval()
+    with torch.inference_mode():
+        for _ in range(n_eval_episodes):
+            obs = torch.tensor(
+                env.reset()[0], dtype=torch.float32, device=device
+            ).unsqueeze(0)
+            done = False
+            ep_ret = 0.0
+            ep_len = 0
+            while not done:
+                action_tensor, _ = policy.sample(obs)
+                action = action_tensor.cpu().numpy()[0]
+                next_obs, reward, terminated, truncated, _ = env.step(action)
+                ep_ret += float(reward)
+                ep_len += 1
+                done = terminated or truncated
+                obs = torch.tensor(
+                    next_obs, dtype=torch.float32, device=device
+                ).unsqueeze(0)
+            returns.append(ep_ret)
+            lengths.append(ep_len)
+    policy.train(prior_mode)
+    return returns, lengths
+
+
+def compute_weights_and_temperature_loss_torch(
+    q_values: torch.Tensor,
+    epsilon: float,
+    temperature: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    PyTorch equivalent of Acme's compute_weights_and_temperature_loss.
+
+    Args:
+      q_values: [K, B] Q-values for K sampled actions per state.
+      epsilon: scalar KL constraint target.
+      temperature: positive scalar dual variable (already in primal space).
+
+    Returns:
+      normalized_weights: [K, B] softmax-normalized weights (no grad).
+      temperature_loss: scalar temperature (dual) loss for backprop.
+    """
+    # Ensure we don't propagate gradients through Q into the temperature update.
+    tempered_q = (q_values.detach()) / temperature
+
+    # Softmax over action-sample dimension K.
+    normalized_weights = torch.softmax(tempered_q, dim=0).detach()
+
+    # Dual loss: epsilon + E[logsumexp(Q/τ) - log K], multiplied by τ.
+    # dim=0 -> over K actions; mean over batch B.
+    q_logsumexp = torch.logsumexp(tempered_q, dim=0)  # [B]
+    log_num_actions = math.log(q_values.shape[0])
+    loss_temperature_inner = float(epsilon) + q_logsumexp.mean() - log_num_actions
+    temperature_loss = temperature * loss_temperature_inner
+    return normalized_weights, temperature_loss
+
+
+def compute_nonparametric_kl_from_normalized_weights_torch(
+    normalized_weights: torch.Tensor,
+) -> torch.Tensor:
+    """
+    PyTorch equivalent of Acme's compute_nonparametric_kl_from_normalized_weights.
+
+    Args:
+      normalized_weights: [K, B] normalized discrete distribution over K actions.
+
+    Returns:
+      kl: [B] estimated KL(q_nonparametric || uniform over K actions).
+    """
+    K = normalized_weights.shape[0]
+    num_action_samples = float(K)
+    integrand = torch.log(num_action_samples * normalized_weights + 1e-8)
+    return torch.sum(normalized_weights * integrand, dim=0)
+
+
+class MPOLoss(nn.Module):
+    """
+    Small helper that encapsulates MPO dual variables:
+      - log_temperature (scalar)
+      - log_alpha_mean (scalar)
+      - log_alpha_stddev (scalar)
+
+    Exposes:
+      - temperature(): softplus(log_temperature) + eps
+      - alphas(): (alpha_mean, alpha_std) = softplus of the logs
+      - compute_weights_and_temperature_loss(q_values, epsilon): wrapper around utils helper
+    """
+
+    def __init__(
+        self,
+        eta: float = 1.0,
+        init_log_alpha_mean: float = 0.0,
+        init_log_alpha_stddev: float = 0.0,
+        device: torch.device = torch.device("cpu"),
+    ):
+        super().__init__()
+        init_log_temperature = math.log(max(eta, 1e-8))
+        self.log_temperature = nn.Parameter(
+            torch.tensor([init_log_temperature], dtype=torch.float32, device=device)
+        )
+        self.log_alpha_mean = nn.Parameter(
+            torch.tensor([init_log_alpha_mean], dtype=torch.float32, device=device)
+        )
+        self.log_alpha_stddev = nn.Parameter(
+            torch.tensor([init_log_alpha_stddev], dtype=torch.float32, device=device)
+        )
+        self._eps = 1e-8
+
+    def temperature(self) -> torch.Tensor:
+        # primal temperature (softplus ensures positivity)
+        return torch.nn.functional.softplus(self.log_temperature) + self._eps
+
+    def alphas(self) -> tuple[torch.Tensor, torch.Tensor]:
+        alpha_mean = torch.nn.functional.softplus(self.log_alpha_mean) + self._eps
+        alpha_std = torch.nn.functional.softplus(self.log_alpha_stddev) + self._eps
+        return alpha_mean, alpha_std
+
+    def compute_weights_and_temperature_loss(
+        self, q_values: torch.Tensor, epsilon: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        q_values: [K, B] (same convention as utils helper)
+        returns (normalized_weights [K,B], temperature_loss scalar tensor)
+        """
+        return compute_weights_and_temperature_loss_torch(
+            q_values=q_values, epsilon=float(epsilon), temperature=self.temperature()
+        )
 
 
 def policy_evaluation_e_step(
@@ -198,15 +331,9 @@ def policy_evaluation_m_step(
 
 def warmup_replay_buffer(
     env: gymnasium.Env, device: torch.device, config: MPOConfig, pi_old: nn.Module
-) -> NStepReplayBuffer:
-    replay_buffer = NStepReplayBuffer(
-        capacity=config.replay_buffer_size,
-        obs_shape=env.observation_space.shape,
-        act_shape=env.action_space.shape,
-        n_step=5,
-        gamma=0.99,
-        device=device,
-    )
+) -> TensorDictReplayBuffer:
+    storage = LazyTensorStorage(config.replay_buffer_size, device=device)
+    replay_buffer = TensorDictReplayBuffer(storage=storage)
     obs, _ = env.reset(seed=config.seed)
     obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
@@ -216,7 +343,18 @@ def warmup_replay_buffer(
             action = action_tensor.cpu().numpy()[0]
         next_obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
-        replay_buffer.push(obs.cpu().numpy()[0], action, reward, done, 0.0, next_obs)
+        transition = TensorDict(
+            {
+                "obs": obs.squeeze(0),
+                "action": torch.tensor(action, device=device, dtype=torch.float32),
+                "reward": torch.tensor(reward, device=device, dtype=torch.float32),
+                "done": torch.tensor(done, device=device, dtype=torch.bool),
+                "next_obs": torch.tensor(next_obs, dtype=torch.float32, device=device),
+                "logp_mu": torch.tensor(0.0, device=device, dtype=torch.float32),
+            },
+            batch_size=[],
+        )
+        replay_buffer.add(transition)
 
         if done:
             next_obs, _ = env.reset()
@@ -288,9 +426,20 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
             done = terminated or truncated
             ep_reward += float(reward)
 
-            replay_buffer.push(
-                obs.cpu().numpy()[0], action, reward, done, 0.0, next_obs
+            transition = TensorDict(
+                {
+                    "obs": obs.squeeze(0),
+                    "action": torch.tensor(action, device=device, dtype=torch.float32),
+                    "reward": torch.tensor(reward, device=device, dtype=torch.float32),
+                    "done": torch.tensor(done, device=device, dtype=torch.bool),
+                    "next_obs": torch.tensor(
+                        next_obs, dtype=torch.float32, device=device
+                    ),
+                    "logp_mu": torch.tensor(0.0, device=device, dtype=torch.float32),
+                },
+                batch_size=[],
             )
+            replay_buffer.add(transition)
             global_step += 1
             wandb.log({"train/global_step": global_step}, step=global_step)
 
@@ -300,9 +449,13 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
             # Run a block of optimization steps (each step samples a mini-batch)
             for opt_iter in range(config.num_optimization_steps_per_step):
                 # Sample a mini-batch B of N (s, a, r) pairs from replay
-                states, acts, rewards, dones, next_states, logp_mu = (
-                    replay_buffer.sample(config.batch_size)
-                )
+                batch = replay_buffer.sample(config.batch_size)
+                states = batch["obs"]
+                acts = batch["action"]
+                rewards = batch["reward"]
+                dones = batch["done"].float()
+                next_states = batch["next_obs"]
+                logp_mu = batch["logp_mu"]
 
                 q_sa = q(states, acts)
 

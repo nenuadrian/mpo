@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--max_actor_steps", type=int, default=1500000)
     parser.add_argument("--num_candidate_actions", type=int, default=32)
-    parser.add_argument("--min_replay_size", type=int, default=50_000)
+    parser.add_argument("--min_replay_size", type=int, default=1000)
     parser.add_argument("--num_optimization_steps_per_step", type=int, default=2)
     parser.add_argument("--q_lr", type=float, default=0.0005)
     parser.add_argument("--pi_lr", type=float, default=0.0005)
@@ -37,14 +37,13 @@ def main():
     parser.add_argument("--temperature_min", type=float, default=1e-3)
     parser.add_argument("--temperature_max", type=float, default=50.0)
     parser.add_argument("--target_q_num_samples", type=int, default=8)
-    parser.add_argument("--policy_old_sync_frequency", type=int, default=1000)
+    parser.add_argument("--policy_old_sync_frequency", type=int, default=100)
     parser.add_argument("--base_log_dir", type=str, default="./logs/mpo_experiment")
     parser.add_argument("--eval_freq", type=int, default=10)
     parser.add_argument("--eval_episodes", type=int, default=5)
-    parser.add_argument("--static_seed", type=int, default=None)
     parser.add_argument("--entropy_coeff", type=float, default=1e-3)
     parser.add_argument("--e_step_solve_dual", type=bool, default=True)
-    parser.add_argument("--checkpoint_ep_freq", type=int, default=50)
+    parser.add_argument("--checkpoint_ep_freq", type=int, default=100)
     parser.add_argument("--pi_max_grad_norm", type=float, default=0.5)
     parser.add_argument("--q_max_grad_norm", type=float, default=1.0)
     parser.add_argument("--replay_buffer_size", type=int, default=1000000)
@@ -68,11 +67,7 @@ def main():
             )
             start_time = time.time()
 
-            seed = (
-                torch.randint(0, 10000, (1,)).item()
-                if args.static_seed is None
-                else args.static_seed
-            )
+            seed = int(time.time()) % 10000
 
             experiment_identifier = (
                 env_name
@@ -121,21 +116,23 @@ def main():
                     env.action_space.low,
                     env.action_space.high,
                 )
+                policy.eval()
                 ckpt_path = os.path.join(
                     config.log_dir, "checkpoints", "checkpoint_maxeval.pt"
                 )
                 print(f"Loading policy from checkpoint: {ckpt_path}")
-                load_policy_from_checkpoint(ckpt_path, policy)
-                generate_video(
-                    env_name=env_name,
-                    env=env,
-                    policy=policy,
-                    output_path=os.path.join(config.log_dir, "video.mp4"),
-                    num_episodes=2,
-                    max_steps=1000,
-                    fps=30,
-                    deterministic=False,
-                )
+                with torch.inference_mode():
+                    load_policy_from_checkpoint(ckpt_path, policy)
+                    generate_video(
+                        env_name=env_name,
+                        env=env,
+                        policy=policy,
+                        output_path=os.path.join(config.log_dir, "video.mp4"),
+                        num_episodes=2,
+                        max_steps=1000,
+                        fps=30,
+                        deterministic=False,
+                    )
             except Exception as e:
                 print(f"[ERROR] Warning: video generation failed: {e}")
 
