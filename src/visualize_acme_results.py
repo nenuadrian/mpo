@@ -90,7 +90,8 @@ def main():
     args = parser.parse_args()
 
     metric = args.metric
-    series_list = []  # list of (name, raw_series, smoothed_series)
+    series_list = []  # list of (name, x_series, raw_series, smoothed_series)
+    has_evaluator_steps = False
 
     # ---------- load data ----------
     for file_arg in args.files:
@@ -113,6 +114,21 @@ def main():
                 f'Metric "{metric}" in file "{path}" is not numeric or all NaN.'
             )
 
+        # determine x axis values: prefer `evaluator_steps` column if present and numeric
+        if "evaluator_steps" in df.columns:
+            x_vals = pd.to_numeric(df["evaluator_steps"], errors="coerce")
+            if not x_vals.isna().all():
+                has_evaluator_steps = True
+            else:
+                # fallback to integer index
+                x_vals = pd.Series(range(len(df)))
+        else:
+            x_vals = pd.Series(range(len(df)))
+
+        # reset indices so x, raw and smoothed series align by position
+        x_vals = x_vals.reset_index(drop=True)
+        s_raw = s_raw.reset_index(drop=True)
+
         # apply centered rolling mean if requested
         if args.smooth_window and args.smooth_window > 1:
             s_smoothed = s_raw.rolling(
@@ -121,28 +137,20 @@ def main():
         else:
             s_smoothed = s_raw
 
-        series_list.append((name, s_raw, s_smoothed))
+        series_list.append((name, x_vals, s_raw, s_smoothed))
 
     if not series_list:
         raise ValueError("No valid files/metrics to plot.")
 
     # ---------- compute global scales ----------
-    # x-axis: we use index (0..len-1). We want same x-range across all.
-    max_len = max(len(s_sm) for _, _, s_sm in series_list)
-    # global x range [0, max_len-1], then add +25% padding on the right
-    if max_len > 1:
-        x_max_base = max_len - 1
-    else:
-        x_max_base = 0
-    x_range = max(x_max_base, 1)  # avoid zero range
-    x_pad = x_range
-    x_min_global = -0.5  # small left margin so first point isn't on the border
-    x_max_global = x_max_base + x_pad
+    # x-axis: use evaluator_steps (if present) or integer index. Compute global x limits.
+    all_x_min = min(x_vals.min() for _, x_vals, _, _ in series_list)
+    all_x_max = max(x_vals.max() for _, x_vals, _, _ in series_list)
 
     # y-axis: based on metric values across all files
     # compute y-limits from the smoothed series (matches plotted lines)
-    y_min_global = min(s_sm.min() for _, _, s_sm in series_list)
-    y_max_global = max(s_sm.max() for _, _, s_sm in series_list)
+    y_min_global = min(s_sm.min() for _, _, _, s_sm in series_list)
+    y_max_global = max(s_sm.max() for _, _, _, s_sm in series_list)
     y_range = y_max_global - y_min_global
 
     if y_range == 0:
@@ -173,9 +181,9 @@ def main():
         axes = axes.flatten()
 
     # ---------- plot ----------
-    for i, (name, s_raw, s_sm) in enumerate(series_list):
+    for i, (name, x_vals, s_raw, s_sm) in enumerate(series_list):
         ax = axes[i]
-        x = s_sm.index
+        x = x_vals.values
         if args.show_raw:
             ax.plot(x, s_raw.values, marker="o", linestyle=":", alpha=0.4, label="raw")
         # plot smoothed series
@@ -186,13 +194,13 @@ def main():
             label="smoothed",
         )
         ax.set_title(name)
-        ax.set_xlabel("Row index")
+        ax.set_xlabel("evaluator_steps" if has_evaluator_steps else "Row index")
         ax.set_ylabel(metric)
         if args.show_raw or args.smooth_window:
             ax.legend(fontsize="small")
 
         # apply global limits
-        ax.set_xlim(x_min_global, x_max_global)
+        ax.set_xlim(all_x_min, all_x_max)
         ax.set_ylim(y_min_global, y_max_global)
 
     # hide unused axes
