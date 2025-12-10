@@ -86,7 +86,7 @@ class Runner(core.Worker):
 
     def get_directory(self) -> str:
         return ""
-    
+
     def __dir__(self):
         return dir(self._wrapped) + ["get_directory"]
 
@@ -657,7 +657,6 @@ class AcmeMPO:
         target_policy_update_period: int = 100,
         target_critic_update_period: int = 100,
         variable_update_period: int = 1000,
-        policy_loss_factory: Optional[Callable[[], snt.Module]] = None,
         max_actor_steps: Optional[int] = None,
         log_every: float = 10.0,
     ):
@@ -667,7 +666,6 @@ class AcmeMPO:
 
         self._environment_factory = environment_factory
         self._network_factory = network_factory
-        self._policy_loss_factory = policy_loss_factory
         self._environment_spec = environment_spec
         self._batch_size = batch_size
         self._prefetch_size = prefetch_size
@@ -759,12 +757,6 @@ class AcmeMPO:
             "learner", time_delta=self._log_every, steps_key="learner_steps"
         )
 
-        # Create policy loss module if a factory is passed.
-        if self._policy_loss_factory:
-            policy_loss_module = self._policy_loss_factory()
-        else:
-            policy_loss_module = None
-
         # Return the learning agent.
         return MPOLearner(
             policy_network=online_networks["policy"],
@@ -777,7 +769,6 @@ class AcmeMPO:
             num_samples=self._num_samples,
             target_policy_update_period=self._target_policy_update_period,
             target_critic_update_period=self._target_critic_update_period,
-            policy_loss_module=policy_loss_module,
             dataset=dataset,
             counter=counter,
             logger=logger,
@@ -1399,15 +1390,12 @@ class MPOLearner(acme.Learner):
         dataset: tf.data.Dataset,
         observation_network: types.TensorTransformation = tf.identity,
         target_observation_network: types.TensorTransformation = tf.identity,
-        policy_loss_module: Optional[snt.Module] = None,
         policy_optimizer: Optional[snt.Optimizer] = None,
         critic_optimizer: Optional[snt.Optimizer] = None,
         dual_optimizer: Optional[snt.Optimizer] = None,
         clipping: bool = True,
         counter: Optional[counting.Counter] = None,
         logger: Optional[loggers.Logger] = None,
-        checkpoint: bool = True,
-        save_directory: str = "~/acme",
     ):
 
         self._counter = counter or counting.Counter()
@@ -1437,7 +1425,7 @@ class MPOLearner(acme.Learner):
             target_observation_network
         )
 
-        self._policy_loss_module = policy_loss_module or MPOLoss(
+        self._policy_loss_module = MPOLoss(
             epsilon=1e-1,
             epsilon_penalty=1e-3,
             epsilon_mean=2.5e-3,
