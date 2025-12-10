@@ -285,6 +285,7 @@ class MPOLoss(nn.Module):
                 self._epsilon_penalty + penalty_q_logsumexp.mean() - math.log(float(N))
             ) * penalty_temperature
             normalized_weights = normalized_weights + penalty_w
+            normalized_weights = normalized_weights / (normalized_weights.sum(dim=0, keepdim=True) + 1e-12)
             loss_temperature = loss_temperature + loss_penalty_temp
 
         # Decompose online policy into fixed-std and fixed-mean distributions
@@ -593,7 +594,7 @@ class MPOAgent:
         # policy update using MPO loss
         # Use detached target embeddings (o_t) for policy computation so the policy head
         # updates but not the observation encoder (mirrors TF stop_gradient on o_t).
-        emb_o_t = obs_emb.detach()
+        emb_o_t = emb_next.detach()
         online_mean, online_scale = self.policy_head(emb_o_t)
         # target mean/scale already computed as t_mean/t_scale (from above, no_grad)
         # compute MPO loss with sampled_actions and q_samples
