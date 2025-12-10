@@ -1,11 +1,3 @@
-"""
-python plot_metric_grid.py \
-  --metric episode_return \
-  --file "Enb 0::runs/env0.csv" \
-  --file "Enb 1::runs/env1.csv" \
-  --file "Enb 2::runs/env2.csv"
-"""
-
 import argparse
 import math
 import os
@@ -34,12 +26,7 @@ def parse_file_arg(file_arg: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Plot a single metric from multiple CSV files, "
-            "one subplot per file (2 plots per row), with shared axis scales."
-        )
-    )
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--file",
         dest="files",
@@ -65,6 +52,13 @@ def main():
         type=float,
         default=3.0,
         help="Figure height per row in inches.",
+    )
+    parser.add_argument(
+        "--graphs-per-row",
+        dest="graphs_per_row",
+        type=int,
+        default=4,
+        help="Number of subplots (graphs) per row (columns). Must be >= 1.",
     )
     parser.add_argument(
         "--smooth-window",
@@ -166,7 +160,7 @@ def main():
 
     # ---------- prepare grid ----------
     n_plots = len(series_list)
-    n_cols = 2
+    n_cols = max(1, int(args.graphs_per_row))
     n_rows = math.ceil(n_plots / n_cols)
 
     fig, axes = plt.subplots(
