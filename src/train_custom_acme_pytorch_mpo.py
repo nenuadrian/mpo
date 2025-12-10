@@ -580,7 +580,13 @@ class MPOAgent:
         obs_emb = self.obs_encoder(obs_b)
         critic_inputs_tm1 = torch.cat([obs_emb, actions_b], dim=-1)
         q_tm1 = self.critic(critic_inputs_tm1)
-        critic_loss = F.mse_loss(q_tm1, target)
+
+        # Match Acme/td_learning: TD error = target - v_tm1, loss = 0.5 * td_error^2
+        td_error = target - q_tm1
+        critic_loss = 0.5 * (td_error**2).mean()
+        # small diagnostics for logging
+        td_error_mean = float(td_error.abs().mean().item())
+        target_mean = float(target.mean().item())
 
         # policy update using MPO loss
         # Use detached target embeddings (o_t) for policy computation so the policy head
@@ -631,6 +637,13 @@ class MPOAgent:
             "train/critic_loss": float(critic_loss.item()),
             "train/learn_steps": self._learn_steps,
         }
+        # include TD diagnostics if available
+        fetches.update(
+            {
+                "train/td_error_mean": td_error_mean,
+                "train/td_target_mean": target_mean,
+            }
+        )
         fetches.update(stats)
         return fetches
 

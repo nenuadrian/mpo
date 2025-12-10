@@ -1,6 +1,5 @@
 """Launch MPO agent on the control suite via Launchpad."""
 
-import functools
 from typing import List, Optional, Dict, Tuple, Union, Sequence, Callable
 import time
 import copy
@@ -18,6 +17,7 @@ import launchpad as lp
 import numpy as np
 import sonnet as snt
 
+import tensorflow_probability as tfp
 import tensorflow as tf
 import trfl
 
@@ -27,7 +27,6 @@ from acme.utils import loggers
 from acme import datasets
 from acme.tf import variable_utils as tf2_variable_utils
 from acme.utils import lp_utils
-import tensorflow_probability as tfp
 from acme import wrappers
 from acme import specs
 from acme import types
@@ -41,11 +40,9 @@ from acme.adders.reverb import utils
 from acme.utils import tree_utils
 
 
-from typing import Optional, Tuple
-
-
 tfd = tfp.distributions
 snt_init = snt.initializers
+TensorTransformation = Union[snt.Module, Callable[[types.NestedTensor], tf.Tensor]]
 
 
 FLAGS = flags.FLAGS
@@ -57,6 +54,8 @@ _MAX_ACTOR_STEPS = flags.DEFINE_integer(
 _DOMAIN = flags.DEFINE_string("domain", "cartpole", "Control suite domain name.")
 _TASK = flags.DEFINE_string("task", "balance", "Control suite task name.")
 _DEFAULT_PRIORITY_TABLE = "priority_table"
+
+_MPO_FLOAT_EPSILON = 1e-8
 
 
 class Runner(core.Worker):
@@ -643,9 +642,6 @@ class AcmeMPO:
 
     def __init__(
         self,
-        environment_factory: Callable[[], dm_env.Environment],
-        network_factory: Callable[[specs.BoundedArray], Dict[str, snt.Module]],
-        environment_spec: Optional[specs.EnvironmentSpec] = None,
         batch_size: int = 256,
         prefetch_size: int = 4,
         min_replay_size: int = 1000,
@@ -660,13 +656,9 @@ class AcmeMPO:
         max_actor_steps: Optional[int] = None,
         log_every: float = 10.0,
     ):
-
-        if environment_spec is None:
-            environment_spec = specs.make_environment_spec(environment_factory())
-
-        self._environment_factory = environment_factory
-        self._network_factory = network_factory
-        self._environment_spec = environment_spec
+        self._environment_spec = specs.make_environment_spec(
+            _make_environment(domain_name=_DOMAIN.value, task_name=_TASK.value)
+        )
         self._batch_size = batch_size
         self._prefetch_size = prefetch_size
         self._min_replay_size = min_replay_size
@@ -724,8 +716,8 @@ class AcmeMPO:
         obs_spec = self._environment_spec.observations
 
         # Create online and target networks.
-        online_networks = self._network_factory(act_spec)
-        target_networks = self._network_factory(act_spec)
+        online_networks = make_networks(act_spec)
+        target_networks = make_networks(act_spec)
 
         # Make sure observation networks are Sonnet Modules.
         observation_network = online_networks.get("observation", tf.identity)
@@ -786,8 +778,10 @@ class AcmeMPO:
         observation_spec = self._environment_spec.observations
 
         # Create environment and target networks to act with.
-        environment = self._environment_factory()
-        agent_networks = self._network_factory(action_spec)
+        environment = _make_environment(
+            domain_name=_DOMAIN.value, task_name=_TASK.value
+        )
+        agent_networks = make_networks(action_spec)
 
         # Create a stochastic behavior policy.
         behavior_modules = [
@@ -843,8 +837,10 @@ class AcmeMPO:
         observation_spec = self._environment_spec.observations
 
         # Create environment and target networks to act with.
-        environment = self._environment_factory()
-        agent_networks = self._network_factory(action_spec)
+        environment = _make_environment(
+            domain_name=_DOMAIN.value, task_name=_TASK.value
+        )
+        agent_networks = make_networks(action_spec)
 
         # Create a stochastic behavior policy.
         evaluator_modules = [
@@ -896,10 +892,9 @@ class AcmeMPO:
         with program.group("counter"):
             counter = program.add_node(lp.CourierNode(self.counter))
 
-            if self._max_actor_steps:
-                _ = program.add_node(
-                    lp.CourierNode(self.coordinator, counter, self._max_actor_steps)
-                )
+            _ = program.add_node(
+                lp.CourierNode(self.coordinator, counter, self._max_actor_steps)
+            )
 
         with program.group("learner"):
             learner = program.add_node(lp.CourierNode(self.learner, replay, counter))
@@ -924,9 +919,6 @@ Tensor shapes are annotated, where helpful, as follow:
   N: number of sampled actions, see MPO paper for more details,
   D: dimensionality of the action space.
 """
-
-
-_MPO_FLOAT_EPSILON = 1e-8
 
 
 class MPOLoss(snt.Module):
@@ -1720,9 +1712,6 @@ class MultivariateNormalDiagHead(snt.Module):
         return dist
 
 
-TensorTransformation = Union[snt.Module, Callable[[types.NestedTensor], tf.Tensor]]
-
-
 class NearZeroInitializedLinear(snt.Linear):
     """Simple linear layer, initialized at near zero weights and zero biases."""
 
@@ -1852,13 +1841,7 @@ def _make_environment(
 
 
 def main(_):
-    make_environment = functools.partial(
-        _make_environment, domain_name=_DOMAIN.value, task_name=_TASK.value
-    )
-
     program_builder = AcmeMPO(
-        make_environment,
-        make_networks,
         target_policy_update_period=25,
         max_actor_steps=_MAX_ACTOR_STEPS.value,
     )
