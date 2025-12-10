@@ -8,7 +8,6 @@ import gymnasium as gym
 import cv2
 from typing import Tuple
 
-# Import necessary classes from the training file
 from train_custom_acme_pytorch_mpo import MPOAgent, make_env, flatten_observation
 
 
