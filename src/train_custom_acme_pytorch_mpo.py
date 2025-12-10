@@ -274,8 +274,6 @@ class MPOLoss(nn.Module):
             self._epsilon + q_logsumexp.mean() - log_num_actions
         ) * temperature
 
-        # optional action penalization (MO-MPO)
-        penalty_kl_q = None
         if self.action_penalization:
             penalty_temperature = F.softplus(self.log_penalty_temperature) + 1e-8
             diff_out = sampled_actions - sampled_actions.clamp(-1.0, 1.0)
@@ -287,9 +285,6 @@ class MPOLoss(nn.Module):
                 self._epsilon_penalty + penalty_q_logsumexp.mean() - math.log(float(N))
             ) * penalty_temperature
             normalized_weights = normalized_weights + penalty_w
-            normalized_weights = normalized_weights / (
-                normalized_weights.sum(dim=0, keepdim=True) + 1e-12
-            )
             loss_temperature = loss_temperature + loss_penalty_temp
 
         # Decompose online policy into fixed-std and fixed-mean distributions
