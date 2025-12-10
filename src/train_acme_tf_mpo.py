@@ -14,7 +14,7 @@ from absl import app
 from absl import flags
 
 from dm_control import suite
-import launchpad as lp
+import threading
 import numpy as np
 import sonnet as snt
 
@@ -39,9 +39,6 @@ from acme.utils import signals
 from acme.adders.reverb import base
 from acme.adders.reverb import utils
 from acme.utils import tree_utils
-
-
-from typing import Optional, Tuple
 
 
 tfd = tfp.distributions
@@ -887,30 +884,111 @@ class AcmeMPO:
         return EnvironmentLoop(environment, evaluator, counter, logger)
 
     def build(self, name="mpo"):
-        """Build the distributed agent topology."""
-        program = lp.Program(name=name)
+        raise NotImplementedError(
+            "build() (Launchpad) has been removed; use run_local()"
+        )
 
-        with program.group("replay"):
-            replay = program.add_node(lp.ReverbNode(self.replay))
+    def run_local(
+        self,
+        max_actor_steps: Optional[int] = None,
+        run_learner_in_thread: bool = True,
+        run_evaluator: bool = False,
+        learner_steps_per_episode: int = 1,
+    ):
+        """Run the agent topology locally without Launchpad.
 
-        with program.group("counter"):
-            counter = program.add_node(lp.CourierNode(self.counter))
+        This starts an in-process Reverb server, creates a client, instantiates
+        the learner/actor/evaluator loops and runs the actor loop in the main
+        thread. Optionally runs the learner (and evaluator) in background
+        daemon threads.
+        """
+        # Create tables and start an in-process Reverb server.
+        tables = self.replay()
+        server = reverb.Server(tables)
+        client = reverb.Client(server_address=server.server_address)
 
-            if self._max_actor_steps:
-                _ = program.add_node(
-                    lp.CourierNode(self.coordinator, counter, self._max_actor_steps)
+        # Shared counter for bookkeeping.
+        counter = counting.Counter()
+
+        # Instantiate learner, evaluator and actor loops.
+        learner = self.learner(client, counter)
+        evaluator_loop = None
+        if run_evaluator:
+            evaluator_loop = self.evaluator(learner, counter)
+
+        actor_loop = self.actor(client, learner, counter)
+
+        # If requested, run the learner in a background thread.
+        if run_learner_in_thread:
+
+            def _learner_loop():
+                try:
+                    while True:
+                        learner.step()
+                except Exception:
+                    return
+
+            t = threading.Thread(target=_learner_loop, daemon=True)
+            t.start()
+
+            # Optionally run evaluator in a background thread.
+            if run_evaluator:
+
+                def _eval_loop():
+                    try:
+                        evaluator_loop.run()
+                    except Exception:
+                        return
+
+                t_eval = threading.Thread(target=_eval_loop, daemon=True)
+                t_eval.start()
+
+            # Run actor loop in the foreground (blocks until completion).
+            if max_actor_steps:
+                actor_loop.run(num_steps=max_actor_steps)
+            else:
+                actor_loop.run()
+        else:
+            # Single-threaded interleaved mode: run one episode at a time and
+            # execute a configurable number of learner steps between episodes.
+            num_episodes = None
+            num_steps = max_actor_steps
+
+            def _should_terminate(episode_count: int, step_count: int) -> bool:
+                return (num_episodes is not None and episode_count >= num_episodes) or (
+                    num_steps is not None and step_count >= num_steps
                 )
 
-        with program.group("learner"):
-            learner = program.add_node(lp.CourierNode(self.learner, replay, counter))
+            episode_count = 0
+            step_count = 0
+            with signals.runtime_terminator():
+                while not _should_terminate(episode_count, step_count):
+                    episode_result = actor_loop.run_episode()
+                    # Add episode duration and other bookkeeping similar to
+                    # EnvironmentLoop.run
+                    episode_count += 1
+                    step_count += int(episode_result.get("episode_length", 0))
+                    # Write actor logs for the episode.
+                    try:
+                        actor_loop._logger.write(
+                            {**episode_result, **{"episode_duration": 0}}
+                        )
+                    except Exception:
+                        pass
 
-        with program.group("evaluator"):
-            program.add_node(lp.CourierNode(self.evaluator, learner, counter))
+                    # Run learner steps after the episode.
+                    for _ in range(max(1, learner_steps_per_episode)):
+                        try:
+                            learner.step()
+                        except Exception:
+                            # If learner fails, continue with acting.
+                            pass
 
-        with program.group("actor"):
-            program.add_node(lp.CourierNode(self.actor, replay, learner, counter))
-
-        return program
+        # Cleanly stop server when done.
+        try:
+            server.stop()
+        except Exception:
+            pass
 
 
 """Implements the MPO losses.
@@ -1863,7 +1941,8 @@ def main(_):
         max_actor_steps=_MAX_ACTOR_STEPS.value,
     )
 
-    lp.launch(programs=program_builder.build())
+    # Run locally without Launchpad using an in-process Reverb server.
+    program_builder.run_local(max_actor_steps=_MAX_ACTOR_STEPS.value)
 
 
 if __name__ == "__main__":
