@@ -37,6 +37,16 @@ def weighted_cross_entropy(means, scales, N, sampled_actions, normalized_weights
     return loss.mean()
 
 
+def kl_between_diag_normals(p_mean, p_scale, q_mean, q_scale, per_dim: bool):
+    base_p = dist.Normal(p_mean, p_scale)
+    base_q = dist.Normal(q_mean, q_scale)
+    if per_dim:
+        return dist.kl_divergence(base_p, base_q)
+    indep_p = dist.Independent(base_p, 1)
+    indep_q = dist.Independent(base_q, 1)
+    return dist.kl_divergence(indep_p, indep_q).unsqueeze(-1)
+
+
 class LayerNormMLP(nn.Module):
     """MLP with LayerNorm on first hidden layer and ELU activations by default."""
 
@@ -256,14 +266,12 @@ class MPOLoss(nn.Module):
             fixed_mean_mean, fixed_mean_scale, N, sampled_actions, normalized_weights
         )
 
-        # KL computations: KL(target || fixed) per-dim using PyTorch distributions
-        # Create distributions: P is the "fixed" (online decomposed), Q is the target
-        dist_fixed_std = dist.Normal(fixed_std_mean, fixed_std_scale)  # P for mean KL
-        dist_target = dist.Normal(target_mean, target_scale)  # Q for mean KL
-        kl_mean = dist.kl_divergence(dist_fixed_std, dist_target)  # KL(P || Q) [B, D]
-
-        dist_fixed_mean = dist.Normal(fixed_mean_mean, fixed_mean_scale)  # P for std KL
-        kl_std = dist.kl_divergence(dist_fixed_mean, dist_target)  # KL(P || Q) [B, D]
+        kl_mean = kl_between_diag_normals(
+            fixed_std_mean, fixed_std_scale, target_mean, target_scale, self.per_dim
+        )
+        kl_std = kl_between_diag_normals(
+            fixed_mean_mean, fixed_mean_scale, target_mean, target_scale, self.per_dim
+        )
 
         if not self.per_dim:
             kl_mean = kl_mean.sum(dim=-1, keepdim=True)  # [B,1]
@@ -345,19 +353,26 @@ class MPOLoss(nn.Module):
                 )
 
             if self.action_penalization:
-                # penalty KL relative — compute using penalty normalized weights if available
-                # The TF version logs a penalty_kl_q_rel; we try to approximate: recompute penalty_kl if possible
+                penalty_temperature = F.softplus(self.log_penalty_temperature) + 1e-8
                 diff_out = sampled_actions - sampled_actions.clamp(-1.0, 1.0)
                 cost = -torch.norm(diff_out, dim=-1)  # [N,B]
-                penalty_temperature = F.softplus(self.log_penalty_temperature) + 1e-8
                 penalty_tempered = cost.detach() / penalty_temperature
-                penalty_w = torch.softmax(penalty_tempered, dim=0).detach()
-                integrand_pen = torch.log(num_actions * penalty_w + eps)
-                penalty_kl_nonparametric = (penalty_w * integrand_pen).sum(dim=0)
-                stats["train/penalty_kl_q_rel"] = float(
-                    penalty_kl_nonparametric.mean().item()
-                    / float(self._epsilon_penalty)
+                penalty_weights = torch.softmax(penalty_tempered, dim=0).detach()
+                penalty_q_logsumexp = torch.logsumexp(penalty_tempered, dim=0)
+                loss_penalty_temp = (
+                    self._epsilon_penalty
+                    + penalty_q_logsumexp.mean()
+                    - math.log(float(N))
+                ) * penalty_temperature
+                penalty_ce = weighted_cross_entropy(
+                    fixed_mean_mean,
+                    fixed_mean_scale,
+                    N,
+                    sampled_actions,
+                    penalty_weights,
                 )
+                loss_policy = loss_policy + penalty_ce
+                loss_temperature = loss_temperature + loss_penalty_temp
 
         return loss, stats
 
