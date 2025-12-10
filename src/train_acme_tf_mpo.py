@@ -710,16 +710,12 @@ class AcmeMPO:
         # Create the run loop and return it.
         return EnvironmentLoop(environment, evaluator, counter, logger)
 
-    def build(self, name="mpo"):
-        raise NotImplementedError(
-            "build() (Launchpad) has been removed; use run_local()"
-        )
 
     def run_local(
         self,
         max_actor_steps: Optional[int] = None,
         run_learner_in_thread: bool = True,
-        run_evaluator: bool = False,
+        run_evaluator: bool = True,
         learner_steps_per_episode: int = 1,
     ):
         """Run the agent topology locally without Launchpad.
