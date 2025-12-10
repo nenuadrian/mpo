@@ -285,7 +285,9 @@ class MPOLoss(nn.Module):
                 self._epsilon_penalty + penalty_q_logsumexp.mean() - math.log(float(N))
             ) * penalty_temperature
             normalized_weights = normalized_weights + penalty_w
-            normalized_weights = normalized_weights / (normalized_weights.sum(dim=0, keepdim=True) + 1e-12)
+            normalized_weights = normalized_weights / (
+                normalized_weights.sum(dim=0, keepdim=True) + 1e-12
+            )
             loss_temperature = loss_temperature + loss_penalty_temp
 
         # Decompose online policy into fixed-std and fixed-mean distributions
@@ -697,9 +699,8 @@ def train(
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() and device_str == "cuda" else "cpu"
-    )
+    device = torch.device(device_str)
+    print(f"Using device: {device}")
 
     env = make_env(env_name)
     # separate environment for evaluation (keeps train env state intact)
@@ -843,7 +844,7 @@ def parse_args():
     parser.add_argument("--target_critic_update_period", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--dual_lr", type=float, default=1e-2)
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--wandb_project", type=str, default="mpo_project")
     parser.add_argument("--wandb_entity", type=str, default="adrian-research")
     parser.add_argument("--wandb_group_prefix", type=str, default=None)
@@ -863,7 +864,7 @@ if __name__ == "__main__":
             )
             start_time = time.time()
 
-            seed = torch.randint(0, 10000, (1,)).item()
+            seed = int(time.time()) % 10000 + iteration * 1000
 
             experiment_identifier = (
                 env_name
