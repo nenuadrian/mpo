@@ -278,16 +278,9 @@ class CheckpointingRunner(core.Worker):
         **kwargs,
     ):
 
-        # If the object to be wrapped exposes its TF State, checkpoint that.
-        objects_to_save = wrapped
-
         self._wrapped = wrapped
         self._time_delta_minutes = time_delta_minutes
-        self._checkpointer = Checkpointer(
-            objects_to_save={key: objects_to_save},
-            time_delta_minutes=time_delta_minutes,
-            **kwargs,
-        )
+        
 
     # Handle preemption signal. Note that this must happen in the main thread.
     def _signal_handler(self):
@@ -297,10 +290,6 @@ class CheckpointingRunner(core.Worker):
         if isinstance(self._wrapped, core.Learner):
             # Learners have a step() method, so alternate between that and ckpt call.
             self._wrapped.step()
-            self._checkpointer.save()
-        else:
-            # Wrapped object doesn't have a run method; set our run method to ckpt.
-            self.checkpoint()
 
     def run(self):
         """Runs the checkpointer."""
