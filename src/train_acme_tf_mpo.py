@@ -21,6 +21,9 @@ import tree  # type: ignore
 import operator
 import os
 
+# Add import to get signature helper without using Reverb runtime.
+import reverb_transition as rt
+
 
 import dm_env  # type: ignore
 from dm_env import specs  # type: ignore
@@ -352,11 +355,12 @@ class NStepTransitionAdder:
 # ---------------------------------------------------------------------------
 
 
-def make_in_memory_dataset(replay: SimpleReplayBuffer):
+def make_in_memory_dataset(replay: SimpleReplayBuffer, output_signature):
     """Create a tf.data.Dataset that samples single transitions from the replay.
-    The dataset yields elements identical to the previous `TrajectoryDataset`'s
-    `.data` object (i.e., a Transition-like mapping). The caller typically will
-    then .batch(...) as before.
+
+    Args:
+      replay: SimpleReplayBuffer instance.
+      output_signature: nested tf.TensorSpec matching a single Transition element.
     """
 
     def generator():
@@ -367,36 +371,11 @@ def make_in_memory_dataset(replay: SimpleReplayBuffer):
                 time.sleep(0.01)
             # sample a single transition (batch size 1)
             t = replay.sample(1)
-            # For consistency with previous code, yield a mapping (not batched)
             # Remove the leading batch axis (size 1) so batching later matches old pipeline.
-            # All fields are numpy arrays with leading dim = batch_size.
-            # We squeeze the leading dimension so that dataset.batch will produce the intended batch.
             yield tree.map_structure(lambda x: np.squeeze(x, axis=0), t)
 
-    # The output signature is constructed lazily: sample one item to infer structure.
-    # Wait until buffer has at least one item (actors will populate it).
-    while replay.size() == 0:
-        time.sleep(0.01)
-    sample_item = replay.sample(1)
-    sample_item_no_batch = tree.map_structure(
-        lambda x: np.squeeze(x, axis=0), sample_item
-    )
-
-    def tf_signature_from_numpy(numpy_obj):
-        if isinstance(numpy_obj, np.ndarray):
-            return tf.TensorSpec(shape=numpy_obj.shape, dtype=numpy_obj.dtype)
-        else:
-            # fallback for nested structures
-            return tf.TensorSpec(shape=(), dtype=type(numpy_obj))
-
-    # Create nested signature
-    output_signature = tree.map_structure(tf_signature_from_numpy, sample_item_no_batch)
-
-    # Return a dataset of transitions (not yet batched).
+    # Use provided output_signature (avoid blocking inference from the buffer).
     return tf.data.Dataset.from_generator(generator, output_signature=output_signature)
-
-
-# ...existing code...
 
 
 # ---------------------------------------------------------------------------
@@ -909,7 +888,6 @@ class MPO:
         replay,
     ):
         """The Learning part of the agent."""
-
         act_spec = self._environment_spec.actions
         obs_spec = self._environment_spec.observations
 
@@ -935,9 +913,10 @@ class MPO:
         create_variables(target_networks["critic"], [emb_spec, act_spec])
 
         # The dataset object to learn from: use in-memory dataset created from the
-        # provided replay buffer. The dataset yields 1-transition elements; batch
-        # and prefetch as before.
-        dataset = make_in_memory_dataset(replay)
+        # provided replay buffer. Build the tf output signature from the original
+        # NStepTransitionAdder.signature helper (no actual Reverb client needed).
+        transition_signature = rt.NStepTransitionAdder.signature(self._environment_spec)
+        dataset = make_in_memory_dataset(replay, output_signature=transition_signature)
         dataset = dataset.batch(self._batch_size, drop_remainder=True)
         dataset = dataset.prefetch(self._prefetch_size)
 
