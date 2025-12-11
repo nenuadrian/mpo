@@ -266,6 +266,7 @@ class DistributedMPO:
             dataset=dataset,
             counter=counter,
             logger=logger,
+            checkpoint=False,
         )
 
     def actor(
