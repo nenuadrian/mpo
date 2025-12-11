@@ -424,7 +424,7 @@ class MPOLearner:
         critic_optimizer: Optional[snt.Optimizer] = None,
         dual_optimizer: Optional[snt.Optimizer] = None,
         clipping: bool = True,
-        log_every: int = 100,
+        log_every: int = 1,
     ):
         self._discount = discount
         self._num_samples = num_samples
