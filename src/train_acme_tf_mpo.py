@@ -74,7 +74,6 @@ class EnvironmentLoop(core.Worker):
     def __init__(
         self,
         environment: dm_env.Environment,
-        actor: core.Actor,
         counter: Optional[counting.Counter] = None,
         logger: Optional[loggers.Logger] = None,
         label: str = "environment_loop",
@@ -82,7 +81,6 @@ class EnvironmentLoop(core.Worker):
     ):
         # Internalize agent and environment.
         self._environment = environment
-        self._actor = actor
         self._counter = counter or counting.Counter()
         self._logger = logger or loggers.make_default_logger(
             label, steps_key=self._counter.get_steps_key()
@@ -114,7 +112,6 @@ class EnvironmentLoop(core.Worker):
         timestep = self._environment.reset()
         env_reset_duration = time.time() - env_reset_start
         # Make the first observation.
-        self._actor.observe_first(timestep)
         for observer in self._observers:
             # Initialize the observer with the current state of the env after reset
             # and the initial timestep.
@@ -141,9 +138,6 @@ class EnvironmentLoop(core.Worker):
                 # One environment step was completed. Observe the current state of the
                 # environment, the current timestep and the action.
                 observer.observe(self._environment, timestep, action)
-
-            # Give the actor the opportunity to update itself.
-            self._actor.update()
 
             # Equivalent to: episode_return += timestep.reward
             # We capture the return value because if timestep.reward is a JAX
@@ -255,14 +249,16 @@ class EvaluatorActor:
         # Return a numpy array with squeezed out batch dimension.
         return tf2_utils.to_numpy_squeeze(action)
 
-    def observe_first(self, timestep: dm_env.TimeStep):
+    def observe_first(self, _: dm_env.Environment, timestep: dm_env.TimeStep):
         pass
 
-    def observe(self, action: types.NestedArray, next_timestep: dm_env.TimeStep):
-        pass
-
-    def update(self, wait: bool = False):
-        self._variable_client.update(wait)
+    def observe(
+        self,
+        _: dm_env.Environment,
+        _: types.NestedArray,
+        _: dm_env.TimeStep,
+    ):
+        self._variable_client.update()
 
 
 class FeedForwardActor:
@@ -303,14 +299,17 @@ class FeedForwardActor:
         # Return a numpy array with squeezed out batch dimension.
         return tf2_utils.to_numpy_squeeze(action)
 
-    def observe_first(self, timestep: dm_env.TimeStep):
+    def observe_first(self, _: dm_env.Environment, timestep: dm_env.TimeStep):
         self._adder.add_first(timestep)
 
-    def observe(self, action: types.NestedArray, next_timestep: dm_env.TimeStep):
+    def observe(
+        self,
+        _: dm_env.Environment,
+        action: types.NestedArray,
+        next_timestep: dm_env.TimeStep,
+    ):
         self._adder.add(action, next_timestep)
-
-    def update(self, wait: bool = False):
-        self._variable_client.update(wait)
+        self._variable_client.update()
 
 
 class StochasticMeanHead(snt.Module):
@@ -750,7 +749,7 @@ class MPO:
         )
 
         # Create the run loop and return it.
-        return EnvironmentLoop(environment, actor, counter, logger)
+        return EnvironmentLoop(environment, counter, logger, observers=[actor])
 
     def evaluator(
         self,
