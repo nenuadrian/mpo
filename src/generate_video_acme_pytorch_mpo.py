@@ -1,12 +1,8 @@
 import argparse
-import copy
-import math
 import numpy as np
-import os
 import torch
 import gymnasium as gym
 import cv2
-from typing import Tuple
 
 from train_custom_acme_pytorch_mpo import MPOAgent, make_env, flatten_observation
 
@@ -20,7 +16,6 @@ def load_agent_from_checkpoint(
     device: torch.device,
     **agent_kwargs,
 ) -> MPOAgent:
-    """Load MPOAgent from a checkpoint file."""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Create agent with the same parameters

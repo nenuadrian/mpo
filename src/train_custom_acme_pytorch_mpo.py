@@ -643,6 +643,8 @@ class MPOAgent:
         clipping=True,
         action_penalization=True,
         per_dim=True,
+        samples_per_insert=32.0,
+        ratio_tolerance=0.1,
     ):
         self.device = device
         self.obs_dim = obs_dim
@@ -701,21 +703,23 @@ class MPOAgent:
             epsilon_stddev=1e-6,
             init_log_temperature=10.0,
             init_log_alpha_mean=10.0,
-            init_log_alpha_stddev=1000.0,
+            init_log_alpha_stddev=100.0,
         ).to(device)
 
-        # optimizers
         self._critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
         self._policy_optimizer = optim.Adam(self.policy_head.parameters(), lr=lr_policy)
         self._dual_optimizer = optim.Adam(self.mpo_loss.parameters(), lr=lr_dual)
 
-        # Replace replay buffer setup
         self.replay = TensorDictReplayBuffer(
             storage=LazyTensorStorage(max_size=max_replay_size),
             batch_size=batch_size,
         )
         self._nstep_accumulator = NStepAccumulator(n_step=n_step, gamma=gamma)
         self._learn_steps = 0
+        self.samples_per_insert = samples_per_insert
+        self.ratio_tolerance = ratio_tolerance
+        self._num_inserts = 0
+        self._num_samples = 0
 
     def select_action(self, obs: np.ndarray, stochastic: bool = True) -> np.ndarray:
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -749,12 +753,25 @@ class MPOAgent:
                 batch_size=[],
             )
             self.replay.add(data)
+            self._num_inserts += 1
+
+    def _can_sample(self):
+        if len(self.replay) < max(self.min_replay_size, self.batch_size):
+            return False
+        if self.samples_per_insert is None:
+            return True
+        target = (
+            self.samples_per_insert + self.ratio_tolerance * self.samples_per_insert
+        )
+        # block if we are sampling too fast relative to inserts
+        return self._num_samples <= target * max(1, self._num_inserts)
 
     def learn_step(self):
-        if len(self.replay) < max(self.min_replay_size, self.batch_size):
+        if not self._can_sample():
             return None
 
         batch = self.replay.sample()
+        self._num_samples += 1
         device = self.device
         obs_b = batch["obs"].to(device)
         actions_b = batch["action"].to(device)
@@ -800,12 +817,10 @@ class MPOAgent:
         td_error_mean = float(td_error.abs().mean().item())
         target_mean = float(target.mean().item())
 
-        # policy update using MPO loss
-        # Use detached target embeddings (o_t) for policy computation so the policy head
-        # updates but not the observation encoder (mirrors TF stop_gradient on o_t).
-        obs_emb_next = self.obs_encoder(next_obs_b)
-        emb_o_t = obs_emb_next.detach()
+        with torch.no_grad():
+            emb_o_t = self.target_obs_encoder(next_obs_b)
         online_mean, online_scale = self.policy_head(emb_o_t)
+
         # target mean/scale already computed as t_mean/t_scale (from above, no_grad)
         # compute MPO loss with sampled_actions and q_samples
         total_loss, stats = self.mpo_loss(

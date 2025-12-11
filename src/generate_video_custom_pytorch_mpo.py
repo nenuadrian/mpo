@@ -2,11 +2,15 @@ import argparse
 import os
 
 
-from mpo.gaussian_policy import GaussianPolicy
-from mpo.utils import load_policy_from_checkpoint, make_offscreen_env, generate_video
+from train_custom_pytorch_mpo import (
+    GaussianPolicy,
+    load_policy_from_checkpoint,
+    make_offscreen_env,
+    generate_video,
+)
 
 
-def main(argv=None):
+def main():
     parser = argparse.ArgumentParser(description="Generate video from MPO checkpoint")
     parser.add_argument("checkpoint", type=str, help="Path to checkpoint .pt file")
     parser.add_argument(
@@ -24,7 +28,7 @@ def main(argv=None):
         action="store_true",
         help="Use policy mean deterministically instead of sampling",
     )
-    args = parser.parse_args(args=argv)
+    args = parser.parse_args()
 
     ckpt_path = args.checkpoint
     assert os.path.isfile(ckpt_path), f"Checkpoint not found: {ckpt_path}"
