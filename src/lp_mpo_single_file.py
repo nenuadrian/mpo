@@ -382,10 +382,13 @@ class MPO:
         log_every: float = 10.0,
     ):
 
+        if environment_spec is None:
+            environment_spec = specs.make_environment_spec(environment_factory(False))
+
         self._environment_factory = environment_factory
         self._network_factory = network_factory
         self._policy_loss_factory = policy_loss_factory
-        self._environment_spec = specs.make_environment_spec(environment_factory(False))
+        self._environment_spec = environment_spec
         self._num_caches = num_caches
         self._batch_size = batch_size
         self._prefetch_size = prefetch_size
