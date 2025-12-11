@@ -322,8 +322,8 @@ class NStepTransitionAdder(base.ReverbAdder):
             self._first_idx += 1
 
     def _compute_cumulative_quantities(
-        self, rewards: types.NestedArray, discounts: types.NestedArray
-    ) -> Tuple[types.NestedArray, types.NestedArray]:
+        self, rewards: Any, discounts: Any
+    ) -> Tuple[Any, Any]:
 
         # Give the same tree structure to the n-step return accumulator,
         # n-step discount accumulator, and self.discount, so that they can be
@@ -372,9 +372,7 @@ class NStepTransitionAdder(base.ReverbAdder):
     # used as alternative constructors or when modifying some global state,
     # neither of which is done here.
     @classmethod
-    def signature(
-        cls, environment_spec: specs.EnvironmentSpec, extras_spec: types.NestedSpec = ()
-    ):
+    def signature(cls, environment_spec, extras_spec: Any = ()):
 
         # This function currently assumes that self._discount is a scalar.
         # If it ever becomes a nested structure and/or a np.ndarray, this method
@@ -394,7 +392,7 @@ class NStepTransitionAdder(base.ReverbAdder):
         )
         step_discounts_spec = tree.map_structure(copy.deepcopy, step_discounts_spec)
 
-        transition_spec = types.Transition(
+        transition_spec = Transition(
             environment_spec.observations,
             environment_spec.actions,
             rewards_spec,
