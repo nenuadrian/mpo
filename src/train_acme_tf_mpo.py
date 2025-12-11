@@ -238,24 +238,17 @@ class FeedForwardActor(core.Actor):
 
     def __init__(
         self,
+        logger: loggers.Logger,
+        counter: counting.Counter,
         policy_network: snt.Module,
         adder: Optional[acme_adders.Adder] = None,
         variable_client: Optional[tf2_variable_utils.VariableClient] = None,
     ):
-        """Initializes the actor.
-
-        Args:
-          policy_network: the policy to run.
-          adder: the adder object to which allows to add experiences to a
-            dataset/replay buffer.
-          variable_client: object which allows to copy weights from the learner copy
-            of the policy to the actor copy (in case they are separate).
-        """
-
-        # Store these for later use.
         self._adder = adder
+        self._counter = counter
         self._variable_client = variable_client
         self._policy_network = policy_network
+        self._logger = logger
 
     @tf.function
     def _policy(self, observation: types.NestedTensor) -> types.NestedTensor:
@@ -271,6 +264,9 @@ class FeedForwardActor(core.Actor):
         return action
 
     def select_action(self, observation: types.NestedArray) -> types.NestedArray:
+        self._logger.write(
+            f"Selecting action at step {self._counter.get_counts().steps}"
+        )
         # Pass the observation through the policy network.
         action = self._policy(observation)
 
@@ -541,7 +537,7 @@ class MPO:
         prefetch_size: int = 4,
         min_replay_size: int = 1000,
         max_replay_size: int = 1000000,
-        samples_per_insert = 32.0,
+        samples_per_insert=32.0,
         n_step: int = 5,
         num_samples: int = 20,
         additional_discount: float = 0.99,
@@ -579,12 +575,21 @@ class MPO:
         self._log_every = log_every
 
     def replay(self):
+        # Create enough of an error buffer to give a 10% tolerance in rate.
+        samples_per_insert_tolerance = 0.1 * self._samples_per_insert
+        error_buffer = self._min_replay_size * samples_per_insert_tolerance
 
+        limiter = reverb.rate_limiters.SampleToInsertRatio(
+            min_size_to_sample=self._min_replay_size,
+            samples_per_insert=self._samples_per_insert,
+            error_buffer=error_buffer,
+        )
         replay_table = reverb.Table(
             name=adders.DEFAULT_PRIORITY_TABLE,
             sampler=reverb.selectors.Uniform(),
             remover=reverb.selectors.Fifo(),
             max_size=self._max_replay_size,
+            rate_limiter=limiter,
             signature=adders.NStepTransitionAdder.signature(self._environment_spec),
         )
         return [replay_table]
@@ -704,6 +709,8 @@ class MPO:
 
         # Create the agent.
         actor = FeedForwardActor(
+            logger=logger,
+            counter=counter,
             policy_network=behavior_network,
             adder=adder,
             variable_client=variable_client,
