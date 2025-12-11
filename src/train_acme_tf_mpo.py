@@ -8,6 +8,8 @@ from typing import (
     Callable,
     Any,
     NamedTuple,
+    Mapping,
+    Protocol,
 )
 import time
 import collections
@@ -25,7 +27,6 @@ import os
 
 from acme.tf import utils as tf2_utils
 from acme.utils import counting
-from acme.utils import loggers
 from acme.adders import reverb as adders
 from acme import wrappers
 
@@ -163,18 +164,18 @@ class MPOLearner:
         target_critic_update_period: int,
         dataset: tf.data.Dataset,
         counter: counting.Counter,
-        observation_network: TensorTransformation = tf.identity,
-        target_observation_network: TensorTransformation = tf.identity,
+        logger: Logger,
+        observation_network=tf.identity,
+        target_observation_network=tf.identity,
         policy_loss_module: Optional[snt.Module] = None,
         policy_optimizer: Optional[snt.Optimizer] = None,
         critic_optimizer: Optional[snt.Optimizer] = None,
         dual_optimizer: Optional[snt.Optimizer] = None,
         clipping: bool = True,
-        logger: Optional[loggers.Logger] = None,
     ):
 
         self._counter = counter
-        self._logger = logger or loggers.make_default_logger("learner")
+        self._logger = logger
         self._discount = discount
         self._num_samples = num_samples
         self._clipping = clipping
@@ -496,44 +497,27 @@ class EnvironmentLoop:
     A `Counter` instance can optionally be given in order to maintain counts
     between different Acme components. If not given a local Counter will be
     created to maintain counts between calls to the `run` method.
-
-    A `Logger` instance can also be passed in order to control the output of the
-    loop. If not given a platform-specific default logger will be used as defined
-    by utils.loggers.make_default_logger. A string `label` can be passed to easily
-    change the label associated with the default logger; this is ignored if a
-    `Logger` instance is given.
-
-    A list of 'Observer' instances can be specified to generate additional metrics
-    to be logged by the logger. They have access to the 'Environment' instance,
-    the current timestep datastruct and the current action.
     """
 
     def __init__(
         self,
         environment: dm_env.Environment,
         actor,
-        counter: Optional[counting.Counter] = None,
-        logger: Optional[loggers.Logger] = None,
-        label: str = "environment_loop",
+        logger: Logger,
+        counter: counting.Counter,
     ):
-        # Internalize agent and environment.
         self._environment = environment
         self._actor = actor
-        self._counter = counter or counting.Counter()
-        self._logger = logger or loggers.make_default_logger(
-            label, steps_key=self._counter.get_steps_key()
-        )
+        self._counter = counter
+        self._logger = logger
         self._total_steps = 0
 
-    def run_episode(self) -> loggers.LoggingData:
+    def run_episode(self) -> Mapping[str, Any]:
         """Run one episode.
 
         Each episode is a loop which interacts first with the environment to get an
         observation and then give that observation to the agent in order to retrieve
         an action.
-
-        Returns:
-          An instance of `loggers.LoggingData`.
         """
         # Reset any counts and start the environment.
         episode_start_time = time.time()
@@ -766,7 +750,7 @@ class MPO:
 
         # Create a counter and logger for bookkeeping steps and performance.
         counter = counting.Counter(counter, "learner")
-        logger = loggers.make_default_logger(
+        logger = make_default_logger(
             "learner", time_delta=self._log_every, steps_key="learner_steps"
         )
 
@@ -828,7 +812,7 @@ class MPO:
         )
 
         counter = counting.Counter(counter, "actor")
-        logger = loggers.make_default_logger(
+        logger = make_default_logger(
             "actor",
             save_data=False,
             time_delta=self._log_every,
@@ -875,7 +859,7 @@ class MPO:
 
         # Create logger and counter.
         counter = counting.Counter(counter, "evaluator")
-        logger = loggers.make_default_logger(
+        logger = make_default_logger(
             "evaluator", time_delta=self._log_every, steps_key="evaluator_steps"
         )
 
@@ -1590,6 +1574,59 @@ def _make_environment(
     environment = wrappers.CanonicalSpecWrapper(environment, clip=True)
     environment = wrappers.SinglePrecisionWrapper(environment)
     return environment
+
+
+class Logger(Protocol):
+    def write(self, values: Mapping[str, Any]) -> None:
+        pass
+
+
+class _StdoutLogger(Logger):
+    def __init__(
+        self,
+        label: str,
+        *,
+        time_delta: float = 0.0,
+        steps_key: Optional[str] = None,
+        save_data: bool = True,
+    ):
+        self._label = label
+        self._time_delta = max(time_delta or 0.0, 0.0)
+        self._steps_key = steps_key
+        self._save_data = save_data
+        self._last_log_time = 0.0
+        self._buffer: List[Mapping[str, Any]] = [] if save_data else []
+
+    def write(self, values: Mapping[str, Any]) -> None:
+        now = time.time()
+        if self._time_delta and self._last_log_time:
+            if now - self._last_log_time < self._time_delta:
+                if self._steps_key and values.get(self._steps_key) is None:
+                    return
+        self._last_log_time = now
+        payload = dict(values)
+        if self._save_data:
+            self._buffer.append(payload)
+        print(f"[{self._label}] {payload}")
+
+    @property
+    def data(self) -> Sequence[Mapping[str, Any]]:
+        return list(self._buffer)
+
+
+def make_default_logger(
+    label: str,
+    *,
+    time_delta: float = 0.0,
+    steps_key: Optional[str] = None,
+    save_data: bool = True,
+) -> Logger:
+    return _StdoutLogger(
+        label,
+        time_delta=time_delta,
+        steps_key=steps_key,
+        save_data=save_data,
+    )
 
 
 def main(_):
