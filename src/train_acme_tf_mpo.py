@@ -274,9 +274,16 @@ class NStepTransitionAdder:
         self._first_idx = 0
         self._add_first_called = False
 
+    # Helper: convert nested leaves to numpy arrays without collapsing the nest.
+    def _to_numpy_preserve_structure(self, value):
+        if tree.is_nested(value):
+            return tree.map_structure(np.asarray, value)
+        else:
+            return np.asarray(value)
+
     def add_first(self, timestep):
         # timestep.observation is the initial observation
-        self._observations = [np.asarray(timestep.observation)]
+        self._observations = [self._to_numpy_preserve_structure(timestep.observation)]
         self._actions = []
         self._rewards = []
         self._discounts = []
@@ -287,10 +294,12 @@ class NStepTransitionAdder:
     def add(self, action, next_timestep, extras=()):
         if not self._add_first_called:
             raise ValueError("add_first must be called before add()")
-        action = np.asarray(action)
-        reward = np.asarray(next_timestep.reward)
-        discount = np.asarray(next_timestep.discount)
-        next_obs = np.asarray(next_timestep.observation)
+        # Convert each element (possibly nested) to numpy arrays preserving the structure.
+        action = self._to_numpy_preserve_structure(action)
+        reward = self._to_numpy_preserve_structure(next_timestep.reward)
+        discount = self._to_numpy_preserve_structure(next_timestep.discount)
+        next_obs = self._to_numpy_preserve_structure(next_timestep.observation)
+        extras = self._to_numpy_preserve_structure(extras) if extras else ()
         self._actions.append(action)
         self._rewards.append(reward)
         self._discounts.append(discount)
