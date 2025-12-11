@@ -836,21 +836,29 @@ class MPO:
         return program
 
     def run(self):
+        import threading
+        
         counter = counting.Counter()
         server = reverb.Server(tables=self.replay())
         client = reverb.Client(f'localhost:{server.port}')
 
         learner = self.learner(client, counter)
-        learner.run(num_steps=self._max_actor_steps)
-
 
         actor = self.actor(client, learner, counter)
         
-        actor.run(num_steps=self._max_actor_steps)
         
         evaluator = self.evaluator(learner, counter)
         
-        actor.run
+        threads = [
+            threading.Thread(target=learner.run, kwargs={"num_steps": self._max_actor_steps}, daemon=True),
+            threading.Thread(target=actor.run, kwargs={"num_steps": self._max_actor_steps}, daemon=True),
+            threading.Thread(target=evaluator.run, daemon=True),  
+        ]
+        
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
 
 """Implements the MPO losses.
