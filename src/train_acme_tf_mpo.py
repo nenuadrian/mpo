@@ -190,27 +190,13 @@ def zeros_like(nest):
 
 def make_reverb_dataset(
     server_address: str,
-    batch_size: Optional[int] = None,
-    prefetch_size: Optional[int] = None,
     table: str = "priority_table",
     num_parallel_calls: Optional[int] = 12,
-    max_in_flight_samples_per_worker: Optional[int] = None,
 ) -> tf.data.Dataset:
     # This is the default that used to be set by reverb.TFClient.dataset().
-    if max_in_flight_samples_per_worker is None and batch_size is None:
-        max_in_flight_samples_per_worker = 100
-    elif max_in_flight_samples_per_worker is None:
-        max_in_flight_samples_per_worker = 2 * batch_size
+    max_in_flight_samples_per_worker = 100
 
-    # Create mapping from tables to non-zero weights.
-    if isinstance(table, str):
-        tables = collections.OrderedDict([(table, 1.0)])
-    else:
-        tables = collections.OrderedDict(
-            [(name, weight) for name, weight in table.items() if weight > 0.0]
-        )
-        if len(tables) <= 0:
-            raise ValueError(f"No positive weights in input tables {tables}")
+    tables = collections.OrderedDict([(table, 1.0)])
 
     # Normalize weights.
     total_weight = sum(tables.values())
@@ -218,8 +204,8 @@ def make_reverb_dataset(
         [(name, weight / total_weight) for name, weight in tables.items()]
     )
 
-    def _make_dataset(unused_idx: tf.Tensor) -> tf.data.Dataset:
-        datasets = ()
+    def _make_dataset(_: tf.Tensor) -> tf.data.Dataset:
+        dataset = None
         for table_name, weight in tables.items():
             max_in_flight_samples = max(
                 1, int(max_in_flight_samples_per_worker * weight)
@@ -229,38 +215,20 @@ def make_reverb_dataset(
                 table=table_name,
                 max_in_flight_samples_per_worker=max_in_flight_samples,
             )
-            datasets += (dataset,)
-        if len(datasets) > 1:
-            dataset = tf.data.Dataset.sample_from_datasets(
-                datasets, weights=tables.values()
-            )
-        else:
-            dataset = datasets[0]
-
-        if batch_size:
-            dataset = dataset.batch(batch_size, drop_remainder=True)
 
         return dataset
 
-    if num_parallel_calls is not None:
-        # Create a datasets and interleaves it to create `num_parallel_calls`
-        # `TrajectoryDataset`s.
-        num_datasets_to_interleave = (
-            os.cpu_count()
-            if num_parallel_calls == tf.data.AUTOTUNE
-            else num_parallel_calls
-        )
-        dataset = tf.data.Dataset.range(num_datasets_to_interleave).interleave(
-            map_func=_make_dataset,
-            cycle_length=num_parallel_calls,
-            num_parallel_calls=num_parallel_calls,
-            deterministic=False,
-        )
-    else:
-        dataset = _make_dataset(tf.constant(0))
-
-    if prefetch_size:
-        dataset = dataset.prefetch(prefetch_size)
+    # Create a datasets and interleaves it to create `num_parallel_calls`
+    # `TrajectoryDataset`s.
+    num_datasets_to_interleave = (
+        os.cpu_count() if num_parallel_calls == tf.data.AUTOTUNE else num_parallel_calls
+    )
+    dataset = tf.data.Dataset.range(num_datasets_to_interleave).interleave(
+        map_func=_make_dataset,
+        cycle_length=num_parallel_calls,
+        num_parallel_calls=num_parallel_calls,
+        deterministic=False,
+    )
 
     return dataset
 
@@ -1642,75 +1610,34 @@ def make_networks(
     }
 
 
-class EnvironmentWrapper(dm_env.Environment):
-    """Environment that wraps another environment.
-
-    This exposes the wrapped environment with the `.environment` property and also
-    defines `__getattr__` so that attributes are invisibly forwarded to the
-    wrapped environment (and hence enabling duck-typing).
-    """
-
-    _environment: dm_env.Environment
-
-    def __init__(self, environment: dm_env.Environment):
+class CanonicalSinglePrecisionWrapper(dm_env.Environment):
+    def __init__(self, environment: dm_env.Environment, clip: bool = False):
         self._environment = environment
+        self._clip = clip
+        self._raw_action_spec = environment.action_spec()
 
     def __getattr__(self, name):
         if name.startswith("__"):
-            raise AttributeError(
-                "attempted to get missing private attribute '{}'".format(name)
-            )
+            raise AttributeError(f"attempted to get missing private attribute '{name}'")
         return getattr(self._environment, name)
 
     @property
     def environment(self) -> dm_env.Environment:
         return self._environment
 
-    # The following lines are necessary because methods defined in
-    # `dm_env.Environment` are not delegated through `__getattr__`, which would
-    # only be used to expose methods or properties that are not defined in the
-    # base `dm_env.Environment` class.
-
     def step(self, action) -> dm_env.TimeStep:
-        return self._environment.step(action)
-
-    def reset(self) -> dm_env.TimeStep:
-        return self._environment.reset()
-
-    def action_spec(self):
-        return self._environment.action_spec()
-
-    def discount_spec(self):
-        return self._environment.discount_spec()
-
-    def observation_spec(self):
-        return self._environment.observation_spec()
-
-    def reward_spec(self):
-        return self._environment.reward_spec()
-
-    def close(self):
-        return self._environment.close()
-
-
-class SinglePrecisionWrapper(EnvironmentWrapper):
-    """Wrapper which converts environments from double- to single-precision."""
-
-    def _convert_timestep(self, timestep: dm_env.TimeStep) -> dm_env.TimeStep:
-        return timestep._replace(
-            reward=self._convert_value(timestep.reward),
-            discount=self._convert_value(timestep.discount),
-            observation=self._convert_value(timestep.observation),
-        )
-
-    def step(self, action) -> dm_env.TimeStep:
-        return self._convert_timestep(self._environment.step(action))
+        scaled_action = _scale_nested_action(action, self._raw_action_spec, self._clip)
+        timestep = self._environment.step(scaled_action)
+        return self._convert_timestep(timestep)
 
     def reset(self) -> dm_env.TimeStep:
         return self._convert_timestep(self._environment.reset())
 
     def action_spec(self):
-        return self._convert_spec(self._environment.action_spec())
+        canonical_spec = tree.map_structure(
+            self._canonicalize_bounded_spec, self._raw_action_spec
+        )
+        return self._convert_spec(canonical_spec)
 
     def discount_spec(self):
         return self._convert_spec(self._environment.discount_spec())
@@ -1721,13 +1648,26 @@ class SinglePrecisionWrapper(EnvironmentWrapper):
     def reward_spec(self):
         return self._convert_spec(self._environment.reward_spec())
 
-    def _convert_spec(self, nested_spec):
-        """Convert a nested spec."""
+    def close(self):
+        return self._environment.close()
 
+    def _canonicalize_bounded_spec(self, spec: specs.Array) -> specs.Array:
+        if isinstance(spec, specs.BoundedArray):
+            return spec.replace(
+                minimum=-np.ones(spec.shape), maximum=np.ones(spec.shape)
+            )
+        return spec
+
+    def _convert_timestep(self, timestep: dm_env.TimeStep) -> dm_env.TimeStep:
+        return timestep._replace(
+            reward=self._convert_value(timestep.reward),
+            discount=self._convert_value(timestep.discount),
+            observation=self._convert_value(timestep.observation),
+        )
+
+    def _convert_spec(self, nested_spec):
         def _convert_single_spec(spec: specs.Array):
-            """Convert a single spec."""
             if spec.dtype == "O":
-                # Pass StringArray objects through unmodified.
                 return spec
             if np.issubdtype(spec.dtype, np.float64):
                 dtype = np.float32
@@ -1740,86 +1680,16 @@ class SinglePrecisionWrapper(EnvironmentWrapper):
         return tree.map_structure(_convert_single_spec, nested_spec)
 
     def _convert_value(self, nested_value):
-        """Convert a nested value given a desired nested spec."""
-
         def _convert_single_value(value):
             if value is not None:
                 value = np.asarray(value)
                 if np.issubdtype(value.dtype, np.float64):
-                    value = np.asarray(value, dtype=np.float32)
+                    value = value.astype(np.float32)
                 elif np.issubdtype(value.dtype, np.int64):
-                    value = np.asarray(value, dtype=np.int32)
+                    value = value.astype(np.int32)
             return value
 
         return tree.map_structure(_convert_single_value, nested_value)
-
-
-class CanonicalSpecWrapper(EnvironmentWrapper):
-    """Wrapper which converts environments to use canonical action specs.
-
-    This only affects action specs of type `specs.BoundedArray`.
-
-    For bounded action specs, we refer to a canonical action spec as the bounding
-    box [-1, 1]^d where d is the dimensionality of the spec. So the shape and
-    dtype of the spec is unchanged, while the maximum/minimum values are set
-    to +/- 1.
-    """
-
-    def __init__(self, environment: dm_env.Environment, clip: bool = False):
-        super().__init__(environment)
-        self._action_spec = environment.action_spec()
-        self._clip = clip
-
-    def step(self, action):
-        scaled_action = _scale_nested_action(action, self._action_spec, self._clip)
-        return self._environment.step(scaled_action)
-
-    def action_spec(self):
-        return self._convert_spec(self._environment.action_spec())
-
-    def _convert_spec(self, nested_spec):
-        """Converts all bounded specs in nested spec to the canonical scale."""
-
-        def _convert_single_spec(spec: specs.Array) -> specs.Array:
-            """Converts a single spec to canonical if bounded."""
-            if isinstance(spec, specs.BoundedArray):
-                return spec.replace(
-                    minimum=-np.ones(spec.shape), maximum=np.ones(spec.shape)
-                )
-            else:
-                return spec
-
-        return tree.map_structure(_convert_single_spec, nested_spec)
-
-
-def _scale_nested_action(
-    nested_action,
-    nested_spec,
-    clip: bool,
-):
-    """Converts a canonical nested action back to the given nested action spec."""
-
-    def _scale_action(action: np.ndarray, spec: specs.Array):
-        """Converts a single canonical action back to the given action spec."""
-        if isinstance(spec, specs.BoundedArray):
-            # Get scale and offset of output action spec.
-            scale = spec.maximum - spec.minimum
-            offset = spec.minimum
-
-            # Maybe clip the action.
-            if clip:
-                action = np.clip(action, -1.0, 1.0)
-
-            # Map action to [0, 1].
-            action = 0.5 * (action + 1.0)
-
-            # Map action to [spec.minimum, spec.maximum].
-            action *= scale
-            action += offset
-
-        return action
-
-    return tree.map_structure(_scale_action, nested_action, nested_spec)
 
 
 def _make_environment(
@@ -1827,8 +1697,7 @@ def _make_environment(
     task_name: str = "balance",
 ) -> dm_env.Environment:
     environment = suite.load(domain_name, task_name)
-    environment = CanonicalSpecWrapper(environment, clip=True)
-    environment = SinglePrecisionWrapper(environment)
+    environment = CanonicalSinglePrecisionWrapper(environment, clip=True)
     return environment
 
 
