@@ -374,9 +374,7 @@ class MPOLearner:
         counts = self._counter.increment(steps=1, walltime=elapsed_time)
         fetches.update(counts)
 
-        wandb.log(
-            {"learner/" + k: v for k, v in fetches.items()}, step=self._total_steps
-        )
+        wandb.log({"learner/" + k: v for k, v in fetches.items()})
 
     def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:
         return [tf2_utils.to_numpy(self._variables[name]) for name in names]
@@ -611,7 +609,6 @@ class EnvironmentLoop:
             episode_count += 1
             wandb.log(
                 {self._actor.label + "/" + k: v for k, v in result.items()},
-                step=self._total_steps,
             )
 
         return self._total_steps
