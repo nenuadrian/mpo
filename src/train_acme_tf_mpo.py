@@ -23,7 +23,6 @@ import operator
 import itertools
 import os
 
-from acme import types
 from acme.tf import utils as tf2_utils
 from acme.utils import counting
 from acme.utils import loggers
@@ -41,7 +40,6 @@ import trfl
 
 
 tfd = tfp.distributions
-TensorTransformation = Union[snt.Module, Callable[[types.NestedTensor], tf.Tensor]]
 
 FLAGS = flags.FLAGS
 _MAX_ACTOR_STEPS = flags.DEFINE_integer(
@@ -165,8 +163,8 @@ class MPOLearner:
         target_critic_update_period: int,
         dataset: tf.data.Dataset,
         counter: counting.Counter,
-        observation_network: types.TensorTransformation = tf.identity,
-        target_observation_network: types.TensorTransformation = tf.identity,
+        observation_network: TensorTransformation = tf.identity,
+        target_observation_network: TensorTransformation = tf.identity,
         policy_loss_module: Optional[snt.Module] = None,
         policy_optimizer: Optional[snt.Optimizer] = None,
         critic_optimizer: Optional[snt.Optimizer] = None,
@@ -239,7 +237,7 @@ class MPOLearner:
             self.step()
 
     @tf.function
-    def _step(self) -> types.Nest:
+    def _step(self):
         # Update target network.
         online_policy_variables = self._policy_network.variables
         target_policy_variables = self._target_policy_network.variables
@@ -269,7 +267,7 @@ class MPOLearner:
 
         # Get data from replay (dropping extras if any). Note there is no
         # extra data here because we do not insert any into Reverb.
-        transitions: types.Transition = inputs.data
+        transitions = inputs.data
 
         # Cast the additional discount to match the environment discount dtype.
         discount = tf.cast(self._discount, dtype=transitions.discount.dtype)
@@ -395,7 +393,7 @@ class EvaluatorActor:
         self._update_period = update_period
 
     @tf.function
-    def _policy(self, observation: types.NestedTensor) -> types.NestedTensor:
+    def _policy(self, observation: NestedTensor) -> NestedTensor:
         # Add a dummy batch dimension and as a side effect convert numpy to TF.
         batched_observation = tf2_utils.add_batch_dim(observation)
 
@@ -407,7 +405,7 @@ class EvaluatorActor:
 
         return action
 
-    def select_action(self, observation: types.NestedArray) -> types.NestedArray:
+    def select_action(self, observation):
         # Pass the observation through the policy network.
         action = self._policy(observation)
 
@@ -417,7 +415,7 @@ class EvaluatorActor:
     def observe_first(self, _: dm_env.TimeStep):
         pass
 
-    def observe(self, _: types.NestedArray, __: dm_env.TimeStep):
+    def observe(self, _, __: dm_env.TimeStep):
         pass
 
     def update(self, total_steps: int):
@@ -451,7 +449,7 @@ class FeedForwardActor:
         self._update_period = update_period
 
     @tf.function
-    def _policy(self, observation: types.NestedTensor) -> types.NestedTensor:
+    def _policy(self, observation: NestedTensor) -> NestedTensor:
         # Add a dummy batch dimension and as a side effect convert numpy to TF.
         batched_observation = tf2_utils.add_batch_dim(observation)
 
@@ -463,7 +461,7 @@ class FeedForwardActor:
 
         return action
 
-    def select_action(self, observation: types.NestedArray) -> types.NestedArray:
+    def select_action(self, observation):
         # Pass the observation through the policy network.
         action = self._policy(observation)
 
@@ -473,7 +471,7 @@ class FeedForwardActor:
     def observe_first(self, timestep: dm_env.TimeStep):
         self._adder.add_first(timestep)
 
-    def observe(self, action: types.NestedArray, next_timestep: dm_env.TimeStep):
+    def observe(self, action, next_timestep: dm_env.TimeStep):
         self._adder.add(action, next_timestep)
 
     def update(self, total_steps: int):
@@ -719,7 +717,7 @@ class MPO:
             error_buffer=error_buffer,
         )
         replay_table = reverb.Table(
-            name=adders.DEFAULT_PRIORITY_TABLE,
+            name="priority_table",
             sampler=reverb.selectors.Uniform(),
             remover=reverb.selectors.Fifo(),
             max_size=self._max_replay_size,
@@ -829,7 +827,6 @@ class MPO:
             client=replay, n_step=self._n_step, discount=self._additional_discount
         )
 
-        # Create logger and counter; actors will not spam bigtable.
         counter = counting.Counter(counter, "actor")
         logger = loggers.make_default_logger(
             "actor",
@@ -1430,7 +1427,7 @@ class LayerNormMLP(snt.Module):
             ]
         )
 
-    def __call__(self, observations: types.Nest) -> tf.Tensor:
+    def __call__(self, observations) -> tf.Tensor:
         """Forwards the policy network."""
         return self._network(tf2_utils.batch_concat(observations))
 
@@ -1517,9 +1514,7 @@ class CriticMultiplexer(snt.Module):
         self._action_network = action_network
         super().__init__(name="critic_multiplexer")
 
-    def __call__(
-        self, observation: types.NestedTensor, action: types.NestedTensor
-    ) -> tf.Tensor:
+    def __call__(self, observation: NestedTensor, action: NestedTensor) -> tf.Tensor:
 
         # Maybe transform observations and actions before feeding them on.
         if self._observation_network:
@@ -1558,7 +1553,7 @@ def make_networks(
     action_spec: specs.BoundedArray,
     policy_layer_sizes: Sequence[int] = (256, 256, 256),
     critic_layer_sizes: Sequence[int] = (512, 512, 256),
-) -> Dict[str, types.TensorTransformation]:
+) -> Dict[str, TensorTransformation]:
     """Creates networks used by the agent."""
 
     num_dimensions = np.prod(action_spec.shape, dtype=int)
