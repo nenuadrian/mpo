@@ -28,7 +28,6 @@ from acme.tf import utils as tf2_utils
 from acme.utils import counting
 from acme.adders import reverb as adders
 from acme import wrappers
-from acme.utils import loggers
 
 import dm_env
 from dm_env import specs
@@ -164,7 +163,6 @@ class MPOLearner:
         target_critic_update_period: int,
         dataset: tf.data.Dataset,
         counter: counting.Counter,
-        logger: loggers.Logger,
         observation_network=tf.identity,
         target_observation_network=tf.identity,
         policy_loss_module: Optional[snt.Module] = None,
@@ -173,9 +171,7 @@ class MPOLearner:
         dual_optimizer: Optional[snt.Optimizer] = None,
         clipping: bool = True,
     ):
-
         self._counter = counter
-        self._logger = logger
         self._discount = discount
         self._num_samples = num_samples
         self._clipping = clipping
@@ -229,6 +225,7 @@ class MPOLearner:
         # This is to avoid including the time it takes for actors to come online and
         # fill the replay buffer.
         self._timestamp = None
+        self._total_steps = 0
 
     def run(self, num_steps: Optional[int] = None) -> None:
 
@@ -364,6 +361,7 @@ class MPOLearner:
         return fetches
 
     def step(self):
+        self._total_steps = self._total_steps + 1
         # Run the learning step.
         fetches = self._step()
 
@@ -376,8 +374,9 @@ class MPOLearner:
         counts = self._counter.increment(steps=1, walltime=elapsed_time)
         fetches.update(counts)
 
-        wandb.log(fetches)
-
+        wandb.log(
+            {"learner/" + k: v for k, v in fetches.items()}, step=self._total_steps
+        )
 
     def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:
         return [tf2_utils.to_numpy(self._variables[name]) for name in names]
@@ -485,40 +484,15 @@ class FeedForwardActor:
 
 
 class EnvironmentLoop:
-    """A simple RL environment loop.
-
-    This takes `Environment` and `Actor` instances and coordinates their
-    interaction. This can be used as:
-
-      loop = EnvironmentLoop(environment, actor)
-      loop.run(num_episodes)
-
-    A `Counter` instance can optionally be given in order to maintain counts
-    between different Acme components. If not given a local Counter will be
-    created to maintain counts between calls to the `run` method.
-
-    A `Logger` instance can also be passed in order to control the output of the
-    loop. If not given a platform-specific default logger will be used as defined
-    by utils.make_default_logger. A string `label` can be passed to easily
-    change the label associated with the default logger; this is ignored if a
-    `Logger` instance is given.
-
-    A list of 'Observer' instances can be specified to generate additional metrics
-    to be logged by the logger. They have access to the 'Environment' instance,
-    the current timestep datastruct and the current action.
-    """
-
     def __init__(
         self,
         environment: dm_env.Environment,
         actor,
-        logger: loggers.Logger,
         counter: counting.Counter,
     ):
         self._environment = environment
         self._actor = actor
         self._counter = counter
-        self._logger = logger
         self._total_steps = 0
 
     def run_episode(self) -> Mapping[str, Any]:
@@ -628,16 +602,17 @@ class EnvironmentLoop:
             )
 
         episode_count: int = 0
-        step_count: int = 0
-        while not should_terminate(episode_count, step_count):
+        while not should_terminate(episode_count, self._total_steps):
             episode_start = time.time()
             result = self.run_episode()
             result = {**result, **{"episode_duration": time.time() - episode_start}}
             episode_count += 1
-            step_count += int(result["episode_length"])
-            wandb.log(result)
+            wandb.log(
+                {self._actor.label + "/" + k: v for k, v in result.items()},
+                step=self._total_steps,
+            )
 
-        return step_count
+        return self._total_steps
 
 
 def _generate_zeros_from_spec(spec: specs.Array) -> np.ndarray:
@@ -756,11 +731,7 @@ class MPO:
         dataset = dataset.batch(self._batch_size, drop_remainder=True)
         dataset = dataset.prefetch(self._prefetch_size)
 
-        # Create a counter and logger for bookkeeping steps and performance.
         counter = counting.Counter(counter, "learner")
-        logger = loggers.make_default_logger(
-            "learner", time_delta=self._log_every, steps_key="learner_steps"
-        )
 
         # Create policy loss module if a factory is passed.
         if self._policy_loss_factory:
@@ -783,7 +754,6 @@ class MPO:
             policy_loss_module=policy_loss_module,
             dataset=dataset,
             counter=counter,
-            logger=logger,
         )
 
     def actor(
@@ -820,12 +790,6 @@ class MPO:
         )
 
         counter = counting.Counter(counter, "actor")
-        logger = loggers.make_default_logger(
-            "actor",
-            save_data=False,
-            time_delta=self._log_every,
-            steps_key="actor_steps",
-        )
 
         actor = FeedForwardActor(
             policy_network=behavior_network,
@@ -835,9 +799,7 @@ class MPO:
         )
 
         # Create the run loop and return it.
-        return EnvironmentLoop(
-            environment=environment, actor=actor, counter=counter, logger=logger
-        )
+        return EnvironmentLoop(environment=environment, actor=actor, counter=counter)
 
     def evaluator(
         self,
@@ -867,11 +829,7 @@ class MPO:
         # Ensure network variables are created.
         tf2_utils.create_variables(evaluator_network, [observation_spec])
 
-        # Create logger and counter.
         counter = counting.Counter(counter, "evaluator")
-        logger = loggers.make_default_logger(
-            "evaluator", time_delta=self._log_every, steps_key="evaluator_steps"
-        )
 
         evaluator = EvaluatorActor(
             policy_network=evaluator_network,
@@ -880,7 +838,7 @@ class MPO:
         )
 
         return EnvironmentLoop(
-            environment=environment, actor=evaluator, counter=counter, logger=logger
+            environment=environment, actor=evaluator, counter=counter
         )
 
     def run(self):
