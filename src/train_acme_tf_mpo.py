@@ -24,7 +24,6 @@ import operator
 import itertools
 import os
 
-from acme.tf import utils as tf2_utils
 from acme.adders import reverb as adders
 from acme import wrappers
 
@@ -49,6 +48,145 @@ _MAX_ACTOR_STEPS = flags.DEFINE_integer(
 _DOMAIN = flags.DEFINE_string("domain", "cartpole", "Control suite domain name.")
 _TASK = flags.DEFINE_string("task", "balance", "Control suite task name.")
 _MPO_FLOAT_EPSILON = 1e-8
+
+
+def add_batch_dim(nest):
+    """Adds a batch dimension to each leaf of a nested structure of Tensors."""
+    return tree.map_structure(lambda x: tf.expand_dims(x, axis=0), nest)
+
+
+def squeeze_batch_dim(nest):
+    """Squeezes out a batch dimension from each leaf of a nested structure."""
+    return tree.map_structure(lambda x: tf.squeeze(x, axis=0), nest)
+
+
+def batch_concat(inputs) -> tf.Tensor:
+    """Concatenate a collection of Tensors while preserving the batch dimension.
+
+    This takes a potentially nested collection of tensors, flattens everything
+    but the batch (first) dimension, and concatenates along the resulting data
+    (second) dimension.
+
+    Args:
+      inputs: a tensor or nested collection of tensors.
+
+    Returns:
+      A concatenated tensor which maintains the batch dimension but concatenates
+      all other data along the flattened second dimension.
+    """
+    flat_leaves = tree.map_structure(snt.Flatten(), inputs)
+    return tf.concat(tree.flatten(flat_leaves), axis=-1)
+
+
+def tile_tensor(tensor: tf.Tensor, multiple: int) -> tf.Tensor:
+    """Tiles `multiple` copies of `tensor` along a new leading axis."""
+    rank = len(tensor.shape)
+    multiples = tf.constant([multiple] + [1] * rank, dtype=tf.int32)
+    expanded_tensor = tf.expand_dims(tensor, axis=0)
+    return tf.tile(expanded_tensor, multiples)
+
+
+def create_variables(
+    network: snt.Module,
+    input_spec: List[Any],
+) -> Optional[tf.TensorSpec]:
+    """Builds the network with dummy inputs to create the necessary variables.
+
+    Args:
+      network: Sonnet Module whose variables are to be created.
+      input_spec: list of input specs to the network. The length of this list
+        should match the number of arguments expected by `network`.
+
+    Returns:
+      output_spec: only returns an output spec if the output is a tf.Tensor, else
+          it doesn't return anything (None); e.g. if the output is a
+          tfp.distributions.Distribution.
+    """
+    # Create a dummy observation with no batch dimension.
+    dummy_input = zeros_like(input_spec)
+
+    # If we have an RNNCore the hidden state will be an additional input.
+    if isinstance(network, snt.RNNCore):
+        initial_state = squeeze_batch_dim(network.initial_state(1))
+        dummy_input += [initial_state]
+
+    # Forward pass of the network which will create variables as a side effect.
+    dummy_output = network(*add_batch_dim(dummy_input))
+
+    # Evaluate the input signature by converting the dummy input into a
+    # TensorSpec. We then save the signature as a property of the network. This is
+    # done so that we can later use it when creating snapshots. We do this here
+    # because the snapshot code may not have access to the precise form of the
+    # inputs.
+    input_signature = tree.map_structure(
+        lambda t: tf.TensorSpec((None,) + t.shape, t.dtype), dummy_input
+    )
+    network._input_signature = input_signature  # pylint: disable=protected-access
+
+    def spec(output):
+        # If the output is not a Tensor, return None as spec is ill-defined.
+        if not isinstance(output, tf.Tensor):
+            return None
+        # If this is not a scalar Tensor, make sure to squeeze out the batch dim.
+        if tf.rank(output) > 0:
+            output = squeeze_batch_dim(output)
+        return tf.TensorSpec(output.shape, output.dtype)
+
+    return tree.map_structure(spec, dummy_output)
+
+
+class TransformationWrapper(snt.Module):
+    """Helper class for to_sonnet_module.
+
+    This wraps arbitrary Tensor-valued callables as a Sonnet module.
+    A use case for this is in agent code that could take either a trainable
+    sonnet module or a hard-coded function as its policy. By wrapping a hard-coded
+    policy with this class, the agent can then treat it as if it were a Sonnet
+    module. This removes the need for "if is_hard_coded:..." branches, which you'd
+    otherwise need if e.g. calling get_variables() on the policy.
+    """
+
+    def __init__(self, transformation, name: Optional[str] = None):
+        super().__init__(name=name)
+        self._transformation = transformation
+
+    def __call__(self, *args, **kwargs):
+        return self._transformation(*args, **kwargs)
+
+
+def to_sonnet_module(transformation) -> snt.Module:
+    """Convert a tensor transformation to a Sonnet Module.
+
+    Args:
+      transformation: A Callable that takes one or more (nested) Tensors, and
+        returns one or more (nested) Tensors.
+
+    Returns:
+      A Sonnet Module that wraps the transformation.
+    """
+
+    if isinstance(transformation, snt.Module):
+        return transformation
+
+    module = TransformationWrapper(transformation)
+
+    # Wrap the module to allow it to return an empty variable tuple.
+    return snt.allow_empty_variables(module)
+
+
+def to_numpy(nest: types.NestedTensor) -> types.NestedArray:
+    """Converts a nest of Tensors to a nest of numpy arrays."""
+    return tree.map_structure(lambda x: x.numpy(), nest)
+
+
+def to_numpy_squeeze(nest: types.NestedTensor, axis=0) -> types.NestedArray:
+    """Converts a nest of Tensors to a nest of numpy arrays and squeeze axis."""
+    return tree.map_structure(lambda x: tf.squeeze(x, axis=axis).numpy(), nest)
+
+
+def zeros_like(nest: types.Nest) -> types.NestedTensor:
+    """Given a nest of array-like objects, returns similarly nested tf.zeros."""
+    return tree.map_structure(lambda x: tf.zeros(x.shape, x.dtype), nest)
 
 
 def make_reverb_dataset(
@@ -189,10 +327,8 @@ class MPOLearner:
         self._target_critic_network = target_critic_network
 
         # Make sure observation networks are snt.Module's so they have variables.
-        self._observation_network = tf2_utils.to_sonnet_module(observation_network)
-        self._target_observation_network = tf2_utils.to_sonnet_module(
-            target_observation_network
-        )
+        self._observation_network = to_sonnet_module(observation_network)
+        self._target_observation_network = to_sonnet_module(target_observation_network)
 
         self._policy_loss_module = policy_loss_module or MPOLoss(
             epsilon=1e-1,
@@ -287,7 +423,7 @@ class MPOLearner:
 
             # Get sampled actions to evaluate policy; of size [N, B, ...].
             sampled_actions = target_action_distribution.sample(self._num_samples)
-            tiled_o_t = tf2_utils.tile_tensor(o_t, self._num_samples)  # [N, B, ...]
+            tiled_o_t = tile_tensor(o_t, self._num_samples)  # [N, B, ...]
 
             # Compute the target critic's Q-value of the sampled actions in state o_t.
             sampled_q_t = self._target_critic_network(
@@ -371,7 +507,7 @@ class MPOLearner:
         wandb.log({"learner/" + k: v for k, v in fetches.items()})
 
     def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:
-        return [tf2_utils.to_numpy(self._variables[name]) for name in names]
+        return [to_numpy(self._variables[name]) for name in names]
 
 
 class EvaluatorActor:
@@ -387,7 +523,7 @@ class EvaluatorActor:
     @tf.function
     def _policy(self, observation):
         # Add a dummy batch dimension and as a side effect convert numpy to TF.
-        batched_observation = tf2_utils.add_batch_dim(observation)
+        batched_observation = add_batch_dim(observation)
 
         # Compute the policy, conditioned on the observation.
         policy = self._policy_network(batched_observation)
@@ -402,7 +538,7 @@ class EvaluatorActor:
         action = self._policy(observation)
 
         # Return a numpy array with squeezed out batch dimension.
-        return tf2_utils.to_numpy_squeeze(action)
+        return to_numpy_squeeze(action)
 
     def observe_first(self, _: dm_env.TimeStep):
         pass
@@ -444,7 +580,7 @@ class FeedForwardActor:
     @tf.function
     def _policy(self, observation):
         # Add a dummy batch dimension and as a side effect convert numpy to TF.
-        batched_observation = tf2_utils.add_batch_dim(observation)
+        batched_observation = add_batch_dim(observation)
 
         # Compute the policy, conditioned on the observation.
         policy = self._policy_network(batched_observation)
@@ -459,7 +595,7 @@ class FeedForwardActor:
         action = self._policy(observation)
 
         # Return a numpy array with squeezed out batch dimension.
-        return tf2_utils.to_numpy_squeeze(action)
+        return to_numpy_squeeze(action)
 
     def observe_first(self, timestep: dm_env.TimeStep):
         self._adder.add_first(timestep)
@@ -696,28 +832,25 @@ class MPO:
 
         # Make sure observation networks are Sonnet Modules.
         observation_network = online_networks.get("observation", tf.identity)
-        observation_network = tf2_utils.to_sonnet_module(observation_network)
+        observation_network = to_sonnet_module(observation_network)
         online_networks["observation"] = observation_network
         target_observation_network = target_networks.get("observation", tf.identity)
-        target_observation_network = tf2_utils.to_sonnet_module(
-            target_observation_network
-        )
+        target_observation_network = to_sonnet_module(target_observation_network)
         target_networks["observation"] = target_observation_network
 
         # Get embedding spec and create observation network variables.
-        emb_spec = tf2_utils.create_variables(observation_network, [obs_spec])
+        emb_spec = create_variables(observation_network, [obs_spec])
 
-        tf2_utils.create_variables(online_networks["policy"], [emb_spec])
-        tf2_utils.create_variables(online_networks["critic"], [emb_spec, act_spec])
-        tf2_utils.create_variables(target_networks["observation"], [obs_spec])
-        tf2_utils.create_variables(target_networks["policy"], [emb_spec])
-        tf2_utils.create_variables(target_networks["critic"], [emb_spec, act_spec])
+        create_variables(online_networks["policy"], [emb_spec])
+        create_variables(online_networks["critic"], [emb_spec, act_spec])
+        create_variables(target_networks["observation"], [obs_spec])
+        create_variables(target_networks["policy"], [emb_spec])
+        create_variables(target_networks["critic"], [emb_spec, act_spec])
 
         # The dataset object to learn from.
         dataset = make_reverb_dataset(server_address=replay.server_address)
         dataset = dataset.batch(self._batch_size, drop_remainder=True)
         dataset = dataset.prefetch(self._prefetch_size)
-
 
         # Create policy loss module if a factory is passed.
         if self._policy_loss_factory:
@@ -766,13 +899,12 @@ class MPO:
         behavior_network = snt.Sequential(behavior_modules)
 
         # Ensure network variables are created.
-        tf2_utils.create_variables(behavior_network, [observation_spec])
+        create_variables(behavior_network, [observation_spec])
 
         # Component to add things into replay.
         adder = adders.NStepTransitionAdder(
             client=replay, n_step=self._n_step, discount=self._additional_discount
         )
-
 
         actor = FeedForwardActor(
             policy_network=behavior_network,
@@ -809,8 +941,7 @@ class MPO:
         evaluator_network = snt.Sequential(evaluator_modules)
 
         # Ensure network variables are created.
-        tf2_utils.create_variables(evaluator_network, [observation_spec])
-
+        create_variables(evaluator_network, [observation_spec])
 
         evaluator = EvaluatorActor(
             policy_network=evaluator_network,
@@ -818,9 +949,7 @@ class MPO:
             update_period=self._variable_update_period,
         )
 
-        return EnvironmentLoop(
-            environment=environment, actor=evaluator
-        )
+        return EnvironmentLoop(environment=environment, actor=evaluator)
 
     def run(self):
         server = reverb.Server(tables=self.replay())
@@ -1363,7 +1492,7 @@ class LayerNormMLP(snt.Module):
 
     def __call__(self, observations) -> tf.Tensor:
         """Forwards the policy network."""
-        return self._network(tf2_utils.batch_concat(observations))
+        return self._network(batch_concat(observations))
 
 
 class MultivariateNormalDiagHead(snt.Module):
@@ -1462,7 +1591,7 @@ class CriticMultiplexer(snt.Module):
                 action = tf.cast(action, observation.dtype)
 
         # Concat observations and actions, with one batch dimension.
-        outputs = tf2_utils.batch_concat([observation, action])
+        outputs = batch_concat([observation, action])
 
         # Maybe transform output before returning.
         if self._critic_network:
@@ -1512,7 +1641,7 @@ def make_networks(
     return {
         "policy": policy_network,
         "critic": critic_network,
-        "observation": tf2_utils.batch_concat,
+        "observation": batch_concat,
     }
 
 
