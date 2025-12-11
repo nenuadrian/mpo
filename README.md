@@ -44,6 +44,8 @@ Very difficult to get it to build. TensorFlow version is only one that I was abl
 Combined all code necessary in `src/train_acme_tf_mpo.py`. But still need a lot of the tricks I have documented in my `acme` fork.
 
 ```bash
+python src/lp_mpo_single_file.py --max_actor_steps 3000000 --domain cheetah --task run
+
 python src/train_acme_tf_mpo.py --max_actor_steps 3000000 --domain cheetah --task run
 ```
 

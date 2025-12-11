@@ -222,14 +222,15 @@ class EnvironmentLoop(core.Worker):
 
         episode_count: int = 0
         step_count: int = 0
-        while not should_terminate(episode_count, step_count):
-            episode_start = time.time()
-            result = self.run_episode()
-            result = {**result, **{"episode_duration": time.time() - episode_start}}
-            episode_count += 1
-            step_count += int(result["episode_length"])
-            # Log the given episode results.
-            self._logger.write(result)
+        with signals.runtime_terminator():
+            while not should_terminate(episode_count, step_count):
+                episode_start = time.time()
+                result = self.run_episode()
+                result = {**result, **{"episode_duration": time.time() - episode_start}}
+                episode_count += 1
+                step_count += int(result["episode_length"])
+                # Log the given episode results.
+                self._logger.write(result)
 
         return step_count
 
@@ -833,38 +834,6 @@ class MPO:
             program.add_node(lp.CourierNode(self.actor, replay, learner, counter))
 
         return program
-
-    def run(self):
-        import threading
-
-        counter = counting.Counter()
-        server = reverb.Server(tables=self.replay())
-        client = reverb.Client(f"localhost:{server.port}")
-
-        learner = self.learner(client, counter)
-
-        actor = self.actor(client, learner, counter)
-
-        evaluator = self.evaluator(learner, counter)
-
-        threads = [
-            threading.Thread(
-                target=learner.run,
-                kwargs={"num_steps": self._max_actor_steps},
-                daemon=True,
-            ),
-            threading.Thread(
-                target=actor.run,
-                kwargs={"num_steps": self._max_actor_steps},
-                daemon=True,
-            ),
-            threading.Thread(target=evaluator.run, daemon=True),
-        ]
-
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
 
 
 """Implements the MPO losses.

@@ -1,49 +1,40 @@
-"""Launch MPO agent on the control suite via Launchpad."""
-
 from typing import List, Optional, Dict, Tuple, Union, Sequence, Callable
 import time
-import copy
 
-import tree
-import dm_env
-import reverb
-import operator
-
+import threading
 from absl import app
 from absl import flags
-
-from dm_control import suite
-import launchpad as lp
 import numpy as np
 import sonnet as snt
-
-import tensorflow_probability as tfp
-import tensorflow as tf
-import trfl
+import dm_env
+import reverb
+import wandb
+from dm_control import suite
+import tree
+import operator
+import itertools
 
 import acme
-from acme.utils import counting
-from acme.utils import loggers
-from acme import datasets
-from acme.tf import variable_utils as tf2_variable_utils
-from acme.utils import lp_utils
-from acme import wrappers
 from acme import specs
 from acme import types
 from acme import core
 from acme import adders as acme_adders
 from acme.tf import utils as tf2_utils
+from acme.utils import counting
+from acme.utils import loggers
+from acme import datasets
+from acme.adders import reverb as adders
+from acme.tf import variable_utils as tf2_variable_utils
+from acme import wrappers
 from acme.utils import observers as observers_lib
-from acme.utils import signals
-from acme.adders.reverb import base
-from acme.adders.reverb import utils
-from acme.utils import tree_utils
+
+import tensorflow as tf
+import tensorflow_probability as tfp
+import trfl
 
 
 tfd = tfp.distributions
-snt_init = snt.initializers
 TensorTransformation = Union[snt.Module, Callable[[types.NestedTensor], tf.Tensor]]
-
 
 FLAGS = flags.FLAGS
 _MAX_ACTOR_STEPS = flags.DEFINE_integer(
@@ -53,44 +44,7 @@ _MAX_ACTOR_STEPS = flags.DEFINE_integer(
 )
 _DOMAIN = flags.DEFINE_string("domain", "cartpole", "Control suite domain name.")
 _TASK = flags.DEFINE_string("task", "balance", "Control suite task name.")
-_DEFAULT_PRIORITY_TABLE = "priority_table"
-
 _MPO_FLOAT_EPSILON = 1e-8
-
-
-class Runner(core.Worker):
-    """Wrap an object and expose a run method which checkpoints periodically."""
-
-    def __init__(
-        self,
-        wrapped,
-        key: str = "wrapped",
-    ):
-        self._wrapped = wrapped
-
-    # Handle preemption signal. Note that this must happen in the main thread.
-    def _signal_handler(self):
-        pass
-
-    def step(self):
-        if isinstance(self._wrapped, core.Learner):
-            # Learners have a step() method, so alternate between that and ckpt call.
-            self._wrapped.step()
-
-    def run(self):
-        """Runs the checkpointer."""
-        with signals.runtime_terminator(self._signal_handler):
-            while True:
-                self.step()
-
-    def get_directory(self) -> str:
-        return ""
-
-    def __dir__(self):
-        return dir(self._wrapped) + ["get_directory"]
-
-    def __getattr__(self, name):
-        return getattr(self._wrapped, name)
 
 
 class EnvironmentLoop(core.Worker):
@@ -258,314 +212,20 @@ class EnvironmentLoop(core.Worker):
 
         episode_count: int = 0
         step_count: int = 0
-        with signals.runtime_terminator():
-            while not should_terminate(episode_count, step_count):
-                episode_start = time.time()
-                result = self.run_episode()
-                result = {**result, **{"episode_duration": time.time() - episode_start}}
-                episode_count += 1
-                step_count += int(result["episode_length"])
-                # Log the given episode results.
-                self._logger.write(result)
+        while not should_terminate(episode_count, step_count):
+            episode_start = time.time()
+            result = self.run_episode()
+            result = {**result, **{"episode_duration": time.time() - episode_start}}
+            episode_count += 1
+            step_count += int(result["episode_length"])
+            # Log the given episode results.
+            self._logger.write(result)
 
         return step_count
 
 
 def _generate_zeros_from_spec(spec: specs.Array) -> np.ndarray:
     return np.zeros(spec.shape, spec.dtype)
-
-
-class NStepTransitionAdder(base.ReverbAdder):
-    """An N-step transition adder.
-
-    This will buffer a sequence of N timesteps in order to form a single N-step
-    transition which is added to reverb for future retrieval.
-
-    For N=1 the data added to replay will be a standard one-step transition which
-    takes the form:
-
-          (s_t, a_t, r_t, d_t, s_{t+1}, e_t)
-
-    where:
-
-      s_t = state observation at time t
-      a_t = the action taken from s_t
-      r_t = reward ensuing from action a_t
-      d_t = environment discount ensuing from action a_t. This discount is
-          applied to future rewards after r_t.
-      e_t [Optional] = extra data that the agent persists in replay.
-
-    For N greater than 1, transitions are of the form:
-
-          (s_t, a_t, R_{t:t+n}, D_{t:t+n}, s_{t+N}, e_t),
-
-    where:
-
-      s_t = State (observation) at time t.
-      a_t = Action taken from state s_t.
-      g = the additional discount, used by the agent to discount future returns.
-      R_{t:t+n} = N-step discounted return, i.e. accumulated over N rewards:
-            R_{t:t+n} := r_t + g * d_t * r_{t+1} + ...
-                             + g^{n-1} * d_t * ... * d_{t+n-2} * r_{t+n-1}.
-      D_{t:t+n}: N-step product of agent discounts g_i and environment
-        "discounts" d_i.
-            D_{t:t+n} := g^{n-1} * d_{t} * ... * d_{t+n-1},
-        For most environments d_i is 1 for all steps except the last,
-        i.e. it is the episode termination signal.
-      s_{t+n}: The "arrival" state, i.e. the state at time t+n.
-      e_t [Optional]: A nested structure of any 'extras' the user wishes to add.
-
-    Notes:
-      - At the beginning and end of episodes, shorter transitions are added.
-        That is, at the beginning of the episode, it will add:
-              (s_0 -> s_1), (s_0 -> s_2), ..., (s_0 -> s_n), (s_1 -> s_{n+1})
-
-        And at the end of the episode, it will add:
-              (s_{T-n+1} -> s_T), (s_{T-n+2} -> s_T), ... (s_{T-1} -> s_T).
-      - We add the *first* `extra` of each transition, not the *last*, i.e.
-          if extras are provided, we get e_t, not e_{t+n}.
-    """
-
-    def __init__(
-        self,
-        client: reverb.Client,
-        n_step: int,
-        discount: float,
-        *,
-        priority_fns: Optional[base.PriorityFnMapping] = None,
-        max_in_flight_items: int = 5,
-    ):
-        """Creates an N-step transition adder.
-
-        Args:
-          client: A `reverb.Client` to send the data to replay through.
-          n_step: The "N" in N-step transition. See the class docstring for the
-            precise definition of what an N-step transition is. `n_step` must be at
-            least 1, in which case we use the standard one-step transition, i.e.
-            (s_t, a_t, r_t, d_t, s_t+1, e_t).
-          discount: Discount factor to apply. This corresponds to the agent's
-            discount in the class docstring.
-          priority_fns: See docstring for BaseAdder.
-          max_in_flight_items: The maximum number of items allowed to be "in flight"
-            at the same time. See `block_until_num_items` in
-            `reverb.TrajectoryWriter.flush` for more info.
-
-        Raises:
-          ValueError: If n_step is less than 1.
-        """
-        # Makes the additional discount a float32, which means that it will be
-        # upcast if rewards/discounts are float64 and left alone otherwise.
-        self.n_step = n_step
-        self._discount = tree.map_structure(np.float32, discount)
-        self._first_idx = 0
-        self._last_idx = 0
-
-        super().__init__(
-            client=client,
-            max_sequence_length=n_step + 1,
-            priority_fns=priority_fns,
-            max_in_flight_items=max_in_flight_items,
-        )
-
-    def add(self, *args, **kwargs):
-        # Increment the indices for the start and end of the window for computing
-        # n-step returns.
-        if self._writer.episode_steps >= self.n_step:
-            self._first_idx += 1
-        self._last_idx += 1
-
-        super().add(*args, **kwargs)
-
-    def reset(
-        self,
-    ):  # pytype: disable=signature-mismatch  # overriding-parameter-count-checks
-        super().reset()
-        self._first_idx = 0
-        self._last_idx = 0
-
-    @property
-    def _n_step(self) -> int:
-        """Effective n-step, which may vary at starts and ends of episodes."""
-        return self._last_idx - self._first_idx
-
-    def _write(self):
-        # Convenient getters for use in tree operations.
-        get_first = lambda x: x[self._first_idx]
-        get_last = lambda x: x[self._last_idx]
-        # Note: this getter is meant to be used on a TrajectoryWriter.history to
-        # obtain its numpy values.
-        get_all_np = lambda x: x[self._first_idx : self._last_idx].numpy()
-
-        # Get the state, action, next_state, as well as possibly extras for the
-        # transition that is about to be written.
-        history = self._writer.history
-        s, a = tree.map_structure(
-            get_first, (history["observation"], history["action"])
-        )
-        s_ = tree.map_structure(get_last, history["observation"])
-
-        # Maybe get extras to add to the transition later.
-        if "extras" in history:
-            extras = tree.map_structure(get_first, history["extras"])
-
-        # Note: at the beginning of an episode we will add the initial N-1
-        # transitions (of size 1, 2, ...) and at the end of an episode (when
-        # called from write_last) we will write the final transitions of size (N,
-        # N-1, ...). See the Note in the docstring.
-        # Get numpy view of the steps to be fed into the priority functions.
-        reward, discount = tree.map_structure(
-            get_all_np, (history["reward"], history["discount"])
-        )
-
-        # Compute discounted return and geometric discount over n steps.
-        n_step_return, total_discount = self._compute_cumulative_quantities(
-            reward, discount
-        )
-
-        # Append the computed n-step return and total discount.
-        # Note: if this call to _write() is within a call to _write_last(), then
-        # this is the only data being appended and so it is not a partial append.
-        self._writer.append(
-            dict(n_step_return=n_step_return, total_discount=total_discount),
-            partial_step=self._writer.episode_steps <= self._last_idx,
-        )
-        # This should be done immediately after self._writer.append so the history
-        # includes the recently appended data.
-        history = self._writer.history
-
-        # Form the n-step transition by using the following:
-        # the first observation and action in the buffer, along with the cumulative
-        # reward and discount computed above.
-        n_step_return, total_discount = tree.map_structure(
-            lambda x: x[-1], (history["n_step_return"], history["total_discount"])
-        )
-        transition = types.Transition(
-            observation=s,
-            action=a,
-            reward=n_step_return,
-            discount=total_discount,
-            next_observation=s_,
-            extras=(extras if "extras" in history else ()),
-        )
-
-        # Calculate the priority for this transition.
-        table_priorities = utils.calculate_priorities(self._priority_fns, transition)
-
-        # Insert the transition into replay along with its priority.
-        for table, priority in table_priorities.items():
-            self._writer.create_item(
-                table=table, priority=priority, trajectory=transition
-            )
-            self._writer.flush(self._max_in_flight_items)
-
-    def _write_last(self):
-        # Write the remaining shorter transitions by alternating writing and
-        # incrementingfirst_idx. Note that last_idx will no longer be incremented
-        # once we're in this method's scope.
-        self._first_idx += 1
-        while self._first_idx < self._last_idx:
-            self._write()
-            self._first_idx += 1
-
-    def _compute_cumulative_quantities(
-        self, rewards: types.NestedArray, discounts: types.NestedArray
-    ) -> Tuple[types.NestedArray, types.NestedArray]:
-
-        # Give the same tree structure to the n-step return accumulator,
-        # n-step discount accumulator, and self.discount, so that they can be
-        # iterated in parallel using tree.map_structure.
-        rewards, discounts, self_discount = tree_utils.broadcast_structures(
-            rewards, discounts, self._discount
-        )
-        flat_rewards = tree.flatten(rewards)
-        flat_discounts = tree.flatten(discounts)
-        flat_self_discount = tree.flatten(self_discount)
-
-        # Copy total_discount as it is otherwise read-only.
-        total_discount = [np.copy(a[0]) for a in flat_discounts]
-
-        # Broadcast n_step_return to have the broadcasted shape of
-        # reward * discount.
-        n_step_return = [
-            np.copy(np.broadcast_to(r[0], np.broadcast(r[0], d).shape))
-            for r, d in zip(flat_rewards, total_discount)
-        ]
-
-        # NOTE: total_discount will have one less self_discount applied to it than
-        # the value of self._n_step. This is so that when the learner/update uses
-        # an additional discount we don't apply it twice. Inside the following loop
-        # we will apply this right before summing up the n_step_return.
-        for i in range(1, self._n_step):
-            for nsr, td, r, d, sd in zip(
-                n_step_return,
-                total_discount,
-                flat_rewards,
-                flat_discounts,
-                flat_self_discount,
-            ):
-                # Equivalent to: `total_discount *= self._discount`.
-                td *= sd
-                # Equivalent to: `n_step_return += reward[i] * total_discount`.
-                nsr += r[i] * td
-                # Equivalent to: `total_discount *= discount[i]`.
-                td *= d[i]
-
-        n_step_return = tree.unflatten_as(rewards, n_step_return)
-        total_discount = tree.unflatten_as(rewards, total_discount)
-        return n_step_return, total_discount
-
-    # TODO(bshahr): make this into a standalone method. Class methods should be
-    # used as alternative constructors or when modifying some global state,
-    # neither of which is done here.
-    @classmethod
-    def signature(
-        cls, environment_spec: specs.EnvironmentSpec, extras_spec: types.NestedSpec = ()
-    ):
-
-        # This function currently assumes that self._discount is a scalar.
-        # If it ever becomes a nested structure and/or a np.ndarray, this method
-        # will need to know its structure / shape. This is because the signature
-        # discount shape is the environment's discount shape and this adder's
-        # discount shape broadcasted together. Also, the reward shape is this
-        # signature discount shape broadcasted together with the environment
-        # reward shape. As long as self._discount is a scalar, it will not affect
-        # either the signature discount shape nor the signature reward shape, so we
-        # can ignore it.
-
-        rewards_spec, step_discounts_spec = tree_utils.broadcast_structures(
-            environment_spec.rewards, environment_spec.discounts
-        )
-        rewards_spec = tree.map_structure(
-            _broadcast_specs, rewards_spec, step_discounts_spec
-        )
-        step_discounts_spec = tree.map_structure(copy.deepcopy, step_discounts_spec)
-
-        transition_spec = types.Transition(
-            environment_spec.observations,
-            environment_spec.actions,
-            rewards_spec,
-            step_discounts_spec,
-            environment_spec.observations,  # next_observation
-            extras_spec,
-        )
-
-        return tree.map_structure_with_path(
-            base.spec_like_to_tensor_spec, transition_spec
-        )
-
-
-def _broadcast_specs(*args: specs.Array) -> specs.Array:
-    """Like np.broadcast, but for specs.Array.
-
-    Args:
-      *args: one or more specs.Array instances.
-
-    Returns:
-      A specs.Array with the broadcasted shape and dtype of the specs in *args.
-    """
-    bc_info = np.broadcast(*tuple(a.generate_value() for a in args))
-    dtype = np.result_type(*tuple(a.dtype for a in args))
-    return specs.Array(shape=bc_info.shape, dtype=dtype)
 
 
 class FeedForwardActor(core.Actor):
@@ -637,11 +297,13 @@ class StochasticMeanHead(snt.Module):
         return distribution.mean()
 
 
-class AcmeMPO:
-    """Program definition for MPO."""
+class MPO:
 
     def __init__(
         self,
+        network_factory: Callable[[specs.BoundedArray], Dict[str, snt.Module]],
+        num_caches: int = 0,
+        environment_spec: Optional[specs.EnvironmentSpec] = None,
         batch_size: int = 256,
         prefetch_size: int = 4,
         min_replay_size: int = 1000,
@@ -653,12 +315,23 @@ class AcmeMPO:
         target_policy_update_period: int = 100,
         target_critic_update_period: int = 100,
         variable_update_period: int = 1000,
+        policy_loss_factory: Optional[Callable[[], snt.Module]] = None,
         max_actor_steps: Optional[int] = None,
         log_every: float = 10.0,
     ):
-        self._environment_spec = specs.make_environment_spec(
-            _make_environment(domain_name=_DOMAIN.value, task_name=_TASK.value)
-        )
+
+        if environment_spec is None:
+            environment_spec = specs.make_environment_spec(
+                _make_environment(
+                    domain_name=_DOMAIN.value,
+                    task_name=_TASK.value,
+                )
+            )
+
+        self._network_factory = network_factory
+        self._policy_loss_factory = policy_loss_factory
+        self._environment_spec = environment_spec
+        self._num_caches = num_caches
         self._batch_size = batch_size
         self._prefetch_size = prefetch_size
         self._min_replay_size = min_replay_size
@@ -690,20 +363,15 @@ class AcmeMPO:
                 min_size_to_sample=self._min_replay_size
             )
         replay_table = reverb.Table(
-            name=_DEFAULT_PRIORITY_TABLE,
+            name=adders.DEFAULT_PRIORITY_TABLE,
             sampler=reverb.selectors.Uniform(),
             remover=reverb.selectors.Fifo(),
             max_size=self._max_replay_size,
             rate_limiter=limiter,
-            signature=NStepTransitionAdder.signature(self._environment_spec),
+            signature=adders.NStepTransitionAdder.signature(self._environment_spec),
         )
         return [replay_table]
 
-    def counter(self):
-        return Runner(counting.Counter())
-
-    def coordinator(self, counter: counting.Counter, max_actor_steps: int):
-        return lp_utils.StepsLimiter(counter, max_actor_steps)
 
     def learner(
         self,
@@ -716,8 +384,8 @@ class AcmeMPO:
         obs_spec = self._environment_spec.observations
 
         # Create online and target networks.
-        online_networks = make_networks(act_spec)
-        target_networks = make_networks(act_spec)
+        online_networks = self._network_factory(act_spec)
+        target_networks = self._network_factory(act_spec)
 
         # Make sure observation networks are Sonnet Modules.
         observation_network = online_networks.get("observation", tf.identity)
@@ -749,6 +417,12 @@ class AcmeMPO:
             "learner", time_delta=self._log_every, steps_key="learner_steps"
         )
 
+        # Create policy loss module if a factory is passed.
+        if self._policy_loss_factory:
+            policy_loss_module = self._policy_loss_factory()
+        else:
+            policy_loss_module = None
+
         # Return the learning agent.
         return MPOLearner(
             policy_network=online_networks["policy"],
@@ -761,6 +435,7 @@ class AcmeMPO:
             num_samples=self._num_samples,
             target_policy_update_period=self._target_policy_update_period,
             target_critic_update_period=self._target_critic_update_period,
+            policy_loss_module=policy_loss_module,
             dataset=dataset,
             counter=counter,
             logger=logger,
@@ -781,7 +456,7 @@ class AcmeMPO:
         environment = _make_environment(
             domain_name=_DOMAIN.value, task_name=_TASK.value
         )
-        agent_networks = make_networks(action_spec)
+        agent_networks = self._network_factory(action_spec)
 
         # Create a stochastic behavior policy.
         behavior_modules = [
@@ -806,16 +481,19 @@ class AcmeMPO:
         # assigning variables before running the environment loop.
         variable_client.update_and_wait()
 
-        adder = NStepTransitionAdder(
+        # Component to add things into replay.
+        adder = adders.NStepTransitionAdder(
             client=replay, n_step=self._n_step, discount=self._additional_discount
         )
 
+        # Create the agent.
         actor = FeedForwardActor(
             policy_network=behavior_network,
             adder=adder,
             variable_client=variable_client,
         )
 
+        # Create logger and counter; actors will not spam bigtable.
         counter = counting.Counter(counter, "actor")
         logger = loggers.make_default_logger(
             "actor",
@@ -824,6 +502,7 @@ class AcmeMPO:
             steps_key="actor_steps",
         )
 
+        # Create the run loop and return it.
         return EnvironmentLoop(environment, actor, counter, logger)
 
     def evaluator(
@@ -831,8 +510,6 @@ class AcmeMPO:
         variable_source: acme.VariableSource,
         counter: counting.Counter,
     ):
-        """The evaluation process."""
-
         action_spec = self._environment_spec.actions
         observation_spec = self._environment_spec.observations
 
@@ -840,7 +517,7 @@ class AcmeMPO:
         environment = _make_environment(
             domain_name=_DOMAIN.value, task_name=_TASK.value
         )
-        agent_networks = make_networks(action_spec)
+        agent_networks = self._network_factory(action_spec)
 
         # Create a stochastic behavior policy.
         evaluator_modules = [
@@ -879,34 +556,33 @@ class AcmeMPO:
             "evaluator", time_delta=self._log_every, steps_key="evaluator_steps"
         )
 
-        # Create the run loop and return it.
         return EnvironmentLoop(environment, evaluator, counter, logger)
 
-    def build(self, name="mpo"):
-        """Build the distributed agent topology."""
-        program = lp.Program(name=name)
+    def run(self):
+        counter = counting.Counter()
+        server = reverb.Server(tables=self.replay())
+        client = reverb.Client(f"localhost:{server.port}")
+        learner = self.learner(client, counter)
+        actor = self.actor(client, learner, counter)
+        evaluator = self.evaluator(learner, counter)
+        threads = [
+            threading.Thread(
+                target=learner.run,
+                kwargs={"num_steps": self._max_actor_steps},
+                daemon=True,
+            ),
+            threading.Thread(
+                target=actor.run,
+                kwargs={"num_steps": self._max_actor_steps},
+                daemon=True,
+            ),
+            threading.Thread(target=evaluator.run, daemon=True),
+        ]
 
-        with program.group("replay"):
-            replay = program.add_node(lp.ReverbNode(self.replay))
-
-        with program.group("counter"):
-            counter = program.add_node(lp.CourierNode(self.counter))
-
-            if self._max_actor_steps:
-                _ = program.add_node(
-                    lp.CourierNode(self.coordinator, counter, self._max_actor_steps)
-                )
-
-        with program.group("learner"):
-            learner = program.add_node(lp.CourierNode(self.learner, replay, counter))
-
-        with program.group("evaluator"):
-            program.add_node(lp.CourierNode(self.evaluator, learner, counter))
-
-        with program.group("actor"):
-            program.add_node(lp.CourierNode(self.actor, replay, learner, counter))
-
-        return program
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
 
 """Implements the MPO losses.
@@ -1367,8 +1043,7 @@ def compute_parametric_kl_penalty_and_dual_loss(
     return loss_kl, loss_alpha
 
 
-class MPOLearner(acme.Learner):
-    """MPO learner."""
+class MPOLearner(acme.VariableSource):
 
     def __init__(
         self,
@@ -1381,17 +1056,18 @@ class MPOLearner(acme.Learner):
         target_policy_update_period: int,
         target_critic_update_period: int,
         dataset: tf.data.Dataset,
+        counter: counting.Counter,
         observation_network: types.TensorTransformation = tf.identity,
         target_observation_network: types.TensorTransformation = tf.identity,
+        policy_loss_module: Optional[snt.Module] = None,
         policy_optimizer: Optional[snt.Optimizer] = None,
         critic_optimizer: Optional[snt.Optimizer] = None,
         dual_optimizer: Optional[snt.Optimizer] = None,
         clipping: bool = True,
-        counter: Optional[counting.Counter] = None,
         logger: Optional[loggers.Logger] = None,
     ):
 
-        self._counter = counter or counting.Counter()
+        self._counter = counter
         self._logger = logger or loggers.make_default_logger("learner")
         self._discount = discount
         self._num_samples = num_samples
@@ -1418,7 +1094,7 @@ class MPOLearner(acme.Learner):
             target_observation_network
         )
 
-        self._policy_loss_module = MPOLoss(
+        self._policy_loss_module = policy_loss_module or MPOLoss(
             epsilon=1e-1,
             epsilon_penalty=1e-3,
             epsilon_mean=2.5e-3,
@@ -1447,6 +1123,13 @@ class MPOLearner(acme.Learner):
         # fill the replay buffer.
         self._timestamp = None
 
+    def run(self, num_steps: Optional[int] = None) -> None:
+
+        iterator = range(num_steps) if num_steps is not None else itertools.count()
+
+        for _ in iterator:
+        self.step()
+        
     @tf.function
     def _step(self) -> types.Nest:
         # Update target network.
@@ -1585,6 +1268,9 @@ class MPOLearner(acme.Learner):
         # Update our counts and record it.
         counts = self._counter.increment(steps=1, walltime=elapsed_time)
         fetches.update(counts)
+
+        wandb.log(fetches)
+
         self._logger.write(fetches)
 
     def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:
@@ -1660,10 +1346,8 @@ class MultivariateNormalDiagHead(snt.Module):
         init_scale: float = 0.3,
         min_scale: float = 1e-6,
         tanh_mean: bool = False,
-        fixed_scale: bool = False,
-        use_tfd_independent: bool = False,
-        w_init: snt_init.Initializer = tf.initializers.VarianceScaling(1e-4),
-        b_init: snt_init.Initializer = tf.initializers.Zeros(),
+        w_init=tf.initializers.VarianceScaling(1e-4),
+        b_init=tf.initializers.Zeros(),
     ):
         """Initialization.
 
@@ -1673,9 +1357,6 @@ class MultivariateNormalDiagHead(snt.Module):
           min_scale: Minimum standard deviation.
           tanh_mean: Whether to transform the mean (via tanh) before passing it to
             the distribution.
-          fixed_scale: Whether to use a fixed variance.
-          use_tfd_independent: Whether to use tfd.Independent or
-            tfd.MultivariateNormalDiag class
           w_init: Initialization for linear layer weights.
           b_init: Initialization for linear layer biases.
         """
@@ -1684,31 +1365,21 @@ class MultivariateNormalDiagHead(snt.Module):
         self._min_scale = min_scale
         self._tanh_mean = tanh_mean
         self._mean_layer = snt.Linear(num_dimensions, w_init=w_init, b_init=b_init)
-        self._fixed_scale = fixed_scale
+        self._scale_layer = snt.Linear(num_dimensions, w_init=w_init, b_init=b_init)
 
-        if not fixed_scale:
-            self._scale_layer = snt.Linear(num_dimensions, w_init=w_init, b_init=b_init)
-        self._use_tfd_independent = use_tfd_independent
-
-    def __call__(self, inputs: tf.Tensor) -> tfd.Distribution:
+    def __call__(self, inputs: tf.Tensor):
         zero = tf.constant(0, dtype=inputs.dtype)
         mean = self._mean_layer(inputs)
 
-        if self._fixed_scale:
-            scale = tf.ones_like(mean) * self._init_scale
-        else:
-            scale = tf.nn.softplus(self._scale_layer(inputs))
-            scale *= self._init_scale / tf.nn.softplus(zero)
-            scale += self._min_scale
+        scale = tf.nn.softplus(self._scale_layer(inputs))
+        scale *= self._init_scale / tf.nn.softplus(zero)
+        scale += self._min_scale
 
         # Maybe transform the mean.
         if self._tanh_mean:
             mean = tf.tanh(mean)
 
-        if self._use_tfd_independent:
-            dist = tfd.Independent(tfd.Normal(loc=mean, scale=scale))
-        else:
-            dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=scale)
+        dist = tfd.Independent(tfd.Normal(loc=mean, scale=scale))
 
         return dist
 
@@ -1797,9 +1468,7 @@ def make_networks(
     policy_network = snt.Sequential(
         [
             LayerNormMLP(policy_layer_sizes, activate_final=True),
-            MultivariateNormalDiagHead(
-                num_dimensions, init_scale=0.7, use_tfd_independent=True
-            ),
+            MultivariateNormalDiagHead(num_dimensions, init_scale=0.7),
         ]
     )
 
@@ -1821,33 +1490,34 @@ def make_networks(
 
 
 def _make_environment(
-    evaluation: bool = False,
     domain_name: str = "cartpole",
     task_name: str = "balance",
-    num_action_repeats: Optional[int] = None,
 ) -> dm_env.Environment:
-    """Implements a control suite environment factory."""
-    # Load raw control suite environment.
     environment = suite.load(domain_name, task_name)
-
     environment = wrappers.CanonicalSpecWrapper(environment, clip=True)
-
-    if num_action_repeats:
-        environment = wrappers.ActionRepeatWrapper(
-            environment, num_repeats=num_action_repeats
-        )
     environment = wrappers.SinglePrecisionWrapper(environment)
-
     return environment
 
 
 def main(_):
-    program_builder = AcmeMPO(
+    wandb.init(
+        entity="adrian-research",
+        group=_DOMAIN.value + "_" + _TASK.value,
+        project="lp_mpo_single_file",
+        config={
+            "domain": _DOMAIN.value,
+            "task": _TASK.value,
+            "max_actor_steps": _MAX_ACTOR_STEPS.value,
+        },
+    )
+
+    program_builder = MPO(
+        network_factory=make_networks,
         target_policy_update_period=25,
         max_actor_steps=_MAX_ACTOR_STEPS.value,
     )
 
-    lp.launch(programs=program_builder.build())
+    program_builder.run()
 
 
 if __name__ == "__main__":
