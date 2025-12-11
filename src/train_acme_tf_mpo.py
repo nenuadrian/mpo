@@ -803,7 +803,7 @@ class MPO:
             variable_client=variable_client,
         )
 
-        return EnvironmentLoop(environment, evaluator, counter, logger)
+        return EnvironmentLoop(environment, counter, logger, observers=[evaluator])
 
     def run(self):
         counter = counting.Counter()
