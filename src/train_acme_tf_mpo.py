@@ -1692,6 +1692,36 @@ class CanonicalSinglePrecisionWrapper(dm_env.Environment):
         return tree.map_structure(_convert_single_value, nested_value)
 
 
+def _scale_nested_action(
+    nested_action,
+    nested_spec,
+    clip: bool,
+):
+    """Converts a canonical nested action back to the given nested action spec."""
+
+    def _scale_action(action: np.ndarray, spec: specs.Array):
+        """Converts a single canonical action back to the given action spec."""
+        if isinstance(spec, specs.BoundedArray):
+            # Get scale and offset of output action spec.
+            scale = spec.maximum - spec.minimum
+            offset = spec.minimum
+
+            # Maybe clip the action.
+            if clip:
+                action = np.clip(action, -1.0, 1.0)
+
+            # Map action to [0, 1].
+            action = 0.5 * (action + 1.0)
+
+            # Map action to [spec.minimum, spec.maximum].
+            action *= scale
+            action += offset
+
+        return action
+
+    return tree.map_structure(_scale_action, nested_action, nested_spec)
+
+
 def _make_environment(
     domain_name: str = "cartpole",
     task_name: str = "balance",
