@@ -243,16 +243,6 @@ class EnvironmentSpec(NamedTuple):
     discounts: Any
 
 
-def make_environment_spec(environment: dm_env.Environment) -> EnvironmentSpec:
-    """Returns an `EnvironmentSpec` describing values used by an environment."""
-    return EnvironmentSpec(
-        observations=environment.observation_spec(),
-        actions=environment.action_spec(),
-        rewards=environment.reward_spec(),
-        discounts=environment.discount_spec(),
-    )
-
-
 class MPOLearner:
 
     def __init__(
@@ -663,28 +653,6 @@ class EnvironmentLoop:
         num_episodes: Optional[int] = None,
         num_steps: Optional[int] = None,
     ) -> int:
-        """Perform the run loop.
-
-        Run the environment loop either for `num_episodes` episodes or for at
-        least `num_steps` steps (the last episode is always run until completion,
-        so the total number of steps may be slightly more than `num_steps`).
-        At least one of these two arguments has to be None.
-
-        Upon termination of an episode a new episode will be started. If the number
-        of episodes and the number of steps are not given then this will interact
-        with the environment infinitely.
-
-        Args:
-          num_episodes: number of episodes to run the loop for.
-          num_steps: minimal number of steps to run the loop for.
-
-        Returns:
-          Actual number of steps the loop executed.
-
-        Raises:
-          ValueError: If both 'num_episodes' and 'num_steps' are not None.
-        """
-
         if not (num_episodes is None or num_steps is None):
             raise ValueError('Either "num_episodes" or "num_steps" should be None.')
 
@@ -739,11 +707,15 @@ class MPO:
     ):
 
         if environment_spec is None:
-            environment_spec = make_environment_spec(
-                _make_environment(
-                    domain_name=_DOMAIN.value,
-                    task_name=_TASK.value,
-                )
+            environment = _make_environment(
+                domain_name=_DOMAIN.value,
+                task_name=_TASK.value,
+            )
+            environment_spec = EnvironmentSpec(
+                observations=environment.observation_spec(),
+                actions=environment.action_spec(),
+                rewards=environment.reward_spec(),
+                discounts=environment.discount_spec(),
             )
 
         self._network_factory = network_factory
