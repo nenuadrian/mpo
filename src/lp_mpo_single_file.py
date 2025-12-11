@@ -841,6 +841,9 @@ class MPO:
         client = reverb.Client(f'localhost:{server.port}')
 
         learner = self.learner(client, counter)
+        learner.run(num_steps=self._max_actor_steps)
+
+
         actor = self.actor(client, learner, counter)
         
         actor.run(num_steps=self._max_actor_steps)
@@ -1321,6 +1324,7 @@ class MPOLearner(acme.Learner):
         target_policy_update_period: int,
         target_critic_update_period: int,
         dataset: tf.data.Dataset,
+        counter:counting.Counter,
         observation_network: types.TensorTransformation = tf.identity,
         target_observation_network: types.TensorTransformation = tf.identity,
         policy_loss_module: Optional[snt.Module] = None,
@@ -1328,11 +1332,10 @@ class MPOLearner(acme.Learner):
         critic_optimizer: Optional[snt.Optimizer] = None,
         dual_optimizer: Optional[snt.Optimizer] = None,
         clipping: bool = True,
-        counter: Optional[counting.Counter] = None,
         logger: Optional[loggers.Logger] = None,
     ):
 
-        self._counter = counter or counting.Counter()
+        self._counter = counter
         self._logger = logger or loggers.make_default_logger("learner")
         self._discount = discount
         self._num_samples = num_samples
