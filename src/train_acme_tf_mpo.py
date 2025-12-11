@@ -53,6 +53,59 @@ _TASK = flags.DEFINE_string("task", "balance", "Control suite task name.")
 _MPO_FLOAT_EPSILON = 1e-8
 
 
+class Logger(Protocol):
+    def write(self, values: Mapping[str, Any]) -> None:
+        pass
+
+
+class _StdoutLogger(Logger):
+    def __init__(
+        self,
+        label: str,
+        *,
+        time_delta: float = 0.0,
+        steps_key: Optional[str] = None,
+        save_data: bool = True,
+    ):
+        self._label = label
+        self._time_delta = max(time_delta or 0.0, 0.0)
+        self._steps_key = steps_key
+        self._save_data = save_data
+        self._last_log_time = 0.0
+        self._buffer: List[Mapping[str, Any]] = [] if save_data else []
+
+    def write(self, values: Mapping[str, Any]) -> None:
+        now = time.time()
+        if self._time_delta and self._last_log_time:
+            if now - self._last_log_time < self._time_delta:
+                if self._steps_key and values.get(self._steps_key) is None:
+                    return
+        self._last_log_time = now
+        payload = dict(values)
+        if self._save_data:
+            self._buffer.append(payload)
+        print(f"[{self._label}] {payload}")
+
+    @property
+    def data(self) -> Sequence[Mapping[str, Any]]:
+        return list(self._buffer)
+
+
+def make_default_logger(
+    label: str,
+    *,
+    time_delta: float = 0.0,
+    steps_key: Optional[str] = None,
+    save_data: bool = True,
+) -> Logger:
+    return _StdoutLogger(
+        label,
+        time_delta=time_delta,
+        steps_key=steps_key,
+        save_data=save_data,
+    )
+
+
 def make_reverb_dataset(
     server_address: str,
     batch_size: Optional[int] = None,
@@ -394,7 +447,7 @@ class EvaluatorActor:
         self._update_period = update_period
 
     @tf.function
-    def _policy(self, observation: NestedTensor) -> NestedTensor:
+    def _policy(self, observation):
         # Add a dummy batch dimension and as a side effect convert numpy to TF.
         batched_observation = tf2_utils.add_batch_dim(observation)
 
@@ -450,7 +503,7 @@ class FeedForwardActor:
         self._update_period = update_period
 
     @tf.function
-    def _policy(self, observation: NestedTensor) -> NestedTensor:
+    def _policy(self, observation):
         # Add a dummy batch dimension and as a side effect convert numpy to TF.
         batched_observation = tf2_utils.add_batch_dim(observation)
 
@@ -1489,16 +1542,16 @@ class CriticMultiplexer(snt.Module):
 
     def __init__(
         self,
-        critic_network: Optional[TensorTransformation] = None,
-        observation_network: Optional[TensorTransformation] = None,
-        action_network: Optional[TensorTransformation] = None,
+        critic_network: Optional[Any] = None,
+        observation_network: Optional[Any] = None,
+        action_network: Optional[Any] = None,
     ):
         self._critic_network = critic_network
         self._observation_network = observation_network
         self._action_network = action_network
         super().__init__(name="critic_multiplexer")
 
-    def __call__(self, observation: NestedTensor, action: NestedTensor) -> tf.Tensor:
+    def __call__(self, observation, action) -> tf.Tensor:
 
         # Maybe transform observations and actions before feeding them on.
         if self._observation_network:
@@ -1537,7 +1590,7 @@ def make_networks(
     action_spec: specs.BoundedArray,
     policy_layer_sizes: Sequence[int] = (256, 256, 256),
     critic_layer_sizes: Sequence[int] = (512, 512, 256),
-) -> Dict[str, TensorTransformation]:
+) -> Dict[str, Any]:
     """Creates networks used by the agent."""
 
     num_dimensions = np.prod(action_spec.shape, dtype=int)
@@ -1574,59 +1627,6 @@ def _make_environment(
     environment = wrappers.CanonicalSpecWrapper(environment, clip=True)
     environment = wrappers.SinglePrecisionWrapper(environment)
     return environment
-
-
-class Logger(Protocol):
-    def write(self, values: Mapping[str, Any]) -> None:
-        pass
-
-
-class _StdoutLogger(Logger):
-    def __init__(
-        self,
-        label: str,
-        *,
-        time_delta: float = 0.0,
-        steps_key: Optional[str] = None,
-        save_data: bool = True,
-    ):
-        self._label = label
-        self._time_delta = max(time_delta or 0.0, 0.0)
-        self._steps_key = steps_key
-        self._save_data = save_data
-        self._last_log_time = 0.0
-        self._buffer: List[Mapping[str, Any]] = [] if save_data else []
-
-    def write(self, values: Mapping[str, Any]) -> None:
-        now = time.time()
-        if self._time_delta and self._last_log_time:
-            if now - self._last_log_time < self._time_delta:
-                if self._steps_key and values.get(self._steps_key) is None:
-                    return
-        self._last_log_time = now
-        payload = dict(values)
-        if self._save_data:
-            self._buffer.append(payload)
-        print(f"[{self._label}] {payload}")
-
-    @property
-    def data(self) -> Sequence[Mapping[str, Any]]:
-        return list(self._buffer)
-
-
-def make_default_logger(
-    label: str,
-    *,
-    time_delta: float = 0.0,
-    steps_key: Optional[str] = None,
-    save_data: bool = True,
-) -> Logger:
-    return _StdoutLogger(
-        label,
-        time_delta=time_delta,
-        steps_key=steps_key,
-        save_data=save_data,
-    )
 
 
 def main(_):
