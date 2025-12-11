@@ -4,7 +4,7 @@ import copy
 import math
 import random
 import time
-from typing import Tuple, cast
+from typing import Tuple, cast, Dict, Union
 import os
 import json
 
@@ -154,225 +154,412 @@ class CriticNetwork(nn.Module):
         return x.squeeze(-1)
 
 
+def _diag_normal_kl(
+    p_mean: torch.Tensor,
+    p_std: torch.Tensor,
+    q_mean: torch.Tensor,
+    q_std: torch.Tensor,
+    per_dim: bool,
+) -> torch.Tensor:
+    """
+    KL( N(p_mean, p_std^2) || N(q_mean, q_std^2) ) for diagonal Gaussians.
+
+    Shapes:
+        p_mean, p_std, q_mean, q_std: [B, D]
+    If per_dim = True:
+        return [B, D] (no sum over D)
+    If per_dim = False:
+        return [B]    (sum over D)
+    """
+    # all shapes [B, D]
+    var_p = p_std.pow(2)
+    var_q = q_std.pow(2)
+    diff = q_mean - p_mean
+
+    # Element-wise KL
+    # KL = log(σ_q/σ_p) + (σ_p^2 + (μ_p-μ_q)^2) / (2 σ_q^2) - 1/2
+    log_term = torch.log(q_std / p_std)
+    frac_term = (var_p + diff.pow(2)) / (2.0 * var_q)
+    kl_elem = log_term + frac_term - 0.5  # [B, D]
+
+    if per_dim:
+        return kl_elem  # [B, D]
+    else:
+        return kl_elem.sum(dim=-1)  # [B]
+
+
+def compute_weights_and_temperature_loss(
+    q_values: torch.Tensor,  # [N, B]
+    epsilon: float,
+    temperature: torch.Tensor,  # scalar > 0
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    PyTorch version of compute_weights_and_temperature_loss.
+
+    Returns:
+        normalized_weights: [N, B]
+        loss_temperature: scalar
+    """
+
+    # Temper Q-values; no gradient flows back into Q for the E-step dual update
+    tempered_q_values = q_values.detach() / temperature
+
+    # Softmax along action-sample dimension N
+    normalized_weights = torch.softmax(tempered_q_values, dim=0).detach()
+
+    # Dual loss for temperature (E-step Lagrange multiplier)
+    # logsumexp over actions, averaged over batch
+    q_logsumexp = torch.logsumexp(tempered_q_values, dim=0)  # [B]
+    log_num_actions = math.log(q_values.shape[0])
+
+    loss_temperature_inner = epsilon + q_logsumexp.mean() - log_num_actions  # scalar
+    loss_temperature = temperature * loss_temperature_inner
+
+    return normalized_weights, loss_temperature
+
+
+def compute_nonparametric_kl_from_normalized_weights(
+    normalized_weights: torch.Tensor,  # [N, B]
+) -> torch.Tensor:
+    """
+    Estimate KL between non-parametric policy and target policy, from normalized weights.
+
+    Returns:
+        kl_nonparametric: [B]
+    """
+    num_action_samples = float(normalized_weights.shape[0])
+    integrand = torch.log(num_action_samples * normalized_weights + 1e-8)  # [N, B]
+    return (normalized_weights * integrand).sum(dim=0)  # [B]
+
+
+def compute_cross_entropy_loss(
+    sampled_actions: torch.Tensor,  # [N, B, D]
+    normalized_weights: torch.Tensor,  # [N, B]
+    online_action_distribution: dist.Distribution,  # Independent(Normal)
+) -> torch.Tensor:
+    """
+    PyTorch version of compute_cross_entropy_loss.
+
+    Returns:
+        scalar: mean over batch of the weighted negative log-prob.
+    """
+    # log_prob: [N, B]
+    log_prob = online_action_distribution.log_prob(sampled_actions)
+
+    # Weighted sum over actions (N), then mean over batch (B)
+    loss_policy_gradient = -(log_prob * normalized_weights).sum(dim=0)  # [B]
+    return loss_policy_gradient.mean()  # scalar
+
+
+def compute_parametric_kl_penalty_and_dual_loss(
+    kl: torch.Tensor,  # [B, D] or [B]
+    alpha: torch.Tensor,  # [D] or [1], nn.Parameter (after softplus)
+    epsilon: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    PyTorch version of compute_parametric_kl_penalty_and_dual_loss.
+
+    Returns:
+        loss_kl: scalar (alpha-weighted KL regularizer)
+        loss_alpha: scalar (dual loss for alpha)
+    """
+    # Mean over batch
+    mean_kl = kl.mean(dim=0)  # [D] or [1]
+
+    # KL regularization uses stop_gradient(alpha)
+    loss_kl = (alpha.detach() * mean_kl).sum()
+
+    # Dual loss updates alpha but does not backprop through mean_kl
+    loss_alpha = (alpha * (epsilon - mean_kl.detach())).sum()
+
+    return loss_kl, loss_alpha
+
+
+_MPO_FLOAT_EPSILON = 1e-8
+
+
 class MPOLoss(nn.Module):
     """
-    MPO loss with dual variables:
-      - temperature (scalar)
-      - alpha_mean (per-dim or scalar)
-      - alpha_stddev (per-dim or scalar)
-    Includes optional MO-MPO action penalization.
+    PyTorch translation of the Sonnet MPOLoss with decoupled KL constraints.
+
+    This expects Gaussian policies represented as Independent(Normal).
     """
 
     def __init__(
         self,
+        epsilon: float,
+        epsilon_mean: float,
+        epsilon_stddev: float,
+        init_log_temperature: float,
+        init_log_alpha_mean: float,
+        init_log_alpha_stddev: float,
         action_dim: int,
         per_dim_constraining: bool = True,
         action_penalization: bool = True,
-        epsilon: float = 0.1,
-        epsilon_mean: float = 0.02,
-        epsilon_stddev: float = 0.02,
-        epsilon_penalty: float = 0.01,
-        init_log_temperature: float = 0.0,
-        init_log_alpha_mean: float = 0.0,
-        init_log_alpha_stddev: float = 0.0,  # was 1000 in acme
-        min_log: float = -10.0,
+        epsilon_penalty: float = 0.001,
+        dtype: torch.dtype = torch.float32,
+        device: Union[torch.device, str] = "cpu",
     ):
+        """
+        Args:
+            epsilon: KL constraint for non-parametric policy (temperature).
+            epsilon_mean: KL constraint for mean.
+            epsilon_stddev: KL constraint for stddev.
+            init_log_temperature: initial log-temperature (softplus parametrization).
+            init_log_alpha_mean: initial log-alpha for mean constraint.
+            init_log_alpha_stddev: initial log-alpha for stddev constraint.
+            action_dim: dimensionality of action space D.
+            per_dim_constraining: if True, constrain KL per dimension, else overall.
+            action_penalization: use MO-MPO penalty for |a| > 1.
+            epsilon_penalty: KL constraint for action penalty.
+            dtype, device: standard Torch options.
+        """
         super().__init__()
-        self.action_dim = action_dim
-        self.per_dim = per_dim_constraining
-        self.action_penalization = action_penalization
-        self._epsilon = epsilon
-        self._epsilon_mean = epsilon_mean
-        self._epsilon_stddev = epsilon_stddev
-        self._epsilon_penalty = epsilon_penalty
-        self._min_log = min_log
 
-        # dual variables (log-space)
-        self.log_temperature = nn.Parameter(
-            torch.tensor([init_log_temperature], dtype=torch.float32)
+        self._epsilon = float(epsilon)
+        self._epsilon_mean = float(epsilon_mean)
+        self._epsilon_stddev = float(epsilon_stddev)
+        self._epsilon_penalty = float(epsilon_penalty)
+
+        self._per_dim_constraining = per_dim_constraining
+        self._action_penalization = action_penalization
+
+        # Register epsilons as buffers so they move with .to(...)
+        self.register_buffer(
+            "epsilon", torch.tensor(self._epsilon, dtype=dtype, device=device)
         )
-        alpha_shape = (action_dim,) if self.per_dim else (1,)
+        self.register_buffer(
+            "epsilon_mean", torch.tensor(self._epsilon_mean, dtype=dtype, device=device)
+        )
+        self.register_buffer(
+            "epsilon_stddev",
+            torch.tensor(self._epsilon_stddev, dtype=dtype, device=device),
+        )
+        if self._action_penalization:
+            self.register_buffer(
+                "epsilon_penalty",
+                torch.tensor(self._epsilon_penalty, dtype=dtype, device=device),
+            )
+
+        # Dual variables in log space
+        self.log_temperature = nn.Parameter(
+            torch.tensor([init_log_temperature], dtype=dtype, device=device)
+        )
+
+        alpha_shape = (action_dim,) if per_dim_constraining else (1,)
+
         self.log_alpha_mean = nn.Parameter(
-            torch.full(alpha_shape, init_log_alpha_mean, dtype=torch.float32)
+            torch.full(alpha_shape, init_log_alpha_mean, dtype=dtype, device=device)
         )
         self.log_alpha_stddev = nn.Parameter(
-            torch.full(alpha_shape, init_log_alpha_stddev, dtype=torch.float32)
+            torch.full(alpha_shape, init_log_alpha_stddev, dtype=dtype, device=device)
         )
-        if self.action_penalization:
+
+        if self._action_penalization:
             self.log_penalty_temperature = nn.Parameter(
-                torch.tensor([init_log_temperature], dtype=torch.float32)
+                torch.tensor([init_log_temperature], dtype=dtype, device=device)
             )
+
+        self.min_log_temperature = torch.tensor(-18.0, dtype=dtype, device=device)
+        self.min_log_alpha = torch.tensor(-18.0, dtype=dtype, device=device)
 
     def forward(
         self,
+        actions: torch.Tensor,  # [N, B, D]
+        q_values: torch.Tensor,  # [N, B]
         online_mean: torch.Tensor,
         online_scale: torch.Tensor,
         target_mean: torch.Tensor,
         target_scale: torch.Tensor,
-        sampled_actions: torch.Tensor,  # [N,B,D]
-        q_values: torch.Tensor,  # [N,B]
-    ):
-        # ensure positivity with softplus, clamp logs to avoid extreme negatives
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute the MPO loss and diagnostics.
+
+        Args:
+            online_action_distribution: online policy; batch [B], event [D].
+            target_action_distribution: target policy; same shapes.
+            actions: actions sampled from target policy; [N, B, D].
+            q_values: Q(s, a); [N, B].
+
+        Returns:
+            loss: scalar MPO loss.
+            stats: dict of scalars / small tensors for logging.
+        """
+
+        dtype = q_values.dtype
+
+        # Clamp dual variables in log-space for stability
         with torch.no_grad():
-            self.log_temperature.data.clamp_(min=self._min_log, max=10.0)
-            self.log_alpha_mean.data.clamp_(min=self._min_log, max=10.0)
-            self.log_alpha_stddev.data.clamp_(min=self._min_log, max=10.0)
-            if self.action_penalization:
-                self.log_penalty_temperature.data.clamp_(min=self._min_log, max=10.0)
-
-        temperature = F.softplus(self.log_temperature) + 1e-8  # scalar
-        alpha_mean = F.softplus(self.log_alpha_mean) + 1e-8  # (D,) or (1,)
-        alpha_std = F.softplus(self.log_alpha_stddev) + 1e-8
-
-        N, B, D = sampled_actions.shape
-
-        # E-step: tempered Q-values -> normalized weights
-        tempered_q = q_values.detach() / temperature  # [N,B]
-        normalized_weights = torch.softmax(tempered_q, dim=0).detach()  # [N,B]
-
-        # temperature dual loss (matches TF math)
-        q_logsumexp = torch.logsumexp(tempered_q, dim=0)  # [B]
-        log_num_actions = math.log(float(N))
-        loss_temperature = (
-            self._epsilon + q_logsumexp.mean() - log_num_actions
-        ) * temperature
-
-        if self.action_penalization:
-            penalty_temperature = F.softplus(self.log_penalty_temperature) + 1e-8
-            diff_out = sampled_actions - sampled_actions.clamp(-1.0, 1.0)
-            cost = -torch.norm(diff_out, dim=-1)  # [N,B]
-            penalty_tempered = cost.detach() / penalty_temperature
-            penalty_w = torch.softmax(penalty_tempered, dim=0).detach()
-            penalty_q_logsumexp = torch.logsumexp(penalty_tempered, dim=0)
-            loss_penalty_temp = (
-                self._epsilon_penalty + penalty_q_logsumexp.mean() - math.log(float(N))
-            ) * penalty_temperature
-            normalized_weights = normalized_weights + penalty_w
-            normalized_weights = normalized_weights / (
-                normalized_weights.sum(dim=0, keepdim=True) + 1e-12
+            self.log_temperature.data = torch.maximum(
+                self.log_temperature.data, self.min_log_temperature.to(dtype)
             )
-            loss_temperature = loss_temperature + loss_penalty_temp
-
-        # Decompose online policy into fixed-std and fixed-mean distributions
-        fixed_std_mean = online_mean  # for fixed std distribution (mean variable)
-        fixed_std_scale = target_scale
-        fixed_mean_mean = target_mean
-        fixed_mean_scale = online_scale
-
-        loss_policy_mean = weighted_cross_entropy(
-            fixed_std_mean, fixed_std_scale, N, sampled_actions, normalized_weights
-        )
-        loss_policy_std = weighted_cross_entropy(
-            fixed_mean_mean, fixed_mean_scale, N, sampled_actions, normalized_weights
-        )
-
-        kl_mean = kl_between_diag_normals(
-            fixed_std_mean, fixed_std_scale, target_mean, target_scale, self.per_dim
-        )
-        kl_std = kl_between_diag_normals(
-            fixed_mean_mean, fixed_mean_scale, target_mean, target_scale, self.per_dim
-        )
-
-        if not self.per_dim:
-            kl_mean = kl_mean.sum(dim=-1, keepdim=True)  # [B,1]
-            kl_std = kl_std.sum(dim=-1, keepdim=True)
-
-        mean_kl = kl_mean.mean(dim=0)  # (D,) or (1,)
-        std_kl = kl_std.mean(dim=0)
-
-        # alpha-weighted KL penalties and dual losses
-        loss_kl_mean = (alpha_mean.detach() * mean_kl).sum()
-        loss_kl_std = (alpha_std.detach() * std_kl).sum()
-
-        loss_alpha_mean = (alpha_mean * (self._epsilon_mean - mean_kl.detach())).sum()
-        loss_alpha_std = (alpha_std * (self._epsilon_stddev - std_kl.detach())).sum()
-
-        loss_policy = loss_policy_mean + loss_policy_std
-        loss_kl_penalty = loss_kl_mean + loss_kl_std
-        loss_dual = loss_alpha_mean + loss_alpha_std + loss_temperature
-
-        if self.action_penalization:
-            penalty_temperature = F.softplus(self.log_penalty_temperature) + 1e-8
-            diff_out = sampled_actions - sampled_actions.clamp(-1.0, 1.0)
-            cost = -torch.norm(diff_out, dim=-1)  # [N,B]
-            penalty_tempered = cost.detach() / penalty_temperature
-            penalty_weights = torch.softmax(penalty_tempered, dim=0).detach()
-            penalty_q_logsumexp = torch.logsumexp(penalty_tempered, dim=0)
-            loss_penalty_temp = (
-                self._epsilon_penalty + penalty_q_logsumexp.mean() - math.log(float(N))
-            ) * penalty_temperature
-            penalty_ce = weighted_cross_entropy(
-                fixed_mean_mean,
-                fixed_mean_scale,
-                N,
-                sampled_actions,
-                penalty_weights,
+            self.log_alpha_mean.data = torch.maximum(
+                self.log_alpha_mean.data, self.min_log_alpha.to(dtype)
             )
-            loss_policy = loss_policy + penalty_ce
-            loss_temperature = loss_temperature + loss_penalty_temp
-
-        loss = loss_policy + loss_kl_penalty + loss_dual
-
-        # Diagnostics: compute non-parametric KL and other stats (match TF)
-        with torch.no_grad():
-            # non-parametric KL estimate: KL(nonparam || target) per-batch
-            eps = 1e-8
-            num_actions = float(N)
-            integrand = torch.log(num_actions * normalized_weights + eps)
-            kl_nonparametric = (normalized_weights * integrand).sum(dim=0)  # [B]
-
-            stats = {
-                "train/dual_alpha_mean": float(alpha_mean.mean().item()),
-                "train/dual_alpha_stddev": float(alpha_std.mean().item()),
-                "train/dual_temperature": float(temperature.item()),
-                "train/loss_policy": float(loss_policy.item()),
-                "train/loss_alpha": float((loss_alpha_mean + loss_alpha_std).item()),
-                "train/loss_temperature": float(loss_temperature.item()),
-                "train/kl_q_rel": float(
-                    kl_nonparametric.mean().item() / float(self._epsilon)
-                ),
-            }
-
-            # Q stats
-            stats["train/q_min"] = float(q_values.min(dim=0)[0].mean().item())
-            stats["train/q_max"] = float(q_values.max(dim=0)[0].mean().item())
-
-            # pi stddev stats: online_scale shape is [B,D]
-            pi_stddev = online_scale.detach()
-            pi_std_min = pi_stddev.min(dim=-1)[0]  # [B]
-            pi_std_max = pi_stddev.max(dim=-1)[0]  # [B]
-            stats["train/pi_stddev_min"] = float(pi_std_min.mean().item())
-            stats["train/pi_stddev_max"] = float(pi_std_max.mean().item())
-            # condition number: mean over batch of (max/min)
-            cond = (pi_std_max / (pi_std_min + 1e-12)).mean().item()
-            stats["train/pi_stddev_cond"] = float(cond)
-
-            # KL mean/std relative
-            stats["train/kl_mean_rel"] = float(
-                mean_kl.mean().item() / float(self._epsilon_mean)
+            self.log_alpha_stddev.data = torch.maximum(
+                self.log_alpha_stddev.data, self.min_log_alpha.to(dtype)
             )
-            stats["train/kl_stddev_rel"] = float(
-                std_kl.mean().item() / float(self._epsilon_stddev)
-            )
-
-            if self.per_dim:
-                # per-dim min/max (match TF logging)
-                kl_mean_per_dim = kl_mean.mean(dim=0)  # [D] or [1]
-                kl_std_per_dim = kl_std.mean(dim=0)
-                stats["train/kl_mean_rel_min"] = float(
-                    kl_mean_per_dim.min().item() / float(self._epsilon_mean)
-                )
-                stats["train/kl_mean_rel_max"] = float(
-                    kl_mean_per_dim.max().item() / float(self._epsilon_mean)
-                )
-                stats["train/kl_stddev_rel_min"] = float(
-                    kl_std_per_dim.min().item() / float(self._epsilon_stddev)
-                )
-                stats["train/kl_stddev_rel_max"] = float(
-                    kl_std_per_dim.max().item() / float(self._epsilon_stddev)
+            if self._action_penalization:
+                self.log_penalty_temperature.data = torch.maximum(
+                    self.log_penalty_temperature.data,
+                    self.min_log_temperature.to(dtype),
                 )
 
-        return loss, stats
+        # Softplus (instead of exp) for numerical stability
+        temperature = F.softplus(self.log_temperature) + _MPO_FLOAT_EPSILON  # [1]
+        alpha_mean = F.softplus(self.log_alpha_mean) + _MPO_FLOAT_EPSILON  # [D] or [1]
+        alpha_stddev = F.softplus(self.log_alpha_stddev) + _MPO_FLOAT_EPSILON
+
+        # Compute normalized weights for non-parametric E-step & temperature dual loss
+        normalized_weights, loss_temperature = compute_weights_and_temperature_loss(
+            q_values=q_values,  # [N, B]
+            epsilon=float(self.epsilon.item()),
+            temperature=temperature,
+        )
+
+        # Non-parametric KL diagnostic
+        kl_nonparametric = compute_nonparametric_kl_from_normalized_weights(
+            normalized_weights
+        )  # [B]
+
+        # Optional MO-MPO action penalization
+        if self._action_penalization:
+            penalty_temperature = (
+                F.softplus(self.log_penalty_temperature) + _MPO_FLOAT_EPSILON
+            )
+
+            # Cost: 0 inside [-1,1], negative quadratic outside (we *maximize* cost)
+            diff_out_of_bound = actions - actions.clamp(-1.0, 1.0)  # [N, B, D]
+            cost_out_of_bound = -diff_out_of_bound.norm(dim=-1)  # [N, B]
+
+            penalty_normalized_weights, loss_penalty_temperature = (
+                compute_weights_and_temperature_loss(
+                    q_values=cost_out_of_bound,
+                    epsilon=float(self.epsilon_penalty.item()),
+                    temperature=penalty_temperature,
+                )
+            )
+
+            penalty_kl_nonparametric = compute_nonparametric_kl_from_normalized_weights(
+                penalty_normalized_weights
+            )
+
+            # Combine weights and temperature losses
+            normalized_weights = normalized_weights + penalty_normalized_weights
+            loss_temperature = loss_temperature + loss_penalty_temperature
+        else:
+            penalty_kl_nonparametric = None
+
+        # Decompose online policy into fixed-stddev and fixed-mean components
+        fixed_stddev_dist = dist.Independent(
+            dist.Normal(loc=online_mean, scale=target_scale), 1
+        )
+        fixed_mean_dist = dist.Independent(
+            dist.Normal(loc=target_mean, scale=online_scale), 1
+        )
+
+        # Decomposed cross-entropy policy losses (E-step → M-step)
+        loss_policy_mean = compute_cross_entropy_loss(
+            sampled_actions=actions,
+            normalized_weights=normalized_weights,
+            online_action_distribution=fixed_stddev_dist,
+        )
+        loss_policy_stddev = compute_cross_entropy_loss(
+            sampled_actions=actions,
+            normalized_weights=normalized_weights,
+            online_action_distribution=fixed_mean_dist,
+        )
+
+        # KL terms between target and decomposed policies
+        per_dim = self._per_dim_constraining
+
+        # KL for mean-constrained component
+        kl_mean = _diag_normal_kl(
+            p_mean=target_mean,
+            p_std=target_scale,
+            q_mean=fixed_stddev_dist.base_dist.loc,
+            q_std=fixed_stddev_dist.base_dist.scale,
+            per_dim=per_dim,
+        )  # [B, D] or [B]
+
+        # KL for stddev-constrained component
+        kl_stddev = _diag_normal_kl(
+            p_mean=target_mean,
+            p_std=target_scale,
+            q_mean=fixed_mean_dist.base_dist.loc,
+            q_std=fixed_mean_dist.base_dist.scale,
+            per_dim=per_dim,
+        )  # [B, D] or [B]
+
+        # Parametric KL penalization + dual losses
+        loss_kl_mean, loss_alpha_mean = compute_parametric_kl_penalty_and_dual_loss(
+            kl=kl_mean,
+            alpha=alpha_mean,
+            epsilon=float(self.epsilon_mean.item()),
+        )
+        loss_kl_stddev, loss_alpha_stddev = compute_parametric_kl_penalty_and_dual_loss(
+            kl=kl_stddev,
+            alpha=alpha_stddev,
+            epsilon=float(self.epsilon_stddev.item()),
+        )
+
+        loss_policy = loss_policy_mean + loss_policy_stddev
+        loss_kl_penalty = loss_kl_mean + loss_kl_stddev
+        loss_dual = loss_alpha_mean + loss_alpha_stddev + loss_temperature
+
+        total_loss = loss_policy + loss_kl_penalty + loss_dual
+
+        # Diagnostics
+        stats: Dict[str, Tensor] = {}
+
+        # Duals
+        stats["dual_alpha_mean"] = alpha_mean.mean()
+        stats["dual_alpha_stddev"] = alpha_stddev.mean()
+        stats["dual_temperature"] = temperature.mean()
+
+        # Loss terms
+        stats["loss_policy"] = total_loss.detach()
+        stats["loss_alpha"] = (loss_alpha_mean + loss_alpha_stddev).detach()
+        stats["loss_temperature"] = loss_temperature.detach()
+
+        # KL diagnostics
+        stats["kl_q_rel"] = kl_nonparametric.mean() / self.epsilon
+
+        if self._action_penalization and penalty_kl_nonparametric is not None:
+            stats["penalty_kl_q_rel"] = (
+                penalty_kl_nonparametric.mean() / self.epsilon_penalty
+            )
+
+        stats["kl_mean_rel"] = kl_mean.mean() / self.epsilon_mean
+        stats["kl_stddev_rel"] = kl_stddev.mean() / self.epsilon_stddev
+
+        if self._per_dim_constraining:
+            # per-dim summaries
+            kl_mean_batch_mean = kl_mean.mean(dim=0)  # [D]
+            kl_stddev_batch_mean = kl_stddev.mean(dim=0)  # [D]
+
+            stats["kl_mean_rel_min"] = kl_mean_batch_mean.min() / self.epsilon_mean
+            stats["kl_mean_rel_max"] = kl_mean_batch_mean.max() / self.epsilon_mean
+            stats["kl_stddev_rel_min"] = (
+                kl_stddev_batch_mean.min() / self.epsilon_stddev
+            )
+            stats["kl_stddev_rel_max"] = (
+                kl_stddev_batch_mean.max() / self.epsilon_stddev
+            )
+
+        # Q statistics
+        stats["q_min"] = q_values.min(dim=0).values.mean()
+        stats["q_max"] = q_values.max(dim=0).values.mean()
+
+        # Policy stddev statistics for the online policy
+        pi_stddev = online_scale  # [B, D]
+        stats["pi_stddev_min"] = pi_stddev.min(dim=-1).values.mean()
+        stats["pi_stddev_max"] = pi_stddev.max(dim=-1).values.mean()
+        stats["pi_stddev_cond"] = (
+            pi_stddev.max(dim=-1).values / (pi_stddev.min(dim=-1).values + 1e-8)
+        ).mean()
+
+        return total_loss, stats
 
 
 class NStepAccumulator:
@@ -483,6 +670,14 @@ class MPOAgent:
             action_dim=action_dim,
             per_dim_constraining=per_dim,
             action_penalization=action_penalization,
+            device=device,
+            epsilon=1e-1,
+            epsilon_penalty=1e-3,
+            epsilon_mean=2.5e-3,
+            epsilon_stddev=1e-6,
+            init_log_temperature=10.0,
+            init_log_alpha_mean=10.0,
+            init_log_alpha_stddev=1000.0,
         ).to(device)
         self.dual_opt = optim.Adam(self.mpo_loss.parameters(), lr=lr_dual)
 
@@ -595,7 +790,7 @@ class MPOAgent:
         # target mean/scale already computed as t_mean/t_scale (from above, no_grad)
         # compute MPO loss with sampled_actions and q_samples
         total_loss, stats = self.mpo_loss(
-            online_mean, online_scale, t_mean, t_scale, sampled_actions, q_samples
+            sampled_actions, q_samples, online_mean, online_scale, t_mean, t_scale
         )
 
         # update critic
