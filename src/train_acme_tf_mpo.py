@@ -16,14 +16,13 @@ import threading
 import argparse
 import numpy as np
 import sonnet as snt  # type: ignore
+import reverb  # type: ignore
 import wandb
 import tree  # type: ignore
 import operator
 import os
 
-# Add import to get signature helper without using Reverb runtime.
-import reverb_transition as rt
-
+import reverb_transition as adders
 
 import dm_env  # type: ignore
 from dm_env import specs  # type: ignore
@@ -177,6 +176,51 @@ def zeros_like(nest):
     return tree.map_structure(lambda x: tf.zeros(x.shape, x.dtype), nest)
 
 
+def make_reverb_dataset(
+    server_address: str,
+    table: str = "priority_table",
+    num_parallel_calls: Optional[int] = 12,
+) -> tf.data.Dataset:
+    # This is the default that used to be set by reverb.TFClient.dataset().
+    max_in_flight_samples_per_worker = 100
+
+    tables = collections.OrderedDict([(table, 1.0)])
+
+    # Normalize weights.
+    total_weight = sum(tables.values())
+    tables = collections.OrderedDict(
+        [(name, weight / total_weight) for name, weight in tables.items()]
+    )
+
+    def _make_dataset(_: tf.Tensor) -> tf.data.Dataset:
+        dataset = None
+        for table_name, weight in tables.items():
+            max_in_flight_samples = max(
+                1, int(max_in_flight_samples_per_worker * weight)
+            )
+            dataset = reverb.TrajectoryDataset.from_table_signature(
+                server_address=server_address,
+                table=table_name,
+                max_in_flight_samples_per_worker=max_in_flight_samples,
+            )
+
+        return dataset
+
+    # Create a datasets and interleaves it to create `num_parallel_calls`
+    # `TrajectoryDataset`s.
+    num_datasets_to_interleave = (
+        os.cpu_count() if num_parallel_calls == tf.data.AUTOTUNE else num_parallel_calls
+    )
+    dataset = tf.data.Dataset.range(num_datasets_to_interleave).interleave(
+        map_func=_make_dataset,
+        cycle_length=num_parallel_calls,
+        num_parallel_calls=num_parallel_calls,
+        deterministic=False,
+    )
+
+    return dataset
+
+
 class EnvironmentSpec(NamedTuple):
     """Full specification of the domains used by a given environment."""
 
@@ -185,211 +229,6 @@ class EnvironmentSpec(NamedTuple):
     actions: Any
     rewards: Any
     discounts: Any
-
-
-# ---------------------------------------------------------------------------
-# In-memory replay buffer + N-step adder (replaces Reverb for single-actor setup)
-# ---------------------------------------------------------------------------
-
-
-class Transition(NamedTuple):
-    observation: Any
-    action: Any
-    reward: Any
-    discount: Any
-    next_observation: Any
-    extras: Any = ()
-
-
-class SimpleReplayBuffer:
-    """A minimal in-memory replay buffer supporting uniform sampling."""
-
-    def __init__(self, max_size: int = 1000000, seed: Optional[int] = None):
-        self._max_size = int(max_size)
-        self._buffer = collections.deque(maxlen=self._max_size)
-        self._rng = np.random.RandomState(seed)
-
-    def add(self, transition: Transition):
-        self._buffer.append(transition)
-
-    def size(self) -> int:
-        return len(self._buffer)
-
-    def sample(self, batch_size: int) -> Transition:
-        """Return a batch of transitions as numpy arrays stacked along axis 0."""
-        if len(self._buffer) == 0:
-            raise RuntimeError("Replay buffer is empty.")
-        # allow sampling with replacement if not enough items
-        idx = self._rng.randint(0, len(self._buffer), size=batch_size)
-        sampled = [self._buffer[i] for i in idx]
-        # stack fields (support nested structures)
-        obs = tree.map_structure(
-            lambda *xs: np.stack(xs, axis=0), *[t.observation for t in sampled]
-        )
-        act = tree.map_structure(
-            lambda *xs: np.stack(xs, axis=0), *[t.action for t in sampled]
-        )
-        rew = tree.map_structure(
-            lambda *xs: np.stack(xs, axis=0), *[t.reward for t in sampled]
-        )
-        disc = tree.map_structure(
-            lambda *xs: np.stack(xs, axis=0), *[t.discount for t in sampled]
-        )
-        next_obs = tree.map_structure(
-            lambda *xs: np.stack(xs, axis=0), *[t.next_observation for t in sampled]
-        )
-        extras = (
-            tree.map_structure(
-                lambda *xs: np.stack(xs, axis=0), *[t.extras for t in sampled]
-            )
-            if sampled[0].extras
-            else ()
-        )
-        return Transition(
-            observation=obs,
-            action=act,
-            reward=rew,
-            discount=disc,
-            next_observation=next_obs,
-            extras=extras,
-        )
-
-    def all(self):
-        return list(self._buffer)
-
-
-class NStepTransitionAdder:
-    """A tiny N-step adder for a single actor writing into the in-memory buffer."""
-
-    def __init__(self, replay: SimpleReplayBuffer, n_step: int, discount: float):
-        self._replay = replay
-        self.n_step = max(1, int(n_step))
-        self._discount = float(discount)
-        # buffers
-        self._observations = []
-        self._actions = []
-        self._rewards = []
-        self._discounts = []
-        self._extras = []
-        self._first_idx = 0
-        self._add_first_called = False
-
-    # Helper: convert nested leaves to numpy arrays without collapsing the nest.
-    def _to_numpy_preserve_structure(self, value):
-        if tree.is_nested(value):
-            return tree.map_structure(np.asarray, value)
-        else:
-            return np.asarray(value)
-
-    def add_first(self, timestep):
-        # timestep.observation is the initial observation
-        self._observations = [self._to_numpy_preserve_structure(timestep.observation)]
-        self._actions = []
-        self._rewards = []
-        self._discounts = []
-        self._extras = []
-        self._first_idx = 0
-        self._add_first_called = True
-
-    def add(self, action, next_timestep, extras=()):
-        if not self._add_first_called:
-            raise ValueError("add_first must be called before add()")
-        # Convert each element (possibly nested) to numpy arrays preserving the structure.
-        action = self._to_numpy_preserve_structure(action)
-        reward = self._to_numpy_preserve_structure(next_timestep.reward)
-        discount = self._to_numpy_preserve_structure(next_timestep.discount)
-        next_obs = self._to_numpy_preserve_structure(next_timestep.observation)
-        extras = self._to_numpy_preserve_structure(extras) if extras else ()
-        self._actions.append(action)
-        self._rewards.append(reward)
-        self._discounts.append(discount)
-        self._extras.append(extras)
-        # append next observation
-        self._observations.append(next_obs)
-
-        # After each add, potentially write one transition (the earliest outstanding).
-        last_idx = len(self._actions)
-        # Effective available length for the earliest index
-        while self._first_idx < last_idx and (
-            last_idx - self._first_idx >= self.n_step or next_timestep.last()
-        ):
-            # compute n-step return/window length
-            window_len = min(self.n_step, last_idx - self._first_idx)
-            # compute n-step return and total discount
-            g = self._discount
-            total_discount = 1.0
-            R = 0.0
-            prod_env = 1.0
-            for k in range(window_len):
-                r = self._rewards[self._first_idx + k]
-                # product of environment discounts up to k-1
-                R += (g**k) * prod_env * r
-                # update prod_env by environment discount at this step
-                prod_env *= float(self._discounts[self._first_idx + k])
-            if window_len > 0:
-                total_discount = (g ** (window_len - 1)) * prod_env
-            else:
-                total_discount = 1.0
-
-            # build transition for start index
-            s = self._observations[self._first_idx]
-            a = self._actions[self._first_idx]
-            next_s = self._observations[self._first_idx + window_len]
-            extras = self._extras[self._first_idx] if self._extras else ()
-            transition = Transition(
-                observation=s,
-                action=a,
-                reward=R,
-                discount=total_discount,
-                next_observation=next_s,
-                extras=extras,
-            )
-            self._replay.add(transition)
-            self._first_idx += 1
-
-        # If episode ended, reset internal buffers for next episode.
-        if next_timestep.last():
-            # Leftover transitions, already handled by the while loop above.
-            self._observations = []
-            self._actions = []
-            self._rewards = []
-            self._discounts = []
-            self._extras = []
-            self._first_idx = 0
-            self._add_first_called = False
-
-
-# ---------------------------------------------------------------------------
-# Dataset factory that uses the in-memory replay buffer.
-# ---------------------------------------------------------------------------
-
-
-def make_in_memory_dataset(replay: SimpleReplayBuffer, output_signature):
-    """Create a tf.data.Dataset that samples single transitions from the replay.
-
-    Args:
-      replay: SimpleReplayBuffer instance.
-      output_signature: nested tf.TensorSpec matching a single Transition element.
-    """
-
-    def generator():
-        # Infinite generator that waits until the buffer has at least one item.
-        while True:
-            # Busy-wait until there is at least one transition.
-            while replay.size() == 0:
-                time.sleep(0.01)
-            # sample a single transition (batch size 1)
-            t = replay.sample(1)
-            # Remove the leading batch axis (size 1) so batching later matches old pipeline.
-            yield tree.map_structure(lambda x: np.squeeze(x, axis=0), t)
-
-    # Use provided output_signature (avoid blocking inference from the buffer).
-    return tf.data.Dataset.from_generator(generator, output_signature=output_signature)
-
-
-# ---------------------------------------------------------------------------
-# Modify MPOLearner and MPO wiring to use the in-memory replay/dataset.
-# ---------------------------------------------------------------------------
 
 
 class MPOLearner:
@@ -405,14 +244,14 @@ class MPOLearner:
         target_policy_update_period: int,
         target_critic_update_period: int,
         policy_loss_module: snt.Module,
-        dataset,  # dataset is now a tf.data.Dataset that yields transitions directly
+        dataset: tf.data.Dataset,
         observation_network=tf.identity,
         target_observation_network=tf.identity,
         policy_optimizer: Optional[snt.Optimizer] = None,
         critic_optimizer: Optional[snt.Optimizer] = None,
         dual_optimizer: Optional[snt.Optimizer] = None,
         clipping: bool = True,
-        log_every: int = 1,
+        log_every: int = 100,
     ):
         self._discount = discount
         self._num_samples = num_samples
@@ -496,7 +335,7 @@ class MPOLearner:
 
         # Get data from replay (dropping extras if any). Note there is no
         # extra data here because we do not insert any into Reverb.
-        transitions = inputs  # dataset yields transitions directly
+        transitions = inputs.data
 
         # Cast the additional discount to match the environment discount dtype.
         discount = tf.cast(self._discount, dtype=transitions.discount.dtype)
@@ -670,7 +509,7 @@ class FeedForwardActor:
     def __init__(
         self,
         policy_network: snt.Module,
-        adder: Any,
+        adder: adders.NStepTransitionAdder,
         learner: MPOLearner,
         update_period: int,
     ):
@@ -887,16 +726,31 @@ class MPO:
         self._max_actor_steps = max_actor_steps
 
     def replay(self):
-        # This function no longer creates reverb tables. The MPO.run will create
-        # an in-memory replay buffer and pass it to actors/learners.
-        # Keep API for backward compatibility: return a placeholder.
-        return None
+        # Create enough of an error buffer to give a 10% tolerance in rate.
+        samples_per_insert_tolerance = 0.1 * self._samples_per_insert
+        error_buffer = self._min_replay_size * samples_per_insert_tolerance
+
+        limiter = reverb.rate_limiters.SampleToInsertRatio(
+            min_size_to_sample=self._min_replay_size,
+            samples_per_insert=self._samples_per_insert,
+            error_buffer=error_buffer,
+        )
+        replay_table = reverb.Table(
+            name="priority_table",
+            sampler=reverb.selectors.Uniform(),
+            remover=reverb.selectors.Fifo(),
+            max_size=self._max_replay_size,
+            rate_limiter=limiter,
+            signature=adders.NStepTransitionAdder.signature(self._environment_spec),
+        )
+        return [replay_table]
 
     def learner(
         self,
-        replay,
+        replay: reverb.Client,
     ):
         """The Learning part of the agent."""
+
         act_spec = self._environment_spec.actions
         obs_spec = self._environment_spec.observations
 
@@ -921,24 +775,8 @@ class MPO:
         create_variables(target_networks["policy"], [emb_spec])
         create_variables(target_networks["critic"], [emb_spec, act_spec])
 
-        # Build the tf output signature directly from the environment spec so it
-        # exactly matches the structure/shape/dtype the generator yields.
-        def spec_to_tfspec(spec):
-            # Leaves are specs.Array (or nested structures of them).
-            if isinstance(spec, specs.Array):
-                return tf.TensorSpec(shape=spec.shape, dtype=spec.dtype)
-            return tree.map_structure(spec_to_tfspec, spec)
-
-        transition_signature = Transition(
-            observation=spec_to_tfspec(self._environment_spec.observations),
-            action=spec_to_tfspec(self._environment_spec.actions),
-            reward=spec_to_tfspec(self._environment_spec.rewards),
-            discount=spec_to_tfspec(self._environment_spec.discounts),
-            next_observation=spec_to_tfspec(self._environment_spec.observations),
-            extras=(),  # extras are empty in this setup
-        )
-
-        dataset = make_in_memory_dataset(replay, output_signature=transition_signature)
+        # The dataset object to learn from.
+        dataset = make_reverb_dataset(server_address=replay.server_address)
         dataset = dataset.batch(self._batch_size, drop_remainder=True)
         dataset = dataset.prefetch(self._prefetch_size)
 
@@ -968,7 +806,7 @@ class MPO:
 
     def actor(
         self,
-        replay: SimpleReplayBuffer,
+        replay: reverb.Client,
         learner: MPOLearner,
     ) -> EnvironmentLoop:
         """The actor process."""
@@ -993,9 +831,9 @@ class MPO:
         # Ensure network variables are created.
         create_variables(behavior_network, [observation_spec])
 
-        # Component to add things into replay: use in-memory adder.
-        adder = NStepTransitionAdder(
-            replay=replay, n_step=self._n_step, discount=self._additional_discount
+        # Component to add things into replay.
+        adder = adders.NStepTransitionAdder(
+            client=replay, n_step=self._n_step, discount=self._additional_discount
         )
 
         actor = FeedForwardActor(
@@ -1044,11 +882,10 @@ class MPO:
         return EnvironmentLoop(environment=environment, actor=evaluator)
 
     def run(self):
-        # Create in-memory replay buffer instead of reverb server/client.
-        replay = SimpleReplayBuffer(max_size=self._max_replay_size)
-        # Create learner/actor/evaluator.
-        learner = self.learner(replay)
-        actor = self.actor(replay, learner)
+        server = reverb.Server(tables=self.replay())
+        client = reverb.Client(f"localhost:{server.port}")
+        learner = self.learner(client)
+        actor = self.actor(client, learner)
         evaluator = self.evaluator(learner)
         threads = [
             threading.Thread(
