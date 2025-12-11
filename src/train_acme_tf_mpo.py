@@ -21,6 +21,7 @@ import wandb
 import tree  # type: ignore
 import operator
 import os
+import sys
 
 import reverb_transition as adders
 
@@ -1708,6 +1709,7 @@ def parse_args():
     parser.add_argument("--task", default="balance")
     parser.add_argument("--max_actor_steps", type=int, default=None)
     parser.add_argument("--n_step", type=int, default=5)
+    parser.add_argument("--timeout", type=int, default=None)
     return parser.parse_args()
 
 
@@ -1722,6 +1724,20 @@ def main(args):
             "max_actor_steps": args.max_actor_steps,
         },
     )
+    _timeout_timer = None
+
+    if args.timeout is not None and args.timeout > 0:
+
+        def _force_exit():
+            print(
+                f"Timeout of {args.timeout} seconds reached. Exiting.", file=sys.stderr
+            )
+            os._exit(1)
+
+        _timeout_timer = threading.Timer(args.timeout, _force_exit)
+        _timeout_timer.daemon = True
+        _timeout_timer.start()
+
     program_builder = MPO(
         network_factory=make_networks,
         target_policy_update_period=25,
@@ -1731,6 +1747,9 @@ def main(args):
         n_step=args.n_step,
     )
     program_builder.run()
+
+    if _timeout_timer is not None and _timeout_timer.is_alive():
+        _timeout_timer.cancel()
 
 
 if __name__ == "__main__":

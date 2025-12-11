@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 pairs=(
-#  "hopper stand"
-#  "walker walk"
+# "hopper stand"
+# "walker walk"
   "humanoid run"
   "cartpole balance"
   "walker run"
@@ -14,7 +14,6 @@ pairs=(
   "swimmer swimmer6"
   "sweimmer swimmer15"
   "pendulum swingup"
-  "cheetah walk"
   "cheetah run"
 )
 
