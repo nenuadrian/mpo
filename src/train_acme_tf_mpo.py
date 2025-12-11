@@ -47,13 +47,14 @@ _MPO_FLOAT_EPSILON = 1e-8
 class SimpleReplayBuffer:
     """Thread-safe ring-buffer replay with uniform sampling + rate limiting."""
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, logger: loggers.Logger):
         self._capacity = int(capacity)
         self._storage: list[types.Transition] = []
         self._idx = 0
         self._lock = threading.Lock()
         self._insert_count = 0  # total number of transitions ever inserted
         self._sample_count = 0  # total number of batches ever sampled
+        self._logger = logger
 
     def add(self, transition: types.Transition) -> None:
         with self._lock:
@@ -63,6 +64,10 @@ class SimpleReplayBuffer:
                 self._storage[self._idx] = transition
             self._idx = (self._idx + 1) % self._capacity
             self._insert_count += 1
+            if self._insert_count % 1000 == 0:
+                self._logger.write(
+                    {"Replay buffer size": len(self._storage)}
+                )  # debug print
 
     @property
     def size(self) -> int:
@@ -890,7 +895,10 @@ class MPO:
         return EnvironmentLoop(environment, evaluator, counter, logger)
 
     def run(self):
-        replay_buffer = SimpleReplayBuffer(self._max_replay_size)
+        logger = loggers.make_default_logger(
+            "replay_buffer", time_delta=self._log_every
+        )
+        replay_buffer = SimpleReplayBuffer(self._max_replay_size, logger=logger)
         counter = counting.Counter()
         learner = self.learner(replay_buffer, counter)
         actor = self.actor(replay_buffer, learner, counter)
