@@ -9,7 +9,6 @@ from typing import (
     Any,
     NamedTuple,
     Mapping,
-    Protocol,
 )
 import time
 import collections
@@ -29,6 +28,7 @@ from acme.tf import utils as tf2_utils
 from acme.utils import counting
 from acme.adders import reverb as adders
 from acme import wrappers
+from acme import loggers
 
 import dm_env
 from dm_env import specs
@@ -51,59 +51,6 @@ _MAX_ACTOR_STEPS = flags.DEFINE_integer(
 _DOMAIN = flags.DEFINE_string("domain", "cartpole", "Control suite domain name.")
 _TASK = flags.DEFINE_string("task", "balance", "Control suite task name.")
 _MPO_FLOAT_EPSILON = 1e-8
-
-
-class Logger(Protocol):
-    def write(self, values: Mapping[str, Any]) -> None:
-        pass
-
-
-class _StdoutLogger(Logger):
-    def __init__(
-        self,
-        label: str,
-        *,
-        time_delta: float = 0.0,
-        steps_key: Optional[str] = None,
-        save_data: bool = True,
-    ):
-        self._label = label
-        self._time_delta = max(time_delta or 0.0, 0.0)
-        self._steps_key = steps_key
-        self._save_data = save_data
-        self._last_log_time = 0.0
-        self._buffer: List[Mapping[str, Any]] = [] if save_data else []
-
-    def write(self, values: Mapping[str, Any]) -> None:
-        now = time.time()
-        if self._time_delta and self._last_log_time:
-            if now - self._last_log_time < self._time_delta:
-                if self._steps_key and values.get(self._steps_key) is None:
-                    return
-        self._last_log_time = now
-        payload = dict(values)
-        if self._save_data:
-            self._buffer.append(payload)
-        print(f"[{self._label}] {payload}")
-
-    @property
-    def data(self) -> Sequence[Mapping[str, Any]]:
-        return list(self._buffer)
-
-
-def make_default_logger(
-    label: str,
-    *,
-    time_delta: float = 0.0,
-    steps_key: Optional[str] = None,
-    save_data: bool = True,
-) -> Logger:
-    return _StdoutLogger(
-        label,
-        time_delta=time_delta,
-        steps_key=steps_key,
-        save_data=save_data,
-    )
 
 
 def make_reverb_dataset(
@@ -217,9 +164,9 @@ class MPOLearner:
         target_critic_update_period: int,
         dataset: tf.data.Dataset,
         counter: counting.Counter,
-        logger: Logger,
-        observation_network=tf.identity,
-        target_observation_network=tf.identity,
+        logger: loggers.Logger,
+        observation_network = tf.identity,
+        target_observation_network = tf.identity,
         policy_loss_module: Optional[snt.Module] = None,
         policy_optimizer: Optional[snt.Optimizer] = None,
         critic_optimizer: Optional[snt.Optimizer] = None,
@@ -447,7 +394,7 @@ class EvaluatorActor:
         self._update_period = update_period
 
     @tf.function
-    def _policy(self, observation):
+    def _policy(self, observation: NestedTensor) -> NestedTensor:
         # Add a dummy batch dimension and as a side effect convert numpy to TF.
         batched_observation = tf2_utils.add_batch_dim(observation)
 
@@ -503,7 +450,7 @@ class FeedForwardActor:
         self._update_period = update_period
 
     @tf.function
-    def _policy(self, observation):
+    def _policy(self, observation: NestedTensor) -> NestedTensor:
         # Add a dummy batch dimension and as a side effect convert numpy to TF.
         batched_observation = tf2_utils.add_batch_dim(observation)
 
@@ -550,13 +497,23 @@ class EnvironmentLoop:
     A `Counter` instance can optionally be given in order to maintain counts
     between different Acme components. If not given a local Counter will be
     created to maintain counts between calls to the `run` method.
+
+    A `Logger` instance can also be passed in order to control the output of the
+    loop. If not given a platform-specific default logger will be used as defined
+    by utils.make_default_logger. A string `label` can be passed to easily
+    change the label associated with the default logger; this is ignored if a
+    `Logger` instance is given.
+
+    A list of 'Observer' instances can be specified to generate additional metrics
+    to be logged by the logger. They have access to the 'Environment' instance,
+    the current timestep datastruct and the current action.
     """
 
     def __init__(
         self,
         environment: dm_env.Environment,
         actor,
-        logger: Logger,
+        logger: loggers.Logger,
         counter: counting.Counter,
     ):
         self._environment = environment
@@ -565,7 +522,7 @@ class EnvironmentLoop:
         self._logger = logger
         self._total_steps = 0
 
-    def run_episode(self) -> Mapping[str, Any]:
+    def run_episode(self) ->  Mapping[str, Any]:
         """Run one episode.
 
         Each episode is a loop which interacts first with the environment to get an
@@ -803,7 +760,7 @@ class MPO:
 
         # Create a counter and logger for bookkeeping steps and performance.
         counter = counting.Counter(counter, "learner")
-        logger = make_default_logger(
+        logger = loggers.make_default_logger(
             "learner", time_delta=self._log_every, steps_key="learner_steps"
         )
 
@@ -865,7 +822,7 @@ class MPO:
         )
 
         counter = counting.Counter(counter, "actor")
-        logger = make_default_logger(
+        logger = loggers.make_default_logger(
             "actor",
             save_data=False,
             time_delta=self._log_every,
@@ -912,7 +869,7 @@ class MPO:
 
         # Create logger and counter.
         counter = counting.Counter(counter, "evaluator")
-        logger = make_default_logger(
+        logger = loggers.make_default_logger(
             "evaluator", time_delta=self._log_every, steps_key="evaluator_steps"
         )
 
@@ -1109,8 +1066,6 @@ class MPOLoss(snt.Module):
                 )
             )
             online_action_distribution = tfd.Independent(
-                tfd.Normal(
-                    online_action_distribution.mean(),
                     online_action_distribution.stddev(),
                 )
             )
@@ -1542,16 +1497,16 @@ class CriticMultiplexer(snt.Module):
 
     def __init__(
         self,
-        critic_network: Optional[Any] = None,
-        observation_network: Optional[Any] = None,
-        action_network: Optional[Any] = None,
+        critic_network: Optional[TensorTransformation] = None,
+        observation_network: Optional[TensorTransformation] = None,
+        action_network: Optional[TensorTransformation] = None,
     ):
         self._critic_network = critic_network
         self._observation_network = observation_network
         self._action_network = action_network
         super().__init__(name="critic_multiplexer")
 
-    def __call__(self, observation, action) -> tf.Tensor:
+    def __call__(self, observation: NestedTensor, action: NestedTensor) -> tf.Tensor:
 
         # Maybe transform observations and actions before feeding them on.
         if self._observation_network:
@@ -1590,7 +1545,7 @@ def make_networks(
     action_spec: specs.BoundedArray,
     policy_layer_sizes: Sequence[int] = (256, 256, 256),
     critic_layer_sizes: Sequence[int] = (512, 512, 256),
-) -> Dict[str, Any]:
+) -> Dict[str, TensorTransformation]:
     """Creates networks used by the agent."""
 
     num_dimensions = np.prod(action_spec.shape, dtype=int)
