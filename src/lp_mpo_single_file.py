@@ -543,6 +543,8 @@ class MPO:
 
     def __init__(
         self,
+        domain: str,
+        task: str,
         network_factory: Callable[[specs.BoundedArray], Dict[str, snt.Module]],
         num_caches: int = 0,
         batch_size: int = 256,
@@ -565,6 +567,8 @@ class MPO:
             domain_name=_DOMAIN.value, task_name=_TASK.value
         )
 
+        self.domain = domain
+        self.task = task
         self._network_factory = network_factory
         self._policy_loss_factory = policy_loss_factory
         self._environment_spec = environment_spec
@@ -690,16 +694,14 @@ class MPO:
         replay: reverb.Client,
         variable_source: acme.VariableSource,
         counter: counting.Counter,
-    ) -> acme.EnvironmentLoop:
+    ) -> EnvironmentLoop:
         """The actor process."""
 
         action_spec = self._environment_spec.actions
         observation_spec = self._environment_spec.observations
 
         # Create environment and target networks to act with.
-        environment = _make_environment(
-            domain_name=_DOMAIN.value, task_name=_TASK.value
-        )
+        environment = _make_environment(domain_name=self.domain, task_name=self.task)
 
         agent_networks = self._network_factory(action_spec)
 
@@ -748,7 +750,7 @@ class MPO:
         )
 
         # Create the run loop and return it.
-        return acme.EnvironmentLoop(environment, actor, counter, logger)
+        return EnvironmentLoop(environment, actor, counter, logger)
 
     def evaluator(
         self,
@@ -761,7 +763,7 @@ class MPO:
         observation_spec = self._environment_spec.observations
 
         environment = _make_environment(
-            domain_name=_DOMAIN.value, task_name=_TASK.value, evaluation=True
+            domain_name=self.domain, task_name=self.task, evaluation=True
         )
 
         agent_networks = self._network_factory(action_spec)
@@ -803,8 +805,7 @@ class MPO:
             "evaluator", time_delta=self._log_every, steps_key="evaluator_steps"
         )
 
-        # Create the run loop and return it.
-        return acme.EnvironmentLoop(environment, evaluator, counter, logger)
+        return EnvironmentLoop(environment, evaluator, counter, logger)
 
     def build(self, name="mpo"):
         """Build the distributed agent topology."""
@@ -1794,6 +1795,8 @@ def main(_):
         network_factory=make_networks,
         target_policy_update_period=25,
         max_actor_steps=_MAX_ACTOR_STEPS.value,
+        domain=_DOMAIN.value,
+        task=_TASK.value,
     )
 
     lp.launch(programs=program_builder.build())
