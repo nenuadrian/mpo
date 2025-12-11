@@ -297,18 +297,251 @@ class StochasticMeanHead(snt.Module):
         return distribution.mean()
 
 
+class MPOLearner(acme.VariableSource):
+
+    def __init__(
+        self,
+        policy_network: snt.Module,
+        critic_network: snt.Module,
+        target_policy_network: snt.Module,
+        target_critic_network: snt.Module,
+        discount: float,
+        num_samples: int,
+        target_policy_update_period: int,
+        target_critic_update_period: int,
+        dataset: tf.data.Dataset,
+        counter: counting.Counter,
+        observation_network: types.TensorTransformation = tf.identity,
+        target_observation_network: types.TensorTransformation = tf.identity,
+        policy_loss_module: Optional[snt.Module] = None,
+        policy_optimizer: Optional[snt.Optimizer] = None,
+        critic_optimizer: Optional[snt.Optimizer] = None,
+        dual_optimizer: Optional[snt.Optimizer] = None,
+        clipping: bool = True,
+        logger: Optional[loggers.Logger] = None,
+    ):
+
+        self._counter = counter
+        self._logger = logger or loggers.make_default_logger("learner")
+        self._discount = discount
+        self._num_samples = num_samples
+        self._clipping = clipping
+
+        # Necessary to track when to update target networks.
+        self._num_steps = tf.Variable(0, dtype=tf.int32)
+        self._target_policy_update_period = target_policy_update_period
+        self._target_critic_update_period = target_critic_update_period
+
+        # Batch dataset and create iterator.
+        # TODO(b/155086959): Fix type stubs and remove.
+        self._iterator = iter(dataset)  # pytype: disable=wrong-arg-types
+
+        # Store online and target networks.
+        self._policy_network = policy_network
+        self._critic_network = critic_network
+        self._target_policy_network = target_policy_network
+        self._target_critic_network = target_critic_network
+
+        # Make sure observation networks are snt.Module's so they have variables.
+        self._observation_network = tf2_utils.to_sonnet_module(observation_network)
+        self._target_observation_network = tf2_utils.to_sonnet_module(
+            target_observation_network
+        )
+
+        self._policy_loss_module = policy_loss_module or MPOLoss(
+            epsilon=1e-1,
+            epsilon_penalty=1e-3,
+            epsilon_mean=2.5e-3,
+            epsilon_stddev=1e-6,
+            init_log_temperature=10.0,
+            init_log_alpha_mean=10.0,
+            init_log_alpha_stddev=1000.0,
+        )
+
+        # Create the optimizers.
+        self._critic_optimizer = critic_optimizer or snt.optimizers.Adam(1e-4)
+        self._policy_optimizer = policy_optimizer or snt.optimizers.Adam(1e-4)
+        self._dual_optimizer = dual_optimizer or snt.optimizers.Adam(1e-2)
+
+        # Expose the variables.
+        policy_network_to_expose = snt.Sequential(
+            [self._target_observation_network, self._target_policy_network]
+        )
+        self._variables = {
+            "critic": self._target_critic_network.variables,
+            "policy": policy_network_to_expose.variables,
+        }
+
+        # Do not record timestamps until after the first learning step is done.
+        # This is to avoid including the time it takes for actors to come online and
+        # fill the replay buffer.
+        self._timestamp = None
+
+    def run(self, num_steps: Optional[int] = None) -> None:
+
+        iterator = range(num_steps) if num_steps is not None else itertools.count()
+
+        for _ in iterator:
+            self.step()
+
+    @tf.function
+    def _step(self) -> types.Nest:
+        # Update target network.
+        online_policy_variables = self._policy_network.variables
+        target_policy_variables = self._target_policy_network.variables
+        online_critic_variables = (
+            *self._observation_network.variables,
+            *self._critic_network.variables,
+        )
+        target_critic_variables = (
+            *self._target_observation_network.variables,
+            *self._target_critic_network.variables,
+        )
+
+        # Make online policy -> target policy network update ops.
+        if tf.math.mod(self._num_steps, self._target_policy_update_period) == 0:
+            for src, dest in zip(online_policy_variables, target_policy_variables):
+                dest.assign(src)
+        # Make online critic -> target critic network update ops.
+        if tf.math.mod(self._num_steps, self._target_critic_update_period) == 0:
+            for src, dest in zip(online_critic_variables, target_critic_variables):
+                dest.assign(src)
+
+        # Increment number of learner steps for periodic update bookkeeping.
+        self._num_steps.assign_add(1)
+
+        # Get next batch of data.
+        inputs = next(self._iterator)
+
+        # Get data from replay (dropping extras if any). Note there is no
+        # extra data here because we do not insert any into Reverb.
+        transitions: types.Transition = inputs.data
+
+        # Cast the additional discount to match the environment discount dtype.
+        discount = tf.cast(self._discount, dtype=transitions.discount.dtype)
+
+        with tf.GradientTape(persistent=True) as tape:
+            # Maybe transform the observation before feeding into policy and critic.
+            # Transforming the observations this way at the start of the learning
+            # step effectively means that the policy and critic share observation
+            # network weights.
+            o_tm1 = self._observation_network(transitions.observation)
+            # This stop_gradient prevents gradients to propagate into the target
+            # observation network. In addition, since the online policy network is
+            # evaluated at o_t, this also means the policy loss does not influence
+            # the observation network training.
+            o_t = tf.stop_gradient(
+                self._target_observation_network(transitions.next_observation)
+            )
+
+            # Get action distributions from policy networks.
+            online_action_distribution = self._policy_network(o_t)
+            target_action_distribution = self._target_policy_network(o_t)
+
+            # Get sampled actions to evaluate policy; of size [N, B, ...].
+            sampled_actions = target_action_distribution.sample(self._num_samples)
+            tiled_o_t = tf2_utils.tile_tensor(o_t, self._num_samples)  # [N, B, ...]
+
+            # Compute the target critic's Q-value of the sampled actions in state o_t.
+            sampled_q_t = self._target_critic_network(
+                # Merge batch dimensions; to shape [N*B, ...].
+                snt.merge_leading_dims(tiled_o_t, num_dims=2),
+                snt.merge_leading_dims(sampled_actions, num_dims=2),
+            )
+
+            # Reshape Q-value samples back to original batch dimensions and average
+            # them to compute the TD-learning bootstrap target.
+            sampled_q_t = tf.reshape(sampled_q_t, (self._num_samples, -1))  # [N, B]
+            q_t = tf.reduce_mean(sampled_q_t, axis=0)  # [B]
+
+            # Compute online critic value of a_tm1 in state o_tm1.
+            q_tm1 = self._critic_network(o_tm1, transitions.action)  # [B, 1]
+            q_tm1 = tf.squeeze(q_tm1, axis=-1)  # [B]; necessary for trfl.td_learning.
+
+            # Critic loss.
+            critic_loss = trfl.td_learning(
+                q_tm1, transitions.reward, discount * transitions.discount, q_t
+            ).loss
+            critic_loss = tf.reduce_mean(critic_loss)
+
+            # Actor learning.
+            policy_loss, policy_stats = self._policy_loss_module(
+                online_action_distribution=online_action_distribution,
+                target_action_distribution=target_action_distribution,
+                actions=sampled_actions,
+                q_values=sampled_q_t,
+            )
+
+        # For clarity, explicitly define which variables are trained by which loss.
+        critic_trainable_variables = (
+            # In this agent, the critic loss trains the observation network.
+            self._observation_network.trainable_variables
+            + self._critic_network.trainable_variables
+        )
+        policy_trainable_variables = self._policy_network.trainable_variables
+        # The following are the MPO dual variables, stored in the loss module.
+        dual_trainable_variables = self._policy_loss_module.trainable_variables
+
+        # Compute gradients.
+        critic_gradients = tape.gradient(critic_loss, critic_trainable_variables)
+        policy_gradients, dual_gradients = tape.gradient(
+            policy_loss, (policy_trainable_variables, dual_trainable_variables)
+        )
+
+        # Delete the tape manually because of the persistent=True flag.
+        del tape
+
+        # Maybe clip gradients.
+        if self._clipping:
+            policy_gradients = tuple(tf.clip_by_global_norm(policy_gradients, 40.0)[0])
+            critic_gradients = tuple(tf.clip_by_global_norm(critic_gradients, 40.0)[0])
+
+        # Apply gradients.
+        self._critic_optimizer.apply(critic_gradients, critic_trainable_variables)
+        self._policy_optimizer.apply(policy_gradients, policy_trainable_variables)
+        self._dual_optimizer.apply(dual_gradients, dual_trainable_variables)
+
+        # Losses to track.
+        fetches = {
+            "critic_loss": critic_loss,
+            "policy_loss": policy_loss,
+        }
+        fetches.update(policy_stats)  # Log MPO stats.
+
+        return fetches
+
+    def step(self):
+        # Run the learning step.
+        fetches = self._step()
+
+        # Compute elapsed time.
+        timestamp = time.time()
+        elapsed_time = timestamp - self._timestamp if self._timestamp else 0
+        self._timestamp = timestamp
+
+        # Update our counts and record it.
+        counts = self._counter.increment(steps=1, walltime=elapsed_time)
+        fetches.update(counts)
+
+        wandb.log(fetches)
+
+        self._logger.write(fetches)
+
+    def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:
+        return [tf2_utils.to_numpy(self._variables[name]) for name in names]
+
+
 class MPO:
 
     def __init__(
         self,
         network_factory: Callable[[specs.BoundedArray], Dict[str, snt.Module]],
-        num_caches: int = 0,
         environment_spec: Optional[specs.EnvironmentSpec] = None,
         batch_size: int = 256,
         prefetch_size: int = 4,
         min_replay_size: int = 1000,
         max_replay_size: int = 1000000,
-        samples_per_insert: Optional[float] = 32.0,
+        samples_per_insert = 32.0,
         n_step: int = 5,
         num_samples: int = 20,
         additional_discount: float = 0.99,
@@ -331,7 +564,6 @@ class MPO:
         self._network_factory = network_factory
         self._policy_loss_factory = policy_loss_factory
         self._environment_spec = environment_spec
-        self._num_caches = num_caches
         self._batch_size = batch_size
         self._prefetch_size = prefetch_size
         self._min_replay_size = min_replay_size
@@ -347,27 +579,12 @@ class MPO:
         self._log_every = log_every
 
     def replay(self):
-        """The replay storage."""
-        if self._samples_per_insert is not None:
-            # Create enough of an error buffer to give a 10% tolerance in rate.
-            samples_per_insert_tolerance = 0.1 * self._samples_per_insert
-            error_buffer = self._min_replay_size * samples_per_insert_tolerance
 
-            limiter = reverb.rate_limiters.SampleToInsertRatio(
-                min_size_to_sample=self._min_replay_size,
-                samples_per_insert=self._samples_per_insert,
-                error_buffer=error_buffer,
-            )
-        else:
-            limiter = reverb.rate_limiters.MinSize(
-                min_size_to_sample=self._min_replay_size
-            )
         replay_table = reverb.Table(
             name=adders.DEFAULT_PRIORITY_TABLE,
             sampler=reverb.selectors.Uniform(),
             remover=reverb.selectors.Fifo(),
             max_size=self._max_replay_size,
-            rate_limiter=limiter,
             signature=adders.NStepTransitionAdder.signature(self._environment_spec),
         )
         return [replay_table]
@@ -443,7 +660,7 @@ class MPO:
     def actor(
         self,
         replay: reverb.Client,
-        variable_source: acme.VariableSource,
+        learner: MPOLearner,
         counter: counting.Counter,
     ) -> EnvironmentLoop:
         """The actor process."""
@@ -471,7 +688,7 @@ class MPO:
 
         # Create the variable client responsible for keeping the actor up-to-date.
         variable_client = tf2_variable_utils.VariableClient(
-            variable_source,
+            learner,
             policy_variables,
             update_period=self._variable_update_period,
         )
@@ -506,7 +723,7 @@ class MPO:
 
     def evaluator(
         self,
-        variable_source: acme.VariableSource,
+        learner: MPOLearner,
         counter: counting.Counter,
     ):
         action_spec = self._environment_spec.actions
@@ -535,7 +752,7 @@ class MPO:
 
         # Create the variable client responsible for keeping the actor up-to-date.
         variable_client = tf2_variable_utils.VariableClient(
-            variable_source,
+            learner,
             policy_variables,
             update_period=self._variable_update_period,
         )
@@ -1040,240 +1257,6 @@ def compute_parametric_kl_penalty_and_dual_loss(
     loss_alpha = tf.reduce_sum(alpha * (epsilon - tf.stop_gradient(mean_kl)))
 
     return loss_kl, loss_alpha
-
-
-class MPOLearner(acme.VariableSource):
-
-    def __init__(
-        self,
-        policy_network: snt.Module,
-        critic_network: snt.Module,
-        target_policy_network: snt.Module,
-        target_critic_network: snt.Module,
-        discount: float,
-        num_samples: int,
-        target_policy_update_period: int,
-        target_critic_update_period: int,
-        dataset: tf.data.Dataset,
-        counter: counting.Counter,
-        observation_network: types.TensorTransformation = tf.identity,
-        target_observation_network: types.TensorTransformation = tf.identity,
-        policy_loss_module: Optional[snt.Module] = None,
-        policy_optimizer: Optional[snt.Optimizer] = None,
-        critic_optimizer: Optional[snt.Optimizer] = None,
-        dual_optimizer: Optional[snt.Optimizer] = None,
-        clipping: bool = True,
-        logger: Optional[loggers.Logger] = None,
-    ):
-
-        self._counter = counter
-        self._logger = logger or loggers.make_default_logger("learner")
-        self._discount = discount
-        self._num_samples = num_samples
-        self._clipping = clipping
-
-        # Necessary to track when to update target networks.
-        self._num_steps = tf.Variable(0, dtype=tf.int32)
-        self._target_policy_update_period = target_policy_update_period
-        self._target_critic_update_period = target_critic_update_period
-
-        # Batch dataset and create iterator.
-        # TODO(b/155086959): Fix type stubs and remove.
-        self._iterator = iter(dataset)  # pytype: disable=wrong-arg-types
-
-        # Store online and target networks.
-        self._policy_network = policy_network
-        self._critic_network = critic_network
-        self._target_policy_network = target_policy_network
-        self._target_critic_network = target_critic_network
-
-        # Make sure observation networks are snt.Module's so they have variables.
-        self._observation_network = tf2_utils.to_sonnet_module(observation_network)
-        self._target_observation_network = tf2_utils.to_sonnet_module(
-            target_observation_network
-        )
-
-        self._policy_loss_module = policy_loss_module or MPOLoss(
-            epsilon=1e-1,
-            epsilon_penalty=1e-3,
-            epsilon_mean=2.5e-3,
-            epsilon_stddev=1e-6,
-            init_log_temperature=10.0,
-            init_log_alpha_mean=10.0,
-            init_log_alpha_stddev=1000.0,
-        )
-
-        # Create the optimizers.
-        self._critic_optimizer = critic_optimizer or snt.optimizers.Adam(1e-4)
-        self._policy_optimizer = policy_optimizer or snt.optimizers.Adam(1e-4)
-        self._dual_optimizer = dual_optimizer or snt.optimizers.Adam(1e-2)
-
-        # Expose the variables.
-        policy_network_to_expose = snt.Sequential(
-            [self._target_observation_network, self._target_policy_network]
-        )
-        self._variables = {
-            "critic": self._target_critic_network.variables,
-            "policy": policy_network_to_expose.variables,
-        }
-
-        # Do not record timestamps until after the first learning step is done.
-        # This is to avoid including the time it takes for actors to come online and
-        # fill the replay buffer.
-        self._timestamp = None
-
-    def run(self, num_steps: Optional[int] = None) -> None:
-
-        iterator = range(num_steps) if num_steps is not None else itertools.count()
-
-        for _ in iterator:
-            self.step()
-
-    @tf.function
-    def _step(self) -> types.Nest:
-        # Update target network.
-        online_policy_variables = self._policy_network.variables
-        target_policy_variables = self._target_policy_network.variables
-        online_critic_variables = (
-            *self._observation_network.variables,
-            *self._critic_network.variables,
-        )
-        target_critic_variables = (
-            *self._target_observation_network.variables,
-            *self._target_critic_network.variables,
-        )
-
-        # Make online policy -> target policy network update ops.
-        if tf.math.mod(self._num_steps, self._target_policy_update_period) == 0:
-            for src, dest in zip(online_policy_variables, target_policy_variables):
-                dest.assign(src)
-        # Make online critic -> target critic network update ops.
-        if tf.math.mod(self._num_steps, self._target_critic_update_period) == 0:
-            for src, dest in zip(online_critic_variables, target_critic_variables):
-                dest.assign(src)
-
-        # Increment number of learner steps for periodic update bookkeeping.
-        self._num_steps.assign_add(1)
-
-        # Get next batch of data.
-        inputs = next(self._iterator)
-
-        # Get data from replay (dropping extras if any). Note there is no
-        # extra data here because we do not insert any into Reverb.
-        transitions: types.Transition = inputs.data
-
-        # Cast the additional discount to match the environment discount dtype.
-        discount = tf.cast(self._discount, dtype=transitions.discount.dtype)
-
-        with tf.GradientTape(persistent=True) as tape:
-            # Maybe transform the observation before feeding into policy and critic.
-            # Transforming the observations this way at the start of the learning
-            # step effectively means that the policy and critic share observation
-            # network weights.
-            o_tm1 = self._observation_network(transitions.observation)
-            # This stop_gradient prevents gradients to propagate into the target
-            # observation network. In addition, since the online policy network is
-            # evaluated at o_t, this also means the policy loss does not influence
-            # the observation network training.
-            o_t = tf.stop_gradient(
-                self._target_observation_network(transitions.next_observation)
-            )
-
-            # Get action distributions from policy networks.
-            online_action_distribution = self._policy_network(o_t)
-            target_action_distribution = self._target_policy_network(o_t)
-
-            # Get sampled actions to evaluate policy; of size [N, B, ...].
-            sampled_actions = target_action_distribution.sample(self._num_samples)
-            tiled_o_t = tf2_utils.tile_tensor(o_t, self._num_samples)  # [N, B, ...]
-
-            # Compute the target critic's Q-value of the sampled actions in state o_t.
-            sampled_q_t = self._target_critic_network(
-                # Merge batch dimensions; to shape [N*B, ...].
-                snt.merge_leading_dims(tiled_o_t, num_dims=2),
-                snt.merge_leading_dims(sampled_actions, num_dims=2),
-            )
-
-            # Reshape Q-value samples back to original batch dimensions and average
-            # them to compute the TD-learning bootstrap target.
-            sampled_q_t = tf.reshape(sampled_q_t, (self._num_samples, -1))  # [N, B]
-            q_t = tf.reduce_mean(sampled_q_t, axis=0)  # [B]
-
-            # Compute online critic value of a_tm1 in state o_tm1.
-            q_tm1 = self._critic_network(o_tm1, transitions.action)  # [B, 1]
-            q_tm1 = tf.squeeze(q_tm1, axis=-1)  # [B]; necessary for trfl.td_learning.
-
-            # Critic loss.
-            critic_loss = trfl.td_learning(
-                q_tm1, transitions.reward, discount * transitions.discount, q_t
-            ).loss
-            critic_loss = tf.reduce_mean(critic_loss)
-
-            # Actor learning.
-            policy_loss, policy_stats = self._policy_loss_module(
-                online_action_distribution=online_action_distribution,
-                target_action_distribution=target_action_distribution,
-                actions=sampled_actions,
-                q_values=sampled_q_t,
-            )
-
-        # For clarity, explicitly define which variables are trained by which loss.
-        critic_trainable_variables = (
-            # In this agent, the critic loss trains the observation network.
-            self._observation_network.trainable_variables
-            + self._critic_network.trainable_variables
-        )
-        policy_trainable_variables = self._policy_network.trainable_variables
-        # The following are the MPO dual variables, stored in the loss module.
-        dual_trainable_variables = self._policy_loss_module.trainable_variables
-
-        # Compute gradients.
-        critic_gradients = tape.gradient(critic_loss, critic_trainable_variables)
-        policy_gradients, dual_gradients = tape.gradient(
-            policy_loss, (policy_trainable_variables, dual_trainable_variables)
-        )
-
-        # Delete the tape manually because of the persistent=True flag.
-        del tape
-
-        # Maybe clip gradients.
-        if self._clipping:
-            policy_gradients = tuple(tf.clip_by_global_norm(policy_gradients, 40.0)[0])
-            critic_gradients = tuple(tf.clip_by_global_norm(critic_gradients, 40.0)[0])
-
-        # Apply gradients.
-        self._critic_optimizer.apply(critic_gradients, critic_trainable_variables)
-        self._policy_optimizer.apply(policy_gradients, policy_trainable_variables)
-        self._dual_optimizer.apply(dual_gradients, dual_trainable_variables)
-
-        # Losses to track.
-        fetches = {
-            "critic_loss": critic_loss,
-            "policy_loss": policy_loss,
-        }
-        fetches.update(policy_stats)  # Log MPO stats.
-
-        return fetches
-
-    def step(self):
-        # Run the learning step.
-        fetches = self._step()
-
-        # Compute elapsed time.
-        timestamp = time.time()
-        elapsed_time = timestamp - self._timestamp if self._timestamp else 0
-        self._timestamp = timestamp
-
-        # Update our counts and record it.
-        counts = self._counter.increment(steps=1, walltime=elapsed_time)
-        fetches.update(counts)
-
-        wandb.log(fetches)
-
-        self._logger.write(fetches)
-
-    def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:
-        return [tf2_utils.to_numpy(self._variables[name]) for name in names]
 
 
 class StochasticSamplingHead(snt.Module):
