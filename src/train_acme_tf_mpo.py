@@ -264,8 +264,8 @@ class FeedForwardActor(core.Actor):
         return action
 
     def select_action(self, observation: types.NestedArray) -> types.NestedArray:
-        self._logger.log(
-            f"Selecting action at step {self._counter.get_counts()}"
+        self._logger.write(
+            {"info:" f"Selecting action at step {self._counter.get_counts()}"}
         )
         # Pass the observation through the policy network.
         action = self._policy(observation)
