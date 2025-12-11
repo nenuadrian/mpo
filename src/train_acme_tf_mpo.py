@@ -129,7 +129,7 @@ class EnvironmentLoop(core.Worker):
             env_step_durations.append(time.time() - env_step_start)
 
             # Have the agent and observers observe the timestep.
-            self._actor.observe(action, next_timestep=timestep)
+            self._actor.observe(action, timestep)
 
             # Give the actor the opportunity to update itself.
             self._actor.update()
@@ -297,7 +297,7 @@ class FeedForwardActor:
         self._adder.add(action, next_timestep)
 
     def update(self):
-        #self._variable_client.update()
+        # self._variable_client.update()
         pass
 
 
@@ -715,7 +715,7 @@ class MPO:
 
         # Make sure not to use a random policy after checkpoint restoration by
         # assigning variables before running the environment loop.
-        #variable_client.update_and_wait()
+        # variable_client.update_and_wait()
 
         # Component to add things into replay.
         adder = adders.NStepTransitionAdder(
