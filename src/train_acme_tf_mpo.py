@@ -16,13 +16,11 @@ import threading
 import argparse
 import numpy as np
 import sonnet as snt  # type: ignore
-import reverb  # type: ignore
 import wandb
 import tree  # type: ignore
 import operator
 import os
 
-import reverb_transition as adders
 
 import dm_env  # type: ignore
 from dm_env import specs  # type: ignore
@@ -176,51 +174,6 @@ def zeros_like(nest):
     return tree.map_structure(lambda x: tf.zeros(x.shape, x.dtype), nest)
 
 
-def make_reverb_dataset(
-    server_address: str,
-    table: str = "priority_table",
-    num_parallel_calls: Optional[int] = 12,
-) -> tf.data.Dataset:
-    # This is the default that used to be set by reverb.TFClient.dataset().
-    max_in_flight_samples_per_worker = 100
-
-    tables = collections.OrderedDict([(table, 1.0)])
-
-    # Normalize weights.
-    total_weight = sum(tables.values())
-    tables = collections.OrderedDict(
-        [(name, weight / total_weight) for name, weight in tables.items()]
-    )
-
-    def _make_dataset(_: tf.Tensor) -> tf.data.Dataset:
-        dataset = None
-        for table_name, weight in tables.items():
-            max_in_flight_samples = max(
-                1, int(max_in_flight_samples_per_worker * weight)
-            )
-            dataset = reverb.TrajectoryDataset.from_table_signature(
-                server_address=server_address,
-                table=table_name,
-                max_in_flight_samples_per_worker=max_in_flight_samples,
-            )
-
-        return dataset
-
-    # Create a datasets and interleaves it to create `num_parallel_calls`
-    # `TrajectoryDataset`s.
-    num_datasets_to_interleave = (
-        os.cpu_count() if num_parallel_calls == tf.data.AUTOTUNE else num_parallel_calls
-    )
-    dataset = tf.data.Dataset.range(num_datasets_to_interleave).interleave(
-        map_func=_make_dataset,
-        cycle_length=num_parallel_calls,
-        num_parallel_calls=num_parallel_calls,
-        deterministic=False,
-    )
-
-    return dataset
-
-
 class EnvironmentSpec(NamedTuple):
     """Full specification of the domains used by a given environment."""
 
@@ -229,6 +182,226 @@ class EnvironmentSpec(NamedTuple):
     actions: Any
     rewards: Any
     discounts: Any
+
+
+# ---------------------------------------------------------------------------
+# In-memory replay buffer + N-step adder (replaces Reverb for single-actor setup)
+# ---------------------------------------------------------------------------
+
+
+class Transition(NamedTuple):
+    observation: Any
+    action: Any
+    reward: Any
+    discount: Any
+    next_observation: Any
+    extras: Any = ()
+
+
+class SimpleReplayBuffer:
+    """A minimal in-memory replay buffer supporting uniform sampling."""
+
+    def __init__(self, max_size: int = 1000000, seed: Optional[int] = None):
+        self._max_size = int(max_size)
+        self._buffer = collections.deque(maxlen=self._max_size)
+        self._rng = np.random.RandomState(seed)
+
+    def add(self, transition: Transition):
+        self._buffer.append(transition)
+
+    def size(self) -> int:
+        return len(self._buffer)
+
+    def sample(self, batch_size: int) -> Transition:
+        """Return a batch of transitions as numpy arrays stacked along axis 0."""
+        if len(self._buffer) == 0:
+            raise RuntimeError("Replay buffer is empty.")
+        # allow sampling with replacement if not enough items
+        idx = self._rng.randint(0, len(self._buffer), size=batch_size)
+        sampled = [self._buffer[i] for i in idx]
+        # stack fields (support nested structures)
+        obs = tree.map_structure(
+            lambda *xs: np.stack(xs, axis=0), *[t.observation for t in sampled]
+        )
+        act = tree.map_structure(
+            lambda *xs: np.stack(xs, axis=0), *[t.action for t in sampled]
+        )
+        rew = tree.map_structure(
+            lambda *xs: np.stack(xs, axis=0), *[t.reward for t in sampled]
+        )
+        disc = tree.map_structure(
+            lambda *xs: np.stack(xs, axis=0), *[t.discount for t in sampled]
+        )
+        next_obs = tree.map_structure(
+            lambda *xs: np.stack(xs, axis=0), *[t.next_observation for t in sampled]
+        )
+        extras = (
+            tree.map_structure(
+                lambda *xs: np.stack(xs, axis=0), *[t.extras for t in sampled]
+            )
+            if sampled[0].extras
+            else ()
+        )
+        return Transition(
+            observation=obs,
+            action=act,
+            reward=rew,
+            discount=disc,
+            next_observation=next_obs,
+            extras=extras,
+        )
+
+    def all(self):
+        return list(self._buffer)
+
+
+class NStepTransitionAdder:
+    """A tiny N-step adder for a single actor writing into the in-memory buffer."""
+
+    def __init__(self, replay: SimpleReplayBuffer, n_step: int, discount: float):
+        self._replay = replay
+        self.n_step = max(1, int(n_step))
+        self._discount = float(discount)
+        # buffers
+        self._observations = []
+        self._actions = []
+        self._rewards = []
+        self._discounts = []
+        self._extras = []
+        self._first_idx = 0
+        self._add_first_called = False
+
+    def add_first(self, timestep):
+        # timestep.observation is the initial observation
+        self._observations = [np.asarray(timestep.observation)]
+        self._actions = []
+        self._rewards = []
+        self._discounts = []
+        self._extras = []
+        self._first_idx = 0
+        self._add_first_called = True
+
+    def add(self, action, next_timestep, extras=()):
+        if not self._add_first_called:
+            raise ValueError("add_first must be called before add()")
+        action = np.asarray(action)
+        reward = np.asarray(next_timestep.reward)
+        discount = np.asarray(next_timestep.discount)
+        next_obs = np.asarray(next_timestep.observation)
+        self._actions.append(action)
+        self._rewards.append(reward)
+        self._discounts.append(discount)
+        self._extras.append(extras)
+        # append next observation
+        self._observations.append(next_obs)
+
+        # After each add, potentially write one transition (the earliest outstanding).
+        last_idx = len(self._actions)
+        # Effective available length for the earliest index
+        while self._first_idx < last_idx and (
+            last_idx - self._first_idx >= self.n_step or next_timestep.last()
+        ):
+            # compute n-step return/window length
+            window_len = min(self.n_step, last_idx - self._first_idx)
+            # compute n-step return and total discount
+            g = self._discount
+            total_discount = 1.0
+            R = 0.0
+            prod_env = 1.0
+            for k in range(window_len):
+                r = self._rewards[self._first_idx + k]
+                # product of environment discounts up to k-1
+                R += (g**k) * prod_env * r
+                # update prod_env by environment discount at this step
+                prod_env *= float(self._discounts[self._first_idx + k])
+            if window_len > 0:
+                total_discount = (g ** (window_len - 1)) * prod_env
+            else:
+                total_discount = 1.0
+
+            # build transition for start index
+            s = self._observations[self._first_idx]
+            a = self._actions[self._first_idx]
+            next_s = self._observations[self._first_idx + window_len]
+            extras = self._extras[self._first_idx] if self._extras else ()
+            transition = Transition(
+                observation=s,
+                action=a,
+                reward=R,
+                discount=total_discount,
+                next_observation=next_s,
+                extras=extras,
+            )
+            self._replay.add(transition)
+            self._first_idx += 1
+
+        # If episode ended, reset internal buffers for next episode.
+        if next_timestep.last():
+            # Leftover transitions, already handled by the while loop above.
+            self._observations = []
+            self._actions = []
+            self._rewards = []
+            self._discounts = []
+            self._extras = []
+            self._first_idx = 0
+            self._add_first_called = False
+
+
+# ---------------------------------------------------------------------------
+# Dataset factory that uses the in-memory replay buffer.
+# ---------------------------------------------------------------------------
+
+
+def make_in_memory_dataset(replay: SimpleReplayBuffer):
+    """Create a tf.data.Dataset that samples single transitions from the replay.
+    The dataset yields elements identical to the previous `TrajectoryDataset`'s
+    `.data` object (i.e., a Transition-like mapping). The caller typically will
+    then .batch(...) as before.
+    """
+
+    def generator():
+        # Infinite generator that waits until the buffer has at least one item.
+        while True:
+            # Busy-wait until there is at least one transition.
+            while replay.size() == 0:
+                time.sleep(0.01)
+            # sample a single transition (batch size 1)
+            t = replay.sample(1)
+            # For consistency with previous code, yield a mapping (not batched)
+            # Remove the leading batch axis (size 1) so batching later matches old pipeline.
+            # All fields are numpy arrays with leading dim = batch_size.
+            # We squeeze the leading dimension so that dataset.batch will produce the intended batch.
+            yield tree.map_structure(lambda x: np.squeeze(x, axis=0), t)
+
+    # The output signature is constructed lazily: sample one item to infer structure.
+    # Wait until buffer has at least one item (actors will populate it).
+    while replay.size() == 0:
+        time.sleep(0.01)
+    sample_item = replay.sample(1)
+    sample_item_no_batch = tree.map_structure(
+        lambda x: np.squeeze(x, axis=0), sample_item
+    )
+
+    def tf_signature_from_numpy(numpy_obj):
+        if isinstance(numpy_obj, np.ndarray):
+            return tf.TensorSpec(shape=numpy_obj.shape, dtype=numpy_obj.dtype)
+        else:
+            # fallback for nested structures
+            return tf.TensorSpec(shape=(), dtype=type(numpy_obj))
+
+    # Create nested signature
+    output_signature = tree.map_structure(tf_signature_from_numpy, sample_item_no_batch)
+
+    # Return a dataset of transitions (not yet batched).
+    return tf.data.Dataset.from_generator(generator, output_signature=output_signature)
+
+
+# ...existing code...
+
+
+# ---------------------------------------------------------------------------
+# Modify MPOLearner and MPO wiring to use the in-memory replay/dataset.
+# ---------------------------------------------------------------------------
 
 
 class MPOLearner:
@@ -244,7 +417,7 @@ class MPOLearner:
         target_policy_update_period: int,
         target_critic_update_period: int,
         policy_loss_module: snt.Module,
-        dataset: tf.data.Dataset,
+        dataset,  # dataset is now a tf.data.Dataset that yields transitions directly
         observation_network=tf.identity,
         target_observation_network=tf.identity,
         policy_optimizer: Optional[snt.Optimizer] = None,
@@ -335,7 +508,7 @@ class MPOLearner:
 
         # Get data from replay (dropping extras if any). Note there is no
         # extra data here because we do not insert any into Reverb.
-        transitions = inputs.data
+        transitions = inputs  # dataset yields transitions directly
 
         # Cast the additional discount to match the environment discount dtype.
         discount = tf.cast(self._discount, dtype=transitions.discount.dtype)
@@ -509,7 +682,7 @@ class FeedForwardActor:
     def __init__(
         self,
         policy_network: snt.Module,
-        adder: adders.NStepTransitionAdder,
+        adder: Any,
         learner: MPOLearner,
         update_period: int,
     ):
@@ -726,28 +899,14 @@ class MPO:
         self._max_actor_steps = max_actor_steps
 
     def replay(self):
-        # Create enough of an error buffer to give a 10% tolerance in rate.
-        samples_per_insert_tolerance = 0.1 * self._samples_per_insert
-        error_buffer = self._min_replay_size * samples_per_insert_tolerance
-
-        limiter = reverb.rate_limiters.SampleToInsertRatio(
-            min_size_to_sample=self._min_replay_size,
-            samples_per_insert=self._samples_per_insert,
-            error_buffer=error_buffer,
-        )
-        replay_table = reverb.Table(
-            name="priority_table",
-            sampler=reverb.selectors.Uniform(),
-            remover=reverb.selectors.Fifo(),
-            max_size=self._max_replay_size,
-            rate_limiter=limiter,
-            signature=adders.NStepTransitionAdder.signature(self._environment_spec),
-        )
-        return [replay_table]
+        # This function no longer creates reverb tables. The MPO.run will create
+        # an in-memory replay buffer and pass it to actors/learners.
+        # Keep API for backward compatibility: return a placeholder.
+        return None
 
     def learner(
         self,
-        replay: reverb.Client,
+        replay,
     ):
         """The Learning part of the agent."""
 
@@ -775,18 +934,12 @@ class MPO:
         create_variables(target_networks["policy"], [emb_spec])
         create_variables(target_networks["critic"], [emb_spec, act_spec])
 
-        # The dataset object to learn from.
-        # If the replay client is our in-memory client, obtain its iterator directly.
-        # This avoids the reverb/tf.data dependency for the simple single-writer/single-reader case.
-        if hasattr(replay, "get_iterator"):
-            # get_iterator returns a Python iterator that yields objects with `.data` whose fields
-            # are numpy arrays with leading batch dimension.
-            dataset_iterator = replay.get_iterator(batch_size=self._batch_size)
-            dataset = dataset_iterator
-        else:
-            dataset = make_reverb_dataset(replay.server_address)
-            dataset = dataset.batch(self._batch_size, drop_remainder=True)
-            dataset = dataset.prefetch(self._prefetch_size)
+        # The dataset object to learn from: use in-memory dataset created from the
+        # provided replay buffer. The dataset yields 1-transition elements; batch
+        # and prefetch as before.
+        dataset = make_in_memory_dataset(replay)
+        dataset = dataset.batch(self._batch_size, drop_remainder=True)
+        dataset = dataset.prefetch(self._prefetch_size)
 
         # Return the learning agent.
         return MPOLearner(
@@ -814,7 +967,7 @@ class MPO:
 
     def actor(
         self,
-        replay: reverb.Client,
+        replay: SimpleReplayBuffer,
         learner: MPOLearner,
     ) -> EnvironmentLoop:
         """The actor process."""
@@ -839,9 +992,9 @@ class MPO:
         # Ensure network variables are created.
         create_variables(behavior_network, [observation_spec])
 
-        # Component to add things into replay.
-        adder = adders.NStepTransitionAdder(
-            client=replay, n_step=self._n_step, discount=self._additional_discount
+        # Component to add things into replay: use in-memory adder.
+        adder = NStepTransitionAdder(
+            replay=replay, n_step=self._n_step, discount=self._additional_discount
         )
 
         actor = FeedForwardActor(
@@ -890,11 +1043,11 @@ class MPO:
         return EnvironmentLoop(environment=environment, actor=evaluator)
 
     def run(self):
-        # Use the in-memory server/client for single-process training (simple actor/learner).
-        server = adders.InMemoryServer(tables=self.replay())
-        client = adders.InMemoryClient(server)
-        learner = self.learner(client)
-        actor = self.actor(client, learner)
+        # Create in-memory replay buffer instead of reverb server/client.
+        replay = SimpleReplayBuffer(max_size=self._max_replay_size)
+        # Create learner/actor/evaluator.
+        learner = self.learner(replay)
+        actor = self.actor(replay, learner)
         evaluator = self.evaluator(learner)
         threads = [
             threading.Thread(
