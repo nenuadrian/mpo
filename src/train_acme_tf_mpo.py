@@ -837,7 +837,9 @@ class MPO:
         )
 
         # Create the run loop and return it.
-        return EnvironmentLoop(environment, actor, counter, logger)
+        return EnvironmentLoop(
+            environment=environment, actor=actor, counter=counter, logger=logger
+        )
 
     def evaluator(
         self,
@@ -879,7 +881,9 @@ class MPO:
             update_period=self._variable_update_period,
         )
 
-        return EnvironmentLoop(environment, evaluator, counter, logger)
+        return EnvironmentLoop(
+            environment=environment, actor=evaluator, counter=counter, logger=logger
+        )
 
     def run(self):
         counter = counting.Counter()
