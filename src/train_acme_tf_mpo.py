@@ -24,7 +24,7 @@ import operator
 import itertools
 import os
 
-from acme.adders import reverb as adders
+import reverb_transition as adders
 
 import dm_env
 from dm_env import specs
