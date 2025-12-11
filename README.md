@@ -5,6 +5,8 @@
     - [Visualize](#visualize)
     - [Video generation](#video-generation)
   - [Using Google DeepMind Acme](#using-google-deepmind-acme)
+    - [Single file with Launchpad](#single-file-with-launchpad)
+    - [Single file TF and Reverb](#single-file-tf-and-reverb)
     - [Visualise](#visualise)
   - [Implementing based on Acme in PyTorch](#implementing-based-on-acme-in-pytorch)
     - [Visualize Acme in PyTorch](#visualize-acme-in-pytorch)
@@ -43,9 +45,19 @@ Very difficult to get it to build. TensorFlow version is only one that I was abl
 
 Combined all code necessary in `src/train_acme_tf_mpo.py`. But still need a lot of the tricks I have documented in my `acme` fork.
 
+### Single file with Launchpad
+
+Somewhat consolidated code from within acme still depending on acme but brought toegther in one file. Depends on many DM projects such as `dm-reverb`, `dm-env`, `dm-tree`, `dm-launchpad`, `acme`, `sonnet` etc.
+
 ```bash
 python src/lp_mpo_single_file.py --max_actor_steps 3000000 --domain cheetah --task run
+```
 
+### Single file TF and Reverb
+
+Not able to remove dependencies further as Sonnet and Reverb are tightly integrated. But removed Acme and Launchpad dependencies.
+
+```bash
 python src/train_acme_tf_mpo.py --max_actor_steps 3000000 --domain cheetah --task run
 ```
 
@@ -78,14 +90,11 @@ python src/visualize_wandb.py --project-metric "acme_pytorch_3::eval/mean_reward
 
 ![Acme PyTorch Results](results/custom_acme_pytorch.png)
 
-
 ### Video generation Acme in PyTorch
 
 ```bash
 python src/generate_video_acme_pytorch_mpo.py logs/mpo_experiment/identifier/checkpoints/checkpoint_34234.pt --env_name cheetah::run --output mpo_acme_pytorch_cheetah_run.mp4
 ```
-
-![MPO Video](assets/cheetah.gif)
 
 ## Original MPO Paper
 
