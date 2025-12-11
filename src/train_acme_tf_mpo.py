@@ -225,12 +225,12 @@ def _generate_zeros_from_spec(spec: specs.Array) -> np.ndarray:
     return np.zeros(spec.shape, spec.dtype)
 
 
-class EvaluatorActor():
+class EvaluatorActor:
 
     def __init__(
         self,
         policy_network: snt.Module,
-        variable_client: Optional[tf2_variable_utils.VariableClient] = None,
+        variable_client: tf2_variable_utils.VariableClient,
     ):
         self._variable_client = variable_client
         self._policy_network = policy_network
@@ -260,12 +260,12 @@ class EvaluatorActor():
 
     def observe(self, action: types.NestedArray, next_timestep: dm_env.TimeStep):
         pass
-    
+
     def update(self, wait: bool = False):
-        if self._variable_client:
-            self._variable_client.update(wait)
-            
-class FeedForwardActor(core.Actor):
+        self._variable_client.update(wait)
+
+
+class FeedForwardActor:
     """A feed-forward actor.
 
     An actor based on a feed-forward policy which takes non-batched observations
@@ -275,17 +275,13 @@ class FeedForwardActor(core.Actor):
 
     def __init__(
         self,
-        logger: loggers.Logger,
-        counter: counting.Counter,
         policy_network: snt.Module,
-        adder: Optional[acme_adders.Adder] = None,
-        variable_client: Optional[tf2_variable_utils.VariableClient] = None,
+        adder: acme_adders.Adder,
+        variable_client: tf2_variable_utils.VariableClient,
     ):
         self._adder = adder
-        self._counter = counter
         self._variable_client = variable_client
         self._policy_network = policy_network
-        self._logger = logger
 
     @tf.function
     def _policy(self, observation: types.NestedTensor) -> types.NestedTensor:
@@ -308,16 +304,13 @@ class FeedForwardActor(core.Actor):
         return tf2_utils.to_numpy_squeeze(action)
 
     def observe_first(self, timestep: dm_env.TimeStep):
-        if self._adder:
-            self._adder.add_first(timestep)
+        self._adder.add_first(timestep)
 
     def observe(self, action: types.NestedArray, next_timestep: dm_env.TimeStep):
-        if self._adder:
-            self._adder.add(action, next_timestep)
+        self._adder.add(action, next_timestep)
 
     def update(self, wait: bool = False):
-        if self._variable_client:
-            self._variable_client.update(wait)
+        self._variable_client.update(wait)
 
 
 class StochasticMeanHead(snt.Module):
@@ -750,10 +743,7 @@ class MPO:
             steps_key="actor_steps",
         )
 
-        # Create the agent.
         actor = FeedForwardActor(
-            logger=logger,
-            counter=counter,
             policy_network=behavior_network,
             adder=adder,
             variable_client=variable_client,
