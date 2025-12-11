@@ -330,6 +330,9 @@ class CheckpointingRunner(core.Worker):
         if isinstance(self._wrapped, core.Learner):
             # Learners have a step() method, so alternate between that and ckpt call.
             self._wrapped.step()
+            
+    def _signal_handler(self):
+        pass
 
     def run(self):
         """Runs the checkpointer."""
