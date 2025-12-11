@@ -26,7 +26,6 @@ from acme import datasets
 from acme.adders import reverb as adders
 from acme.tf import variable_utils as tf2_variable_utils
 from acme import wrappers
-from acme.utils import observers as observers_lib
 
 import tensorflow as tf
 import tensorflow_probability as tfp
@@ -74,18 +73,18 @@ class EnvironmentLoop(core.Worker):
     def __init__(
         self,
         environment: dm_env.Environment,
+        actor: core.Actor,
         counter: Optional[counting.Counter] = None,
         logger: Optional[loggers.Logger] = None,
         label: str = "environment_loop",
-        observers: Sequence[observers_lib.EnvLoopObserver] = (),
     ):
         # Internalize agent and environment.
         self._environment = environment
+        self._actor = actor
         self._counter = counter or counting.Counter()
         self._logger = logger or loggers.make_default_logger(
             label, steps_key=self._counter.get_steps_key()
         )
-        self._observers = observers
 
     def run_episode(self) -> loggers.LoggingData:
         """Run one episode.
@@ -112,10 +111,7 @@ class EnvironmentLoop(core.Worker):
         timestep = self._environment.reset()
         env_reset_duration = time.time() - env_reset_start
         # Make the first observation.
-        for observer in self._observers:
-            # Initialize the observer with the current state of the env after reset
-            # and the initial timestep.
-            observer.observe_first(self._environment, timestep)
+        self._actor.observe_first(timestep)
 
         # Run an episode.
         while not timestep.last():
@@ -134,10 +130,9 @@ class EnvironmentLoop(core.Worker):
 
             # Have the agent and observers observe the timestep.
             self._actor.observe(action, next_timestep=timestep)
-            for observer in self._observers:
-                # One environment step was completed. Observe the current state of the
-                # environment, the current timestep and the action.
-                observer.observe(self._environment, timestep, action)
+
+            # Give the actor the opportunity to update itself.
+            self._actor.update()
 
             # Equivalent to: episode_return += timestep.reward
             # We capture the return value because if timestep.reward is a JAX
@@ -162,8 +157,6 @@ class EnvironmentLoop(core.Worker):
             "env_step_duration_sec": np.mean(env_step_durations),
         }
         result.update(counts)
-        for observer in self._observers:
-            result.update(observer.get_metrics())
         return result
 
     def run(
@@ -249,13 +242,14 @@ class EvaluatorActor:
         # Return a numpy array with squeezed out batch dimension.
         return tf2_utils.to_numpy_squeeze(action)
 
-    def observe_first(self, _: dm_env.Environment, timestep: dm_env.TimeStep):
+    def observe_first(self, timestep: dm_env.TimeStep):
         pass
 
-    def observe(
-        self, _: dm_env.Environment, __: types.NestedArray, ___: dm_env.TimeStep
-    ):
-        self._variable_client.update()
+    def observe(self, action: types.NestedArray, next_timestep: dm_env.TimeStep):
+        pass
+
+    def update(self, wait: bool = False):
+        self._variable_client.update(wait)
 
 
 class FeedForwardActor:
@@ -296,17 +290,14 @@ class FeedForwardActor:
         # Return a numpy array with squeezed out batch dimension.
         return tf2_utils.to_numpy_squeeze(action)
 
-    def observe_first(self, _: dm_env.Environment, timestep: dm_env.TimeStep):
+    def observe_first(self, timestep: dm_env.TimeStep):
         self._adder.add_first(timestep)
 
-    def observe(
-        self,
-        _: dm_env.Environment,
-        action: types.NestedArray,
-        next_timestep: dm_env.TimeStep,
-    ):
+    def observe(self, action: types.NestedArray, next_timestep: dm_env.TimeStep):
         self._adder.add(action, next_timestep)
-        self._variable_client.update()
+
+    def update(self, wait: bool = False):
+        self._variable_client.update(wait)
 
 
 class StochasticMeanHead(snt.Module):
@@ -746,7 +737,7 @@ class MPO:
         )
 
         # Create the run loop and return it.
-        return EnvironmentLoop(environment, counter, logger, observers=[actor])
+        return EnvironmentLoop(environment, actor, counter, logger)
 
     def evaluator(
         self,
@@ -800,7 +791,7 @@ class MPO:
             variable_client=variable_client,
         )
 
-        return EnvironmentLoop(environment, counter, logger, observers=[evaluator])
+        return EnvironmentLoop(environment, evaluator, counter, logger)
 
     def run(self):
         counter = counting.Counter()
