@@ -25,7 +25,6 @@ import itertools
 import os
 
 from acme.tf import utils as tf2_utils
-from acme.utils import counting
 from acme.adders import reverb as adders
 from acme import wrappers
 
@@ -162,7 +161,6 @@ class MPOLearner:
         target_policy_update_period: int,
         target_critic_update_period: int,
         dataset: tf.data.Dataset,
-        counter: counting.Counter,
         observation_network=tf.identity,
         target_observation_network=tf.identity,
         policy_loss_module: Optional[snt.Module] = None,
@@ -171,7 +169,6 @@ class MPOLearner:
         dual_optimizer: Optional[snt.Optimizer] = None,
         clipping: bool = True,
     ):
-        self._counter = counter
         self._discount = discount
         self._num_samples = num_samples
         self._clipping = clipping
@@ -362,17 +359,14 @@ class MPOLearner:
 
     def step(self):
         self._total_steps = self._total_steps + 1
-        # Run the learning step.
         fetches = self._step()
 
         # Compute elapsed time.
         timestamp = time.time()
-        elapsed_time = timestamp - self._timestamp if self._timestamp else 0
         self._timestamp = timestamp
 
         # Update our counts and record it.
-        counts = self._counter.increment(steps=1, walltime=elapsed_time)
-        fetches.update(counts)
+        fetches.update({"total_steps": self._total_steps})
 
         wandb.log({"learner/" + k: v for k, v in fetches.items()})
 
@@ -488,11 +482,9 @@ class EnvironmentLoop:
         self,
         environment: dm_env.Environment,
         actor,
-        counter: counting.Counter,
     ):
         self._environment = environment
         self._actor = actor
-        self._counter = counter
         self._total_steps = 0
 
     def run_episode(self) -> Mapping[str, Any]:
@@ -550,9 +542,6 @@ class EnvironmentLoop:
                 operator.iadd, episode_return, timestep.reward
             )
 
-        # Record counts.
-        counts = self._counter.increment(episodes=1, steps=episode_steps)
-
         # Collect the results and combine with counts.
         steps_per_second = episode_steps / (time.time() - episode_start_time)
         result = {
@@ -562,8 +551,8 @@ class EnvironmentLoop:
             "env_reset_duration_sec": env_reset_duration,
             "select_action_duration_sec": np.mean(select_action_durations),
             "env_step_duration_sec": np.mean(env_step_durations),
+            "total_steps": self._total_steps,
         }
-        result.update(counts)
         return result
 
     def run(
@@ -695,7 +684,6 @@ class MPO:
     def learner(
         self,
         replay: reverb.Client,
-        counter: counting.Counter,
     ):
         """The Learning part of the agent."""
 
@@ -730,7 +718,6 @@ class MPO:
         dataset = dataset.batch(self._batch_size, drop_remainder=True)
         dataset = dataset.prefetch(self._prefetch_size)
 
-        counter = counting.Counter(counter, "learner")
 
         # Create policy loss module if a factory is passed.
         if self._policy_loss_factory:
@@ -752,14 +739,12 @@ class MPO:
             target_critic_update_period=self._target_critic_update_period,
             policy_loss_module=policy_loss_module,
             dataset=dataset,
-            counter=counter,
         )
 
     def actor(
         self,
         replay: reverb.Client,
         learner: MPOLearner,
-        counter: counting.Counter,
     ) -> EnvironmentLoop:
         """The actor process."""
 
@@ -788,7 +773,6 @@ class MPO:
             client=replay, n_step=self._n_step, discount=self._additional_discount
         )
 
-        counter = counting.Counter(counter, "actor")
 
         actor = FeedForwardActor(
             policy_network=behavior_network,
@@ -798,12 +782,11 @@ class MPO:
         )
 
         # Create the run loop and return it.
-        return EnvironmentLoop(environment=environment, actor=actor, counter=counter)
+        return EnvironmentLoop(environment=environment, actor=actor)
 
     def evaluator(
         self,
         learner: MPOLearner,
-        counter: counting.Counter,
     ):
         action_spec = self._environment_spec.actions
         observation_spec = self._environment_spec.observations
@@ -828,7 +811,6 @@ class MPO:
         # Ensure network variables are created.
         tf2_utils.create_variables(evaluator_network, [observation_spec])
 
-        counter = counting.Counter(counter, "evaluator")
 
         evaluator = EvaluatorActor(
             policy_network=evaluator_network,
@@ -837,16 +819,15 @@ class MPO:
         )
 
         return EnvironmentLoop(
-            environment=environment, actor=evaluator, counter=counter
+            environment=environment, actor=evaluator
         )
 
     def run(self):
-        counter = counting.Counter()
         server = reverb.Server(tables=self.replay())
         client = reverb.Client(f"localhost:{server.port}")
-        learner = self.learner(client, counter)
-        actor = self.actor(client, learner, counter)
-        evaluator = self.evaluator(learner, counter)
+        learner = self.learner(client)
+        actor = self.actor(client, learner)
+        evaluator = self.evaluator(learner)
         threads = [
             threading.Thread(
                 target=learner.run,
