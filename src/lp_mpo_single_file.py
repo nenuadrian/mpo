@@ -987,7 +987,6 @@ class MPOLoss(snt.Module):
         stats["pi_stddev_cond"] = tf.reduce_mean(
             tf.reduce_max(pi_stddev, axis=-1) / tf.reduce_min(pi_stddev, axis=-1)
         )
-        wandb.log(stats)
 
         return loss, stats
 
@@ -1326,7 +1325,7 @@ class MPOLearner(acme.Learner):
         # Update our counts and record it.
         counts = self._counter.increment(steps=1, walltime=elapsed_time)
         fetches.update(counts)
-        
+
         wandb.log(fetches)
 
         self._logger.write(fetches)
