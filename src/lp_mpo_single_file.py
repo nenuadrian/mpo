@@ -302,166 +302,8 @@ class FeedForwardActor(core.Actor):
 PythonState = tf.train.experimental.PythonState
 Checkpointable = Union[tf.Module, tf.Variable, PythonState]
 
-_DEFAULT_CHECKPOINT_TTL = int(datetime.timedelta(days=5).total_seconds())
 
 
-class TFSaveable(abc.ABC):
-    """An interface for objects that expose their checkpointable TF state."""
-
-    @property
-    @abc.abstractmethod
-    def state(self) -> Mapping[str, Checkpointable]:
-        """Returns TensorFlow checkpointable state."""
-
-
-class Checkpointer:
-    """Convenience class for periodically checkpointing.
-
-    This can be used to checkpoint any object with trackable state (e.g.
-    tensorflow variables or modules); see tf.train.Checkpoint for
-    details. Objects inheriting from tf.train.experimental.PythonState can also
-    be checkpointed.
-
-    Typically people use Checkpointer to make sure that they can correctly recover
-    from a machine going down during learning. For more permanent storage of self-
-    contained "networks" see the Snapshotter object.
-
-    Usage example:
-
-    ```python
-    model = snt.Linear(10)
-    checkpointer = Checkpointer(objects_to_save={'model': model})
-
-    for _ in range(100):
-      # ...
-      checkpointer.save()
-    ```
-    """
-
-    def __init__(
-        self,
-        objects_to_save: Mapping[str, Union[Checkpointable, core.Saveable]],
-        *,
-        directory: str = "~/acme/",
-        subdirectory: str = "default",
-        time_delta_minutes: float = 10.0,
-        enable_checkpointing: bool = True,
-        add_uid: bool = True,
-        max_to_keep: int = 1,
-        checkpoint_ttl_seconds: Optional[int] = _DEFAULT_CHECKPOINT_TTL,
-        keep_checkpoint_every_n_hours: Optional[int] = None,
-    ):
-        """Builds the saver object.
-
-        Args:
-          objects_to_save: Mapping specifying what to checkpoint.
-          directory: Which directory to put the checkpoint in.
-          subdirectory: Sub-directory to use (e.g. if multiple checkpoints are being
-            saved).
-          time_delta_minutes: How often to save the checkpoint, in minutes.
-          enable_checkpointing: whether to checkpoint or not.
-          add_uid: If True adds a UID to the checkpoint path, see
-            `paths.get_unique_id()` for how this UID is generated.
-          max_to_keep: The maximum number of checkpoints to keep.
-          checkpoint_ttl_seconds: TTL (time to leave) in seconds for checkpoints.
-          keep_checkpoint_every_n_hours: keep_checkpoint_every_n_hours passed to
-            tf.train.CheckpointManager.
-        """
-
-        # Convert `Saveable` objects to TF `Checkpointable` first, if necessary.
-        def to_ckptable(x: Union[Checkpointable, core.Saveable]) -> Checkpointable:
-            if isinstance(x, core.Saveable):
-                return SaveableAdapter(x)
-            return x
-
-        objects_to_save = {k: to_ckptable(v) for k, v in objects_to_save.items()}
-
-        self._time_delta_minutes = time_delta_minutes
-        self._last_saved = 0.0
-        self._enable_checkpointing = enable_checkpointing
-        self._checkpoint_manager = None
-
-        if enable_checkpointing:
-            # Checkpoint object that handles saving/restoring.
-            self._checkpoint = tf.train.Checkpoint(**objects_to_save)
-            self._checkpoint_dir = paths.process_path(
-                directory,
-                "checkpoints",
-                subdirectory,
-                ttl_seconds=checkpoint_ttl_seconds,
-                backups=False,
-                add_uid=add_uid,
-            )
-
-            # Create a manager to maintain different checkpoints.
-            self._checkpoint_manager = tf.train.CheckpointManager(
-                self._checkpoint,
-                directory=self._checkpoint_dir,
-                max_to_keep=max_to_keep,
-                keep_checkpoint_every_n_hours=keep_checkpoint_every_n_hours,
-            )
-
-            self.restore()
-
-    def save(self, force: bool = False) -> bool:
-        """Save the checkpoint if it's the appropriate time, otherwise no-ops.
-
-        Args:
-          force: Whether to force a save regardless of time elapsed since last save.
-
-        Returns:
-          A boolean indicating if a save event happened.
-        """
-        if not self._enable_checkpointing:
-            return False
-
-        if not force and time.time() - self._last_saved < 60 * self._time_delta_minutes:
-            return False
-
-        checkpoint_manager: tf.train.CheckpointManager = self.checkpoint_manager
-        # Save any checkpoints.
-        checkpoint_manager.save()
-        self._last_saved = time.time()
-
-        return True
-
-    def restore(self):
-        """Restore from most recent checkpoint."""
-
-        # Restore from the most recent checkpoint (if it exists).
-        checkpoint_to_restore = self.checkpoint_manager.latest_checkpoint
-        self._checkpoint.restore(checkpoint_to_restore)
-
-    @property
-    def directory(self):
-        return self.checkpoint_manager.directory
-
-    @property
-    def checkpoint_manager(self) -> tf.train.CheckpointManager:
-        if not self._enable_checkpointing:
-            raise ValueError(
-                "Check-point not enabled. No checkpoint manager available."
-            )
-
-        # At this point, _enable_checkpointing is true, so _checkpoint_manager
-        # should not be None.
-        assert self._checkpoint_manager is not None
-        return self._checkpoint_manager
-
-
-class SaveableAdapter(tf.train.experimental.PythonState):
-    """Adapter which allows `Saveable` object to be checkpointed by TensorFlow."""
-
-    def __init__(self, object_to_save: core.Saveable):
-        self._object_to_save = object_to_save
-
-    def serialize(self):
-        state = self._object_to_save.save()
-        return pickle.dumps(state)
-
-    def deserialize(self, pickled: bytes):
-        state = pickle.loads(pickled)
-        self._object_to_save.restore(state)
 
 
 class CheckpointingRunner(core.Worker):
@@ -480,33 +322,14 @@ class CheckpointingRunner(core.Worker):
         time_delta_minutes: int = 30,
         **kwargs,
     ):
-        if isinstance(wrapped, TFSaveable):
-            # If the object to be wrapped exposes its TF State, checkpoint that.
-            objects_to_save = wrapped.state
-        else:
-            # Otherwise checkpoint the wrapped object itself.
-            objects_to_save = wrapped
-
         self._wrapped = wrapped
         self._time_delta_minutes = time_delta_minutes
-        self._checkpointer = Checkpointer(
-            objects_to_save={key: objects_to_save},
-            time_delta_minutes=time_delta_minutes,
-            **kwargs,
-        )
 
-    # Handle preemption signal. Note that this must happen in the main thread.
-    def _signal_handler(self):
-        self._checkpointer.save(force=True)
 
     def step(self):
         if isinstance(self._wrapped, core.Learner):
             # Learners have a step() method, so alternate between that and ckpt call.
             self._wrapped.step()
-            self._checkpointer.save()
-        else:
-            # Wrapped object doesn't have a run method; set our run method to ckpt.
-            self.checkpoint()
 
     def run(self):
         """Runs the checkpointer."""
@@ -523,15 +346,8 @@ class CheckpointingRunner(core.Worker):
             return self.get_directory
         return getattr(self._wrapped, name)
 
-    def checkpoint(self):
-        self._checkpointer.save()
-        # Do not sleep for a long period of time to avoid LaunchPad program
-        # termination hangs (time.sleep is not interruptible).
-        for _ in range(self._time_delta_minutes * 60):
-            time.sleep(1)
-
     def get_directory(self):
-        return self._checkpointer.directory
+        return ""
 
 
 class StochasticMeanHead(snt.Module):
