@@ -390,6 +390,7 @@ class EvaluatorActor:
         self._learner = learner
         self._policy_network = policy_network
         self._update_period = update_period
+        self.label = "evaluator"
 
     @tf.function
     def _policy(self, observation):
@@ -446,6 +447,7 @@ class FeedForwardActor:
         self._learner = learner
         self._policy_network = policy_network
         self._update_period = update_period
+        self.label = "actor"
 
     @tf.function
     def _policy(self, observation):
