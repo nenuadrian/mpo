@@ -14,6 +14,7 @@ import sonnet as snt
 import launchpad as lp
 import dm_env
 import reverb
+import pickle
 
 import acme
 from acme import specs
@@ -184,6 +185,8 @@ class Checkpointer:
 
         # Convert `Saveable` objects to TF `Checkpointable` first, if necessary.
         def to_ckptable(x: Union[Checkpointable, core.Saveable]) -> Checkpointable:
+            if isinstance(x, core.Saveable):
+                return SaveableAdapter(x)
             return x
 
         objects_to_save = {k: to_ckptable(v) for k, v in objects_to_save.items()}
@@ -261,6 +264,21 @@ class Checkpointer:
         return self._checkpoint_manager
 
 
+class SaveableAdapter(tf.train.experimental.PythonState):
+    """Adapter which allows `Saveable` object to be checkpointed by TensorFlow."""
+
+    def __init__(self, object_to_save: core.Saveable):
+        self._object_to_save = object_to_save
+
+    def serialize(self):
+        state = self._object_to_save.save()
+        return pickle.dumps(state)
+
+    def deserialize(self, pickled: bytes):
+        state = pickle.loads(pickled)
+        self._object_to_save.restore(state)
+
+
 class CheckpointingRunner(core.Worker):
     """Wrap an object and expose a run method which checkpoints periodically.
 
@@ -277,10 +295,20 @@ class CheckpointingRunner(core.Worker):
         time_delta_minutes: int = 30,
         **kwargs,
     ):
+        if isinstance(wrapped, TFSaveable):
+            # If the object to be wrapped exposes its TF State, checkpoint that.
+            objects_to_save = wrapped.state
+        else:
+            # Otherwise checkpoint the wrapped object itself.
+            objects_to_save = wrapped
 
         self._wrapped = wrapped
         self._time_delta_minutes = time_delta_minutes
-        
+        self._checkpointer = Checkpointer(
+            objects_to_save={key: objects_to_save},
+            time_delta_minutes=time_delta_minutes,
+            **kwargs,
+        )
 
     # Handle preemption signal. Note that this must happen in the main thread.
     def _signal_handler(self):
@@ -290,6 +318,10 @@ class CheckpointingRunner(core.Worker):
         if isinstance(self._wrapped, core.Learner):
             # Learners have a step() method, so alternate between that and ckpt call.
             self._wrapped.step()
+            self._checkpointer.save()
+        else:
+            # Wrapped object doesn't have a run method; set our run method to ckpt.
+            self.checkpoint()
 
     def run(self):
         """Runs the checkpointer."""
