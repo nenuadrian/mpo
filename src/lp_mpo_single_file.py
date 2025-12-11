@@ -13,6 +13,7 @@ import launchpad as lp
 import dm_env
 import reverb
 import pickle
+from dm_control import suite
 
 import acme
 from acme import specs
@@ -29,6 +30,8 @@ from acme.utils import lp_utils
 from acme import wrappers
 from acme.utils import paths
 from acme.utils import signals
+from acme.wrappers import mujoco as mujoco_wrappers
+
 
 import tensorflow as tf
 import tensorflow_probability as tfp
@@ -47,6 +50,7 @@ _MAX_ACTOR_STEPS = flags.DEFINE_integer(
 )
 _DOMAIN = flags.DEFINE_string("domain", "cartpole", "Control suite domain name.")
 _TASK = flags.DEFINE_string("task", "balance", "Control suite task name.")
+_MPO_FLOAT_EPSILON = 1e-8
 
 
 class FeedForwardActor(core.Actor):
@@ -657,7 +661,6 @@ Tensor shapes are annotated, where helpful, as follow:
 """
 
 
-_MPO_FLOAT_EPSILON = 1e-8
 
 
 class MPOLoss(snt.Module):
@@ -1106,7 +1109,6 @@ def compute_parametric_kl_penalty_and_dual_loss(
 
 
 class MPOLearner(acme.Learner):
-    """MPO learner."""
 
     def __init__(
         self,
@@ -1164,7 +1166,7 @@ class MPOLearner(acme.Learner):
             epsilon_stddev=1e-6,
             init_log_temperature=10.0,
             init_log_alpha_mean=10.0,
-            init_log_alpha_stddev=1000.0,
+            init_log_alpha_stddev=10.0,
         )
 
         # Create the optimizers.
@@ -1400,10 +1402,8 @@ class MultivariateNormalDiagHead(snt.Module):
         init_scale: float = 0.3,
         min_scale: float = 1e-6,
         tanh_mean: bool = False,
-        fixed_scale: bool = False,
-        use_tfd_independent: bool = False,
-        w_init: snt_init.Initializer = tf.initializers.VarianceScaling(1e-4),
-        b_init: snt_init.Initializer = tf.initializers.Zeros(),
+        w_init=tf.initializers.VarianceScaling(1e-4),
+        b_init=tf.initializers.Zeros(),
     ):
         """Initialization.
 
@@ -1413,9 +1413,6 @@ class MultivariateNormalDiagHead(snt.Module):
           min_scale: Minimum standard deviation.
           tanh_mean: Whether to transform the mean (via tanh) before passing it to
             the distribution.
-          fixed_scale: Whether to use a fixed variance.
-          use_tfd_independent: Whether to use tfd.Independent or
-            tfd.MultivariateNormalDiag class
           w_init: Initialization for linear layer weights.
           b_init: Initialization for linear layer biases.
         """
@@ -1424,31 +1421,21 @@ class MultivariateNormalDiagHead(snt.Module):
         self._min_scale = min_scale
         self._tanh_mean = tanh_mean
         self._mean_layer = snt.Linear(num_dimensions, w_init=w_init, b_init=b_init)
-        self._fixed_scale = fixed_scale
+        self._scale_layer = snt.Linear(num_dimensions, w_init=w_init, b_init=b_init)
 
-        if not fixed_scale:
-            self._scale_layer = snt.Linear(num_dimensions, w_init=w_init, b_init=b_init)
-        self._use_tfd_independent = use_tfd_independent
-
-    def __call__(self, inputs: tf.Tensor) -> tfd.Distribution:
+    def __call__(self, inputs: tf.Tensor):
         zero = tf.constant(0, dtype=inputs.dtype)
         mean = self._mean_layer(inputs)
 
-        if self._fixed_scale:
-            scale = tf.ones_like(mean) * self._init_scale
-        else:
-            scale = tf.nn.softplus(self._scale_layer(inputs))
-            scale *= self._init_scale / tf.nn.softplus(zero)
-            scale += self._min_scale
+        scale = tf.nn.softplus(self._scale_layer(inputs))
+        scale *= self._init_scale / tf.nn.softplus(zero)
+        scale += self._min_scale
 
         # Maybe transform the mean.
         if self._tanh_mean:
             mean = tf.tanh(mean)
 
-        if self._use_tfd_independent:
-            dist = tfd.Independent(tfd.Normal(loc=mean, scale=scale))
-        else:
-            dist = tfd.MultivariateNormalDiag(loc=mean, scale_diag=scale)
+        dist = tfd.Independent(tfd.Normal(loc=mean, scale=scale))
 
         return dist
 
@@ -1540,9 +1527,7 @@ def make_networks(
     policy_network = snt.Sequential(
         [
             LayerNormMLP(policy_layer_sizes, activate_final=True),
-            MultivariateNormalDiagHead(
-                num_dimensions, init_scale=0.7, use_tfd_independent=True
-            ),
+            MultivariateNormalDiagHead(num_dimensions, init_scale=0.7),
         ]
     )
 
@@ -1572,13 +1557,6 @@ def _make_environment(
     flatten_stack: bool = False,
     num_action_repeats: Optional[int] = None,
 ) -> dm_env.Environment:
-    """Implements a control suite environment factory."""
-    # Load dm_suite lazily not require Mujoco license when not using it.
-    from dm_control import suite  # pylint: disable=g-import-not-at-top
-    from acme.wrappers import (
-        mujoco as mujoco_wrappers,
-    )  # pylint: disable=g-import-not-at-top
-
     # Load raw control suite environment.
     environment = suite.load(domain_name, task_name)
 
@@ -1611,7 +1589,7 @@ def main(_):
 
     program_builder = MPO(
         make_environment,
-        make_networks,
+        network_factory=make_networks,
         target_policy_update_period=25,
         max_actor_steps=_MAX_ACTOR_STEPS.value,
     )
