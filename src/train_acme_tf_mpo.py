@@ -51,7 +51,7 @@ class EnvironmentLoop(core.Worker):
     """A simple RL environment loop.
 
     This takes `Environment` and `Actor` instances and coordinates their
-    interaction. Agent is updated if `should_update=True`. This can be used as:
+    interaction. This can be used as:
 
       loop = EnvironmentLoop(environment, actor)
       loop.run(num_episodes)
@@ -77,7 +77,6 @@ class EnvironmentLoop(core.Worker):
         actor: core.Actor,
         counter: Optional[counting.Counter] = None,
         logger: Optional[loggers.Logger] = None,
-        should_update: bool = True,
         label: str = "environment_loop",
         observers: Sequence[observers_lib.EnvLoopObserver] = (),
     ):
@@ -88,7 +87,6 @@ class EnvironmentLoop(core.Worker):
         self._logger = logger or loggers.make_default_logger(
             label, steps_key=self._counter.get_steps_key()
         )
-        self._should_update = should_update
         self._observers = observers
 
     def run_episode(self) -> loggers.LoggingData:
@@ -116,6 +114,11 @@ class EnvironmentLoop(core.Worker):
         timestep = self._environment.reset()
         env_reset_duration = time.time() - env_reset_start
         # Make the first observation.
+        self._actor.observe_first(timestep)
+        for observer in self._observers:
+            # Initialize the observer with the current state of the env after reset
+            # and the initial timestep.
+            observer.observe_first(self._environment, timestep)
 
         # Run an episode.
         while not timestep.last():
@@ -140,8 +143,7 @@ class EnvironmentLoop(core.Worker):
                 observer.observe(self._environment, timestep, action)
 
             # Give the actor the opportunity to update itself.
-            if self._should_update:
-                self._actor.update()
+            self._actor.update()
 
             # Equivalent to: episode_return += timestep.reward
             # We capture the return value because if timestep.reward is a JAX
