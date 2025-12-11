@@ -394,7 +394,7 @@ class EvaluatorActor:
         self._update_period = update_period
 
     @tf.function
-    def _policy(self, observation: NestedTensor) -> NestedTensor:
+    def _policy(self, observation):
         # Add a dummy batch dimension and as a side effect convert numpy to TF.
         batched_observation = tf2_utils.add_batch_dim(observation)
 
@@ -450,7 +450,7 @@ class FeedForwardActor:
         self._update_period = update_period
 
     @tf.function
-    def _policy(self, observation: NestedTensor) -> NestedTensor:
+    def _policy(self, observation):
         # Add a dummy batch dimension and as a side effect convert numpy to TF.
         batched_observation = tf2_utils.add_batch_dim(observation)
 
@@ -1508,7 +1508,7 @@ class CriticMultiplexer(snt.Module):
         self._action_network = action_network
         super().__init__(name="critic_multiplexer")
 
-    def __call__(self, observation: NestedTensor, action: NestedTensor) -> tf.Tensor:
+    def __call__(self, observation, action) -> tf.Tensor:
 
         # Maybe transform observations and actions before feeding them on.
         if self._observation_network:
