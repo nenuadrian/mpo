@@ -1788,9 +1788,7 @@ def main(_):
         max_actor_steps=_MAX_ACTOR_STEPS.value,
     )
 
-    program_builder.run()
-
-    # lp.launch(programs=program_builder.build())
+    lp.launch(programs=program_builder.build())
 
 
 if __name__ == "__main__":

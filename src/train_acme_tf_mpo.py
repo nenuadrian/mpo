@@ -372,7 +372,6 @@ class MPO:
         )
         return [replay_table]
 
-
     def learner(
         self,
         replay: reverb.Client,
@@ -1128,8 +1127,8 @@ class MPOLearner(acme.VariableSource):
         iterator = range(num_steps) if num_steps is not None else itertools.count()
 
         for _ in iterator:
-        self.step()
-        
+            self.step()
+
     @tf.function
     def _step(self) -> types.Nest:
         # Update target network.
