@@ -707,15 +707,6 @@ class MPO:
             client=replay, n_step=self._n_step, discount=self._additional_discount
         )
 
-        # Create the agent.
-        actor = FeedForwardActor(
-            logger=logger,
-            counter=counter,
-            policy_network=behavior_network,
-            adder=adder,
-            variable_client=variable_client,
-        )
-
         # Create logger and counter; actors will not spam bigtable.
         counter = counting.Counter(counter, "actor")
         logger = loggers.make_default_logger(
@@ -723,6 +714,15 @@ class MPO:
             save_data=False,
             time_delta=self._log_every,
             steps_key="actor_steps",
+        )
+
+        # Create the agent.
+        actor = FeedForwardActor(
+            logger=logger,
+            counter=counter,
+            policy_network=behavior_network,
+            adder=adder,
+            variable_client=variable_client,
         )
 
         # Create the run loop and return it.
