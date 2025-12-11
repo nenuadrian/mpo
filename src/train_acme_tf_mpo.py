@@ -13,39 +13,28 @@ from typing import (
 import time
 import collections
 import threading
-from absl import app
-from absl import flags
+import argparse
 import numpy as np
-import sonnet as snt
-import reverb
+import sonnet as snt  # type: ignore
+import reverb  # type: ignore
 import wandb
-import tree
+import tree  # type: ignore
 import operator
 import itertools
 import os
 
 import reverb_transition as adders
 
-import dm_env
-from dm_env import specs
-from dm_control import suite
+import dm_env  # type: ignore
+from dm_env import specs  # type: ignore
+from dm_control import suite  # type: ignore
 
 
-import tensorflow as tf
-import tensorflow_probability as tfp
-import trfl
+import tensorflow as tf  # type: ignore
+import tensorflow_probability as tfp  # type: ignore
+import trfl  # type: ignore
 
 
-tfd = tfp.distributions
-
-FLAGS = flags.FLAGS
-_MAX_ACTOR_STEPS = flags.DEFINE_integer(
-    "max_actor_steps",
-    None,
-    "Number of actor steps to run; defaults to None for an endless loop.",
-)
-_DOMAIN = flags.DEFINE_string("domain", "cartpole", "Control suite domain name.")
-_TASK = flags.DEFINE_string("task", "balance", "Control suite task name.")
 _MPO_FLOAT_EPSILON = 1e-8
 
 
@@ -486,7 +475,11 @@ class EvaluatorActor:
         policy = self._policy_network(batched_observation)
 
         # Sample from the policy if it is stochastic.
-        action = policy.sample() if isinstance(policy, tfd.Distribution) else policy
+        action = (
+            policy.sample()
+            if isinstance(policy, tfp.distributions.Distribution)
+            else policy
+        )
 
         return action
 
@@ -543,7 +536,11 @@ class FeedForwardActor:
         policy = self._policy_network(batched_observation)
 
         # Sample from the policy if it is stochastic.
-        action = policy.sample() if isinstance(policy, tfd.Distribution) else policy
+        action = (
+            policy.sample()
+            if isinstance(policy, tfp.distributions.Distribution)
+            else policy
+        )
 
         return action
 
@@ -681,7 +678,7 @@ def _generate_zeros_from_spec(spec: specs.Array) -> np.ndarray:
 class StochasticMeanHead(snt.Module):
     """Simple sonnet module to produce the mean of a tfp.Distribution."""
 
-    def __call__(self, distribution: tfd.Distribution):
+    def __call__(self, distribution: tfp.distributions.Distribution):
         return distribution.mean()
 
 
@@ -704,12 +701,17 @@ class MPO:
         variable_update_period: int = 1000,
         policy_loss_factory: Optional[Callable[[], snt.Module]] = None,
         max_actor_steps: Optional[int] = None,
+        domain_name: str = "cartpole",
+        task_name: str = "balance",
     ):
+
+        self._domain_name = domain_name
+        self._task_name = task_name
 
         if environment_spec is None:
             environment = _make_environment(
-                domain_name=_DOMAIN.value,
-                task_name=_TASK.value,
+                domain_name=self._domain_name,
+                task_name=self._task_name,
             )
             environment_spec = EnvironmentSpec(
                 observations=environment.observation_spec(),
@@ -823,7 +825,7 @@ class MPO:
 
         # Create environment and target networks to act with.
         environment = _make_environment(
-            domain_name=_DOMAIN.value, task_name=_TASK.value
+            domain_name=self._domain_name, task_name=self._task_name
         )
         agent_networks = self._network_factory(action_spec)
 
@@ -862,7 +864,7 @@ class MPO:
 
         # Create environment and target networks to act with.
         environment = _make_environment(
-            domain_name=_DOMAIN.value, task_name=_TASK.value
+            domain_name=self._domain_name, task_name=self._task_name
         )
         agent_networks = self._network_factory(action_spec)
 
@@ -1041,8 +1043,12 @@ class MPOLoss(snt.Module):
 
     def __call__(
         self,
-        online_action_distribution: Union[tfd.MultivariateNormalDiag, tfd.Independent],
-        target_action_distribution: Union[tfd.MultivariateNormalDiag, tfd.Independent],
+        online_action_distribution: Union[
+            tfp.distributions.MultivariateNormalDiag, tfp.distributions.Independent
+        ],
+        target_action_distribution: Union[
+            tfp.distributions.MultivariateNormalDiag, tfp.distributions.Independent
+        ],
         actions: tf.Tensor,  # Shape [N, B, D].
         q_values: tf.Tensor,  # Shape [N, B].
     ) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
@@ -1064,15 +1070,17 @@ class MPOLoss(snt.Module):
 
         # Cast `MultivariateNormalDiag`s to Independent Normals.
         # The latter allows us to satisfy KL constraints per-dimension.
-        if isinstance(target_action_distribution, tfd.MultivariateNormalDiag):
-            target_action_distribution = tfd.Independent(
-                tfd.Normal(
+        if isinstance(
+            target_action_distribution, tfp.distributions.MultivariateNormalDiag
+        ):
+            target_action_distribution = tfp.distributions.Independent(
+                tfp.distributions.Normal(
                     target_action_distribution.mean(),
                     target_action_distribution.stddev(),
                 )
             )
-            online_action_distribution = tfd.Independent(
-                tfd.Normal(
+            online_action_distribution = tfp.distributions.Independent(
+                tfp.distributions.Normal(
                     online_action_distribution.mean(),
                     online_action_distribution.stddev(),
                 )
@@ -1129,7 +1137,7 @@ class MPOLoss(snt.Module):
         kl_nonparametric = compute_nonparametric_kl_from_normalized_weights(
             normalized_weights
         )
-
+        penalty_kl_nonparametric = None
         if self._action_penalization:
             # Project and transform action penalization temperature.
             self._log_penalty_temperature.assign(
@@ -1162,11 +1170,11 @@ class MPOLoss(snt.Module):
         # Decompose the online policy into fixed-mean & fixed-stddev distributions.
         # This has been documented as having better performance in bandit settings,
         # see e.g. https://arxiv.org/pdf/1812.02256.pdf.
-        fixed_stddev_distribution = tfd.Independent(
-            tfd.Normal(loc=online_mean, scale=target_scale)
+        fixed_stddev_distribution = tfp.distributions.Independent(
+            tfp.distributions.Normal(loc=online_mean, scale=target_scale)
         )
-        fixed_mean_distribution = tfd.Independent(
-            tfd.Normal(loc=target_mean, scale=online_scale)
+        fixed_mean_distribution = tfp.distributions.Independent(
+            tfp.distributions.Normal(loc=target_mean, scale=online_scale)
         )
 
         # Compute the decomposed policy losses.
@@ -1375,7 +1383,7 @@ def compute_parametric_kl_penalty_and_dual_loss(
 class StochasticSamplingHead(snt.Module):
     """Simple sonnet module to sample from a tfp.Distribution."""
 
-    def __call__(self, distribution: tfd.Distribution):
+    def __call__(self, distribution: tfp.distributions.Distribution):
         return distribution.sample()
 
 
@@ -1433,7 +1441,7 @@ class LayerNormMLP(snt.Module):
 
 
 class MultivariateNormalDiagHead(snt.Module):
-    """Module that produces a multivariate normal distribution using tfd.Independent or tfd.MultivariateNormalDiag."""
+    """Module that produces a multivariate normal distribution using tfp.distributions.Independent or tfp.distributions.MultivariateNormalDiag."""
 
     def __init__(
         self,
@@ -1474,7 +1482,9 @@ class MultivariateNormalDiagHead(snt.Module):
         if self._tanh_mean:
             mean = tf.tanh(mean)
 
-        dist = tfd.Independent(tfd.Normal(loc=mean, scale=scale))
+        dist = tfp.distributions.Independent(
+            tfp.distributions.Normal(loc=mean, scale=scale)
+        )
 
         return dist
 
@@ -1703,26 +1713,34 @@ def _make_environment(
     return environment
 
 
-def main(_):
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train ACME MPO agent.")
+    parser.add_argument("--domain", default="cartpole")
+    parser.add_argument("--task", default="balance")
+    parser.add_argument("--max_actor_steps", type=int, default=None)
+    return parser.parse_args()
+
+
+def main(args):
     wandb.init(
         entity="adrian-research",
-        group=_DOMAIN.value + "_" + _TASK.value,
+        group=f"{args.domain}_{args.task}",
         project="lp_mpo_single_file",
         config={
-            "domain": _DOMAIN.value,
-            "task": _TASK.value,
-            "max_actor_steps": _MAX_ACTOR_STEPS.value,
+            "domain": args.domain,
+            "task": args.task,
+            "max_actor_steps": args.max_actor_steps,
         },
     )
-
     program_builder = MPO(
         network_factory=make_networks,
         target_policy_update_period=25,
-        max_actor_steps=_MAX_ACTOR_STEPS.value,
+        max_actor_steps=args.max_actor_steps,
+        domain_name=args.domain,
+        task_name=args.task,
     )
-
     program_builder.run()
 
 
 if __name__ == "__main__":
-    app.run(main)
+    main(parse_args())
