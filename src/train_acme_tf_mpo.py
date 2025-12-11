@@ -640,6 +640,7 @@ class MPOLearner(acme.VariableSource):
             min_replay_size=self._min_replay_size,
         ):
             self._logger.write({"learner_waiting_for_replay": True})
+            time.sleep(1)
             return
 
         # Run the learning step.
