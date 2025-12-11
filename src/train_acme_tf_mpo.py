@@ -297,7 +297,8 @@ class FeedForwardActor:
         self._adder.add(action, next_timestep)
 
     def update(self):
-        self._variable_client.update()
+        #self._variable_client.update()
+        pass
 
 
 class StochasticMeanHead(snt.Module):
@@ -714,7 +715,7 @@ class MPO:
 
         # Make sure not to use a random policy after checkpoint restoration by
         # assigning variables before running the environment loop.
-        variable_client.update_and_wait()
+        #variable_client.update_and_wait()
 
         # Component to add things into replay.
         adder = adders.NStepTransitionAdder(
@@ -785,7 +786,6 @@ class MPO:
             "evaluator", time_delta=self._log_every, steps_key="evaluator_steps"
         )
 
-        # Create the agent.
         evaluator = EvaluatorActor(
             policy_network=evaluator_network,
             variable_client=variable_client,
