@@ -383,7 +383,13 @@ class MPO:
     ):
 
         if environment_spec is None:
-            environment_spec = specs.make_environment_spec(environment_factory(False))
+            environment_spec = specs.make_environment_spec(
+                _make_environment(
+                    evaluation=False,
+                    domain_name=_DOMAIN.value,
+                    task_name=_TASK.value,
+                )
+            )
 
         self._environment_factory = environment_factory
         self._network_factory = network_factory
