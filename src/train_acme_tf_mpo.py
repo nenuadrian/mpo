@@ -45,13 +45,15 @@ _MPO_FLOAT_EPSILON = 1e-8
 
 
 class SimpleReplayBuffer:
-    """Thread-safe ring-buffer replay with uniform sampling."""
+    """Thread-safe ring-buffer replay with uniform sampling + rate limiting."""
 
     def __init__(self, capacity: int):
         self._capacity = int(capacity)
         self._storage: list[types.Transition] = []
         self._idx = 0
         self._lock = threading.Lock()
+        self._insert_count = 0  # total number of transitions ever inserted
+        self._sample_count = 0  # total number of batches ever sampled
 
     def add(self, transition: types.Transition) -> None:
         with self._lock:
@@ -60,10 +62,48 @@ class SimpleReplayBuffer:
             else:
                 self._storage[self._idx] = transition
             self._idx = (self._idx + 1) % self._capacity
+            self._insert_count += 1
 
     @property
     def size(self) -> int:
-        return len(self._storage)
+        with self._lock:
+            return len(self._storage)
+
+    @property
+    def insert_count(self) -> int:
+        with self._lock:
+            return self._insert_count
+
+    @property
+    def sample_count(self) -> int:
+        with self._lock:
+            return self._sample_count
+
+    def can_sample(
+        self,
+        samples_per_insert: float,
+        error_buffer: float,
+        min_replay_size: int,
+    ) -> bool:
+        """Reverb-like SampleToInsertRatio gate.
+
+        Allows sampling only if:
+            - enough items in replay
+            - S <= samples_per_insert * I + error_buffer
+        """
+        with self._lock:
+            if len(self._storage) < min_replay_size:
+                return False
+
+            I = float(self._insert_count)
+            S = float(self._sample_count)
+
+            # If no inserts yet, don't let learner sample.
+            if I == 0.0:
+                return False
+
+            allowed_samples = samples_per_insert * I + error_buffer
+            return S < allowed_samples
 
     def sample(self, batch_size: int) -> types.Transition:
         """Uniformly sample a batch and return a `types.Transition` of TF tensors."""
@@ -87,7 +127,8 @@ class SimpleReplayBuffer:
                 [np.array(self._storage[i].next_observation) for i in indices], axis=0
             )
 
-        # Convert to TF tensors. Shapes: [B, ...] like Reverb dataset would give.
+            self._sample_count += 1
+
         obs_tf = tf.convert_to_tensor(obs)
         actions_tf = tf.convert_to_tensor(actions)
         rewards_tf = tf.convert_to_tensor(rewards)
@@ -100,7 +141,7 @@ class SimpleReplayBuffer:
             reward=rewards_tf,
             discount=discounts_tf,
             next_observation=next_obs_tf,
-            extras=(),  # unused
+            extras=(),
         )
 
 
@@ -588,7 +629,11 @@ class MPOLearner(acme.VariableSource):
         return fetches
 
     def step(self):
-        if self._replay_buffer.size < self._min_replay_size:
+        if not self._replay_buffer.can_sample(
+            samples_per_insert=32.0,
+            error_buffer=self._min_replay_size * 0.1,
+            min_replay_size=self._min_replay_size,
+        ):
             return
 
         # Run the learning step.
