@@ -291,6 +291,26 @@ class MPOLoss(nn.Module):
         loss_kl_penalty = loss_kl_mean + loss_kl_std
         loss_dual = loss_alpha_mean + loss_alpha_std + loss_temperature
 
+        if self.action_penalization:
+            penalty_temperature = F.softplus(self.log_penalty_temperature) + 1e-8
+            diff_out = sampled_actions - sampled_actions.clamp(-1.0, 1.0)
+            cost = -torch.norm(diff_out, dim=-1)  # [N,B]
+            penalty_tempered = cost.detach() / penalty_temperature
+            penalty_weights = torch.softmax(penalty_tempered, dim=0).detach()
+            penalty_q_logsumexp = torch.logsumexp(penalty_tempered, dim=0)
+            loss_penalty_temp = (
+                self._epsilon_penalty + penalty_q_logsumexp.mean() - math.log(float(N))
+            ) * penalty_temperature
+            penalty_ce = weighted_cross_entropy(
+                fixed_mean_mean,
+                fixed_mean_scale,
+                N,
+                sampled_actions,
+                penalty_weights,
+            )
+            loss_policy = loss_policy + penalty_ce
+            loss_temperature = loss_temperature + loss_penalty_temp
+
         loss = loss_policy + loss_kl_penalty + loss_dual
 
         # Diagnostics: compute non-parametric KL and other stats (match TF)
@@ -351,28 +371,6 @@ class MPOLoss(nn.Module):
                 stats["train/kl_stddev_rel_max"] = float(
                     kl_std_per_dim.max().item() / float(self._epsilon_stddev)
                 )
-
-            if self.action_penalization:
-                penalty_temperature = F.softplus(self.log_penalty_temperature) + 1e-8
-                diff_out = sampled_actions - sampled_actions.clamp(-1.0, 1.0)
-                cost = -torch.norm(diff_out, dim=-1)  # [N,B]
-                penalty_tempered = cost.detach() / penalty_temperature
-                penalty_weights = torch.softmax(penalty_tempered, dim=0).detach()
-                penalty_q_logsumexp = torch.logsumexp(penalty_tempered, dim=0)
-                loss_penalty_temp = (
-                    self._epsilon_penalty
-                    + penalty_q_logsumexp.mean()
-                    - math.log(float(N))
-                ) * penalty_temperature
-                penalty_ce = weighted_cross_entropy(
-                    fixed_mean_mean,
-                    fixed_mean_scale,
-                    N,
-                    sampled_actions,
-                    penalty_weights,
-                )
-                loss_policy = loss_policy + penalty_ce
-                loss_temperature = loss_temperature + loss_penalty_temp
 
         return loss, stats
 
@@ -540,7 +538,6 @@ class MPOAgent:
         rewards_b = batch["reward"].to(device)
         discounts_b = batch["discount"].to(device)
         next_obs_b = batch["next_obs"].to(device)
-        dones_b = batch["done"].to(device)
 
         # --- compute target Q via target policy sampling ---
         with torch.no_grad():
@@ -741,7 +738,6 @@ def train(
 
     step = 0
     while step < max_actor_steps:
-        # run one episode (or until global step budget exhausted)
         done = False
         while not done and step < max_actor_steps:
             step += 1

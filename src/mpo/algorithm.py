@@ -1,5 +1,6 @@
 import random
 import math
+import torch.distributions as dist
 
 import torch
 import torch.nn as nn
@@ -181,7 +182,6 @@ def policy_evaluation_e_step(
       kl_np: float, estimated discrete KL(q_nonparametric || π_old over samples)
       temperature_loss: scalar dual loss for updating log-temperature
       temperature_value: float temperature (for logging)
-      pre_tanh_actions: [B, K, act_dim] pre-tanh samples (for moment matching)
     """
     B, obs_dim = states.shape
 
@@ -203,7 +203,6 @@ def policy_evaluation_e_step(
         actions = actions_flat.view(B, K, -1)
         q_vals = q_flat.view(K, B)  # [K, B] for helper, transpose below as needed
         log_pi_old = log_pi_flat.view(B, K)
-        pre_tanh_actions = pre_tanh_flat.view(B, K, -1)
 
     # Use Acme-style helper (no grad into Q) to get non-parametric weights
     # and the dual loss for the temperature. q_values is [K,B]; our q_vals is
@@ -234,22 +233,19 @@ def policy_evaluation_e_step(
         q_dist,
         kl_np,
         temperature_loss,
-        float(temperature.item()),
-        pre_tanh_actions.detach(),
+        float(temperature.item())
     )
 
 
 def policy_evaluation_m_step(
     policy_net: GaussianPolicy,
+    target_policy_net: GaussianPolicy,
     states: torch.Tensor,
     actions: torch.Tensor,
     weights: torch.Tensor,
-    pre_tanh_actions: torch.Tensor,
     entropy_coeff: float = 0.0,
     alpha_mean: torch.Tensor | None = None,
     alpha_std: torch.Tensor | None = None,
-    mean_constraint: float = 0.0,
-    std_constraint: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Continuous-action M-step:
@@ -291,37 +287,34 @@ def policy_evaluation_m_step(
     else:
         mu_state, log_std_state = policy_net(states)
 
-    weights_detached = weights.detach()
-    mean_violation = torch.zeros((), device=states.device, dtype=states.dtype)
-    std_violation = torch.zeros((), device=states.device, dtype=states.dtype)
-    if pre_tanh_actions is not None:
-        target_mean = (weights_detached.unsqueeze(-1) * pre_tanh_actions).sum(dim=1)
-        target_second_moment = (
-            weights_detached.unsqueeze(-1) * pre_tanh_actions.pow(2)
-        ).sum(dim=1)
-        target_var = torch.clamp(target_second_moment - target_mean.pow(2), min=1e-6)
-        target_std = torch.sqrt(target_var)
+    with torch.no_grad():
+        target_mu, target_log_std = target_policy_net(states)
+    target_std = torch.exp(target_log_std)
+    policy_std = torch.exp(log_std_state)
 
-        policy_mean = mu_state
-        policy_std = torch.exp(log_std_state)
-
-        mean_violation_per_state = (policy_mean - target_mean).pow(2).sum(dim=-1)
-        std_violation_per_state = (policy_std - target_std).pow(2).sum(dim=-1)
-
-        if alpha_mean is not None:
-            loss_pi = loss_pi + alpha_mean * (
-                mean_violation_per_state.mean() - float(mean_constraint)
-            )
-        if alpha_std is not None:
-            loss_pi = loss_pi + alpha_std * (
-                std_violation_per_state.mean() - float(std_constraint)
-            )
-        mean_violation = mean_violation_per_state.mean().detach()
-        std_violation = std_violation_per_state.mean().detach()
+    # KL decomposition using torch distributions.
+    kl_mean = dist.kl_divergence(
+        dist.Normal(target_mu, target_std), dist.Normal(mu_state, target_std)
+    ).sum(
+        dim=-1
+    )  # [B]
+    kl_std = dist.kl_divergence(
+        dist.Normal(target_mu, target_std), dist.Normal(target_mu, policy_std)
+    ).sum(
+        dim=-1
+    )  # [B]
+    loss_kl_mean = torch.zeros((), device=states.device, dtype=states.dtype)
+    loss_kl_std = torch.zeros((), device=states.device, dtype=states.dtype)
+    if alpha_mean is not None:
+        loss_kl_mean = alpha_mean.detach() * kl_mean.mean()
+        loss_pi = loss_pi + loss_kl_mean
+    if alpha_std is not None:
+        loss_kl_std = alpha_std.detach() * kl_std.mean()
+        loss_pi = loss_pi + loss_kl_std
 
     stats = {
-        "mean_violation": mean_violation,
-        "std_violation": std_violation,
+        "kl_mean": kl_mean.mean().detach(),
+        "kl_std": kl_std.mean().detach(),
     }
     if ent is not None:
         stats["entropy"] = ent.detach()
@@ -522,8 +515,7 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
                     q_dist,
                     kl_np,
                     temperature_loss,
-                    _,
-                    pre_tanh_actions,
+                    _
                 ) = policy_evaluation_e_step(
                     states,
                     pi_old,
@@ -534,25 +526,23 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
                 )
                 pi_loss, policy_stats = policy_evaluation_m_step(
                     pi,
+                    pi_old,
                     states,
                     actions_e,
                     q_dist,
-                    pre_tanh_actions=pre_tanh_actions,
                     entropy_coeff=config.entropy_coeff,
                     alpha_mean=alpha_mean.detach(),
                     alpha_std=alpha_std.detach(),
-                    mean_constraint=config.epsilon_mean,
-                    std_constraint=config.epsilon_stddev,
                 )
-                mean_violation = policy_stats["mean_violation"]
-                std_violation = policy_stats["std_violation"]
+                kl_mean_det = policy_stats["kl_mean"]
+                kl_std_det = policy_stats["kl_std"]
 
                 # Form dual loss and update dual parameters from mpo_loss_module.
                 dual_optimizer.zero_grad()
                 dual_loss = (
                     temperature_loss
-                    - alpha_mean * (mean_violation - config.epsilon_mean)
-                    - alpha_std * (std_violation - config.epsilon_stddev)
+                    - alpha_mean * (kl_mean_det - config.epsilon_mean)
+                    - alpha_std * (kl_std_det - config.epsilon_stddev)
                 )
                 dual_loss_value = float(dual_loss.detach().cpu().item())
                 dual_loss.backward(retain_graph=True)
@@ -618,8 +608,8 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
                 "train/log_alpha_stddev": float(
                     mpo_loss_module.log_alpha_stddev.detach().cpu().item()
                 ),
-                "train/mean_violation": float(mean_violation.cpu().item()),
-                "train/std_violation": float(std_violation.cpu().item()),
+                "train/kl_mean": float(kl_mean_det.cpu().item()),
+                "train/kl_std": float(kl_std_det.cpu().item()),
             }
             if "entropy" in policy_stats:
                 log_payload["train/policy_entropy"] = float(
