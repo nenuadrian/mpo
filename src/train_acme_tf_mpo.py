@@ -242,14 +242,14 @@ class EvaluatorActor:
         # Return a numpy array with squeezed out batch dimension.
         return tf2_utils.to_numpy_squeeze(action)
 
-    def observe_first(self, timestep: dm_env.TimeStep):
+    def observe_first(self, _: dm_env.TimeStep):
         pass
 
-    def observe(self, action: types.NestedArray, next_timestep: dm_env.TimeStep):
+    def observe(self, _: types.NestedArray, __: dm_env.TimeStep):
         pass
 
-    def update(self, wait: bool = False):
-        self._variable_client.update(wait)
+    def update(self):
+        self._variable_client.update()
 
 
 class FeedForwardActor:
@@ -296,8 +296,8 @@ class FeedForwardActor:
     def observe(self, action: types.NestedArray, next_timestep: dm_env.TimeStep):
         self._adder.add(action, next_timestep)
 
-    def update(self, wait: bool = False):
-        self._variable_client.update(wait)
+    def update(self):
+        self._variable_client.update()
 
 
 class StochasticMeanHead(snt.Module):
