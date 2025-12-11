@@ -10,7 +10,7 @@ from typing import (
     NamedTuple,
 )
 import time
-
+import collections
 import threading
 from absl import app
 from absl import flags
@@ -58,64 +58,10 @@ def make_reverb_dataset(
     server_address: str,
     batch_size: Optional[int] = None,
     prefetch_size: Optional[int] = None,
-    table: Union[str, Mapping[str, float]] = adders.DEFAULT_PRIORITY_TABLE,
+    table: str = "priority_table",
     num_parallel_calls: Optional[int] = 12,
     max_in_flight_samples_per_worker: Optional[int] = None,
-    # Deprecated kwargs.
-    environment_spec: Optional[specs.EnvironmentSpec] = None,
-    extra_spec: Optional[types.NestedSpec] = None,
-    transition_adder: bool = False,
-    convert_zero_size_to_none: bool = False,
-    using_deprecated_adder: bool = False,
-    sequence_length: Optional[int] = None,
 ) -> tf.data.Dataset:
-    """Make a TensorFlow dataset backed by a Reverb trajectory replay service.
-
-    Arguments:
-      server_address: Address of the Reverb server.
-      batch_size: Batch size of the returned dataset.
-      prefetch_size: The number of elements to prefetch from the original dataset.
-        Note that Reverb may do some internal prefetching in addition to this.
-      table: The name of the Reverb table to use, or a mapping of (table_name,
-        float_weight) for mixing multiple tables in the input (e.g. mixing online
-        and offline experiences).
-      num_parallel_calls: The parralelism to use. Setting it to `tf.data.AUTOTUNE`
-        will allow `tf.data` to automatically find a reasonable value.
-      max_in_flight_samples_per_worker: see reverb.TrajectoryDataset for details.
-      postprocess: User-specified transformation to be applied to the dataset (as
-        `ds.map(postprocess)`).
-      environment_spec: DEPRECATED! Do not use.
-      extra_spec: DEPRECATED! Do not use.
-      transition_adder: DEPRECATED! Do not use.
-      convert_zero_size_to_none: DEPRECATED! Do not use.
-      using_deprecated_adder: DEPRECATED! Do not use.
-      sequence_length: DEPRECATED! Do not use.
-
-    Returns:
-      A `tf.data.Dataset` iterating over the contents of the Reverb table.
-
-    Raises:
-      ValueError if `environment_spec` or `extra_spec` are set, or `table` is a
-      mapping with no positive weight values.
-    """
-
-    if environment_spec or extra_spec:
-        raise ValueError(
-            "The make_reverb_dataset factory function no longer requires specs as"
-            " as they should be passed as a signature to the reverb.Table when it"
-            " is created. Consider either updating your code or falling back to the"
-            " deprecated dataset factory in acme/datasets/deprecated."
-        )
-
-    # These are no longer used and are only kept in the call signature for
-    # backward compatibility.
-    del environment_spec
-    del extra_spec
-    del transition_adder
-    del convert_zero_size_to_none
-    del using_deprecated_adder
-    del sequence_length
-
     # This is the default that used to be set by reverb.TFClient.dataset().
     if max_in_flight_samples_per_worker is None and batch_size is None:
         max_in_flight_samples_per_worker = 100
