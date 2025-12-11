@@ -4,33 +4,33 @@ import functools
 from typing import List, Optional, Dict, Tuple, Union, Sequence, Callable
 import time
 
+
 from absl import app
 from absl import flags
+import numpy as np
+import sonnet as snt
+import launchpad as lp
+import dm_env
+import reverb
+
+import acme
 from acme import specs
 from acme import types
 from acme import core
 from acme import adders as acme_adders
-import helpers
 from acme.tf import utils as tf2_utils
-import launchpad as lp
-import numpy as np
-import sonnet as snt
-import acme
 from acme.tf import savers as tf2_savers
 from acme.utils import counting
 from acme.utils import loggers
-import tensorflow as tf
-import trfl
 from acme import datasets
 from acme.adders import reverb as adders
 from acme.tf import variable_utils as tf2_variable_utils
 from acme.utils import lp_utils
-import dm_env
-import reverb
+from acme import wrappers
+
+import tensorflow as tf
 import tensorflow_probability as tfp
-
-
-from typing import Optional, Tuple
+import trfl
 
 
 tfd = tfp.distributions
@@ -1388,9 +1388,50 @@ def make_networks(
     }
 
 
+def _make_environment(
+    evaluation: bool = False,
+    domain_name: str = "cartpole",
+    task_name: str = "balance",
+    from_pixels: bool = False,
+    frames_to_stack: int = 3,
+    flatten_stack: bool = False,
+    num_action_repeats: Optional[int] = None,
+) -> dm_env.Environment:
+    """Implements a control suite environment factory."""
+    # Load dm_suite lazily not require Mujoco license when not using it.
+    from dm_control import suite  # pylint: disable=g-import-not-at-top
+    from acme.wrappers import (
+        mujoco as mujoco_wrappers,
+    )  # pylint: disable=g-import-not-at-top
+
+    # Load raw control suite environment.
+    environment = suite.load(domain_name, task_name)
+
+    # Maybe wrap to get pixel observations from environment state.
+    if from_pixels:
+        environment = mujoco_wrappers.MujocoPixelWrapper(environment)
+        environment = wrappers.FrameStackingWrapper(
+            environment, num_frames=frames_to_stack, flatten=flatten_stack
+        )
+    environment = wrappers.CanonicalSpecWrapper(environment, clip=True)
+
+    if num_action_repeats:
+        environment = wrappers.ActionRepeatWrapper(
+            environment, num_repeats=num_action_repeats
+        )
+    environment = wrappers.SinglePrecisionWrapper(environment)
+
+    if evaluation:
+        # The evaluator in the distributed agent will set this to True so you can
+        # use this clause to, e.g., set up video recording by the evaluator.
+        pass
+
+    return environment
+
+
 def main(_):
     make_environment = functools.partial(
-        helpers.make_environment, domain_name=_DOMAIN.value, task_name=_TASK.value
+        _make_environment, domain_name=_DOMAIN.value, task_name=_TASK.value
     )
 
     program_builder = DistributedMPO(
