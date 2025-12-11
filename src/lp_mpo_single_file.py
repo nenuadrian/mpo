@@ -279,7 +279,7 @@ class CheckpointingRunner(core.Worker):
     ):
 
         # If the object to be wrapped exposes its TF State, checkpoint that.
-        objects_to_save = wrapped.state
+        objects_to_save = wrapped
 
         self._wrapped = wrapped
         self._time_delta_minutes = time_delta_minutes
