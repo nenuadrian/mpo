@@ -563,9 +563,7 @@ class MPO:
         log_every: float = 10.0,
     ):
 
-        environment_spec = _make_environment(
-            domain_name=_DOMAIN.value, task_name=_TASK.value
-        )
+        environment_spec = _make_environment(domain_name=domain, task_name=task)
 
         self.domain = domain
         self.task = task
