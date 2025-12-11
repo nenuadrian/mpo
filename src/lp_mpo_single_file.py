@@ -222,15 +222,14 @@ class EnvironmentLoop(core.Worker):
 
         episode_count: int = 0
         step_count: int = 0
-        with signals.runtime_terminator():
-            while not should_terminate(episode_count, step_count):
-                episode_start = time.time()
-                result = self.run_episode()
-                result = {**result, **{"episode_duration": time.time() - episode_start}}
-                episode_count += 1
-                step_count += int(result["episode_length"])
-                # Log the given episode results.
-                self._logger.write(result)
+        while not should_terminate(episode_count, step_count):
+            episode_start = time.time()
+            result = self.run_episode()
+            result = {**result, **{"episode_duration": time.time() - episode_start}}
+            episode_count += 1
+            step_count += int(result["episode_length"])
+            # Log the given episode results.
+            self._logger.write(result)
 
         return step_count
 
@@ -837,24 +836,31 @@ class MPO:
 
     def run(self):
         import threading
-        
+
         counter = counting.Counter()
         server = reverb.Server(tables=self.replay())
-        client = reverb.Client(f'localhost:{server.port}')
+        client = reverb.Client(f"localhost:{server.port}")
 
         learner = self.learner(client, counter)
 
         actor = self.actor(client, learner, counter)
-        
-        
+
         evaluator = self.evaluator(learner, counter)
-        
+
         threads = [
-            threading.Thread(target=learner.run, kwargs={"num_steps": self._max_actor_steps}, daemon=True),
-            threading.Thread(target=actor.run, kwargs={"num_steps": self._max_actor_steps}, daemon=True),
-            threading.Thread(target=evaluator.run, daemon=True),  
+            threading.Thread(
+                target=learner.run,
+                kwargs={"num_steps": self._max_actor_steps},
+                daemon=True,
+            ),
+            threading.Thread(
+                target=actor.run,
+                kwargs={"num_steps": self._max_actor_steps},
+                daemon=True,
+            ),
+            threading.Thread(target=evaluator.run, daemon=True),
         ]
-        
+
         for t in threads:
             t.start()
         for t in threads:
@@ -1332,7 +1338,7 @@ class MPOLearner(acme.Learner):
         target_policy_update_period: int,
         target_critic_update_period: int,
         dataset: tf.data.Dataset,
-        counter:counting.Counter,
+        counter: counting.Counter,
         observation_network: types.TensorTransformation = tf.identity,
         target_observation_network: types.TensorTransformation = tf.identity,
         policy_loss_module: Optional[snt.Module] = None,
@@ -1812,10 +1818,10 @@ def main(_):
         target_policy_update_period=25,
         max_actor_steps=_MAX_ACTOR_STEPS.value,
     )
-    
+
     program_builder.run()
 
-    #lp.launch(programs=program_builder.build())
+    # lp.launch(programs=program_builder.build())
 
 
 if __name__ == "__main__":
