@@ -104,6 +104,7 @@ class MultivariateNormalDiagHead(nn.Module):
         self.init_scale = init_scale
         self.min_scale = min_scale
         self.use_independent = use_independent
+        self._fixed_scale = None
         if not fixed_scale:
             # output positive scale via softplus of a linear layer
             self.log_scale_layer = nn.Linear(input_dim, action_dim)
@@ -133,8 +134,8 @@ class MultivariateNormalDiagHead(nn.Module):
         mean = self.mean_layer(inputs)
         if self.tanh_mean:
             mean = torch.tanh(mean)
-        if self.fixed_scale:
-            scale = torch.ones_like(mean) * float(self.fixed_scale)
+        if self._fixed_scale is not None:
+            scale = torch.ones_like(mean) * float(self._fixed_scale)
         else:
             log_scale = self.log_scale_layer(inputs)
             scale = F.softplus(log_scale)
@@ -537,7 +538,8 @@ class MPOLoss(nn.Module):
         stats["train/dual_temperature"] = temperature.mean()
 
         # Loss terms
-        stats["train/loss_policy"] = loss.detach()
+        stats["train/loss_policy"] = loss_policy.detach()
+        stats["train/total_loss"] = loss.detach()
         stats["train/loss_alpha"] = (loss_alpha_mean + loss_alpha_stddev).detach()
         stats["train/loss_temperature"] = loss_temperature.detach()
 
@@ -703,15 +705,8 @@ class MPOAgent:
         ).to(device)
 
         # optimizers
-        # Critic optimizer trains both critic and observation encoder (like TF learner).
-        self._critic_optimizer = optim.Adam(
-            list(self.obs_encoder.parameters()) + list(self.critic.parameters()),
-            lr=lr_critic,
-        )
-        # Policy optimizer trains only the policy head (policy shouldn't train the obs encoder).
-        self._policy_optimizer = optim.Adam(
-            list(self.policy_head.parameters()), lr=lr_policy
-        )
+        self._critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
+        self._policy_optimizer = optim.Adam(self.policy_head.parameters(), lr=lr_policy)
         self._dual_optimizer = optim.Adam(self.mpo_loss.parameters(), lr=lr_dual)
 
         # Replace replay buffer setup
@@ -769,7 +764,6 @@ class MPOAgent:
 
         # --- compute target Q via target policy sampling ---
         with torch.no_grad():
-            # Use target observation encoder to get embeddings for next states.
             emb_next = self.target_obs_encoder(next_obs_b)
             t_mean, t_scale = self.target_policy_head(emb_next)  # (B,D)
             N = self.num_samples
@@ -778,19 +772,18 @@ class MPOAgent:
             t_scale_exp = t_scale.unsqueeze(0).expand(N, -1, -1)
             eps = torch.randn_like(t_mean_exp)
             sampled_actions = t_mean_exp + t_scale_exp * eps  # (N,B,D)
-            # clamp sampled target actions to action bounds to avoid extremely large Qs
-            al = self.action_low.view(1, 1, -1)
-            ah = self.action_high.view(1, 1, -1)
-            sampled_actions = torch.clamp(sampled_actions, al, ah)
-            # evaluate target critic on tiled embeddings + sampled actions
-            tiled_emb_next = (
-                emb_next.unsqueeze(0).expand(N, -1, -1).reshape(N * self.batch_size, -1)
+
+            # Target critic expects raw obs; its obs_net will encode.
+            obs_next_exp = (
+                next_obs_b.unsqueeze(0)
+                .expand(N, -1, -1)
+                .reshape(N * self.batch_size, -1)
             )
             sampled_actions_resh = sampled_actions.reshape(N * self.batch_size, -1)
-            critic_inputs = torch.cat([tiled_emb_next, sampled_actions_resh], dim=-1)
-            q_samples = self.target_critic(critic_inputs).view(
+            q_samples = self.target_critic(obs_next_exp, sampled_actions_resh).view(
                 N, self.batch_size
             )  # (N,B)
+
             # guard against NaN / Inf in target Qs
             q_samples = torch.nan_to_num(q_samples, nan=0.0, posinf=1e6, neginf=-1e6)
             q_t = q_samples.mean(dim=0)  # (B,)
@@ -798,14 +791,7 @@ class MPOAgent:
         # critic loss (TD)
         target = rewards_b + discounts_b * q_t
 
-        # clamp actions from replay batch before critic eval to keep inputs within action bounds
-        actions_b = torch.clamp(
-            actions_b, self.action_low.view(1, -1), self.action_high.view(1, -1)
-        )
-        # Use the observation encoder (trained by critic) to get embeddings for current obs.
-        obs_emb = self.obs_encoder(obs_b)
-        critic_inputs_tm1 = torch.cat([obs_emb, actions_b], dim=-1)
-        q_tm1 = self.critic(critic_inputs_tm1)
+        q_tm1 = self.critic(obs_b, actions_b)
 
         # Match Acme/td_learning: TD error = target - v_tm1, loss = 0.5 * td_error^2
         td_error = target - q_tm1
@@ -826,14 +812,10 @@ class MPOAgent:
             sampled_actions, q_samples, online_mean, online_scale, t_mean, t_scale
         )
 
-        # update critic
         self._critic_optimizer.zero_grad()
         critic_loss.backward()
         if self.clipping:
-            torch.nn.utils.clip_grad_norm_(
-                list(self.obs_encoder.parameters()) + list(self.critic.parameters()),
-                40.0,
-            )
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 40.0)
         self._critic_optimizer.step()
 
         # update policy and duals together (total_loss contains dual terms)
@@ -854,10 +836,10 @@ class MPOAgent:
         # Update target policy head (periodic).
         if self._learn_steps % self.target_policy_update_period == 0:
             self.target_policy_head.load_state_dict(self.policy_head.state_dict())
+            self.target_obs_encoder.load_state_dict(self.obs_encoder.state_dict())
         # Update target critic and the target observation encoder (periodic).
         if self._learn_steps % self.target_critic_update_period == 0:
             self.target_critic.load_state_dict(self.critic.state_dict())
-            self.target_obs_encoder.load_state_dict(self.obs_encoder.state_dict())
 
         fetches = {
             "train/critic_loss": float(critic_loss.item()),
