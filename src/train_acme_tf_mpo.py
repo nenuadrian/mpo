@@ -24,7 +24,6 @@ from acme.utils import counting
 from acme.utils import loggers
 from acme import datasets
 from acme.adders import reverb as adders
-from acme.tf import variable_utils as tf2_variable_utils
 from acme import wrappers
 
 import tensorflow as tf
@@ -46,269 +45,7 @@ _TASK = flags.DEFINE_string("task", "balance", "Control suite task name.")
 _MPO_FLOAT_EPSILON = 1e-8
 
 
-class EnvironmentLoop(core.Worker):
-    """A simple RL environment loop.
-
-    This takes `Environment` and `Actor` instances and coordinates their
-    interaction. This can be used as:
-
-      loop = EnvironmentLoop(environment, actor)
-      loop.run(num_episodes)
-
-    A `Counter` instance can optionally be given in order to maintain counts
-    between different Acme components. If not given a local Counter will be
-    created to maintain counts between calls to the `run` method.
-
-    A `Logger` instance can also be passed in order to control the output of the
-    loop. If not given a platform-specific default logger will be used as defined
-    by utils.loggers.make_default_logger. A string `label` can be passed to easily
-    change the label associated with the default logger; this is ignored if a
-    `Logger` instance is given.
-
-    A list of 'Observer' instances can be specified to generate additional metrics
-    to be logged by the logger. They have access to the 'Environment' instance,
-    the current timestep datastruct and the current action.
-    """
-
-    def __init__(
-        self,
-        environment: dm_env.Environment,
-        actor: core.Actor,
-        counter: Optional[counting.Counter] = None,
-        logger: Optional[loggers.Logger] = None,
-        label: str = "environment_loop",
-    ):
-        # Internalize agent and environment.
-        self._environment = environment
-        self._actor = actor
-        self._counter = counter or counting.Counter()
-        self._logger = logger or loggers.make_default_logger(
-            label, steps_key=self._counter.get_steps_key()
-        )
-
-    def run_episode(self) -> loggers.LoggingData:
-        """Run one episode.
-
-        Each episode is a loop which interacts first with the environment to get an
-        observation and then give that observation to the agent in order to retrieve
-        an action.
-
-        Returns:
-          An instance of `loggers.LoggingData`.
-        """
-        # Reset any counts and start the environment.
-        episode_start_time = time.time()
-        select_action_durations: List[float] = []
-        env_step_durations: List[float] = []
-        episode_steps: int = 0
-
-        # For evaluation, this keeps track of the total undiscounted reward
-        # accumulated during the episode.
-        episode_return = tree.map_structure(
-            _generate_zeros_from_spec, self._environment.reward_spec()
-        )
-        env_reset_start = time.time()
-        timestep = self._environment.reset()
-        env_reset_duration = time.time() - env_reset_start
-        # Make the first observation.
-        self._actor.observe_first(timestep)
-
-        # Run an episode.
-        while not timestep.last():
-            # Book-keeping.
-            episode_steps += 1
-
-            # Generate an action from the agent's policy.
-            select_action_start = time.time()
-            action = self._actor.select_action(timestep.observation)
-            select_action_durations.append(time.time() - select_action_start)
-
-            # Step the environment with the agent's selected action.
-            env_step_start = time.time()
-            timestep = self._environment.step(action)
-            env_step_durations.append(time.time() - env_step_start)
-
-            # Have the agent and observers observe the timestep.
-            self._actor.observe(action, timestep)
-
-            # Give the actor the opportunity to update itself.
-            self._actor.update()
-
-            # Equivalent to: episode_return += timestep.reward
-            # We capture the return value because if timestep.reward is a JAX
-            # DeviceArray, episode_return will not be mutated in-place. (In all other
-            # cases, the returned episode_return will be the same object as the
-            # argument episode_return.)
-            episode_return = tree.map_structure(
-                operator.iadd, episode_return, timestep.reward
-            )
-
-        # Record counts.
-        counts = self._counter.increment(episodes=1, steps=episode_steps)
-
-        # Collect the results and combine with counts.
-        steps_per_second = episode_steps / (time.time() - episode_start_time)
-        result = {
-            "episode_length": episode_steps,
-            "episode_return": episode_return,
-            "steps_per_second": steps_per_second,
-            "env_reset_duration_sec": env_reset_duration,
-            "select_action_duration_sec": np.mean(select_action_durations),
-            "env_step_duration_sec": np.mean(env_step_durations),
-        }
-        result.update(counts)
-        return result
-
-    def run(
-        self,
-        num_episodes: Optional[int] = None,
-        num_steps: Optional[int] = None,
-    ) -> int:
-        """Perform the run loop.
-
-        Run the environment loop either for `num_episodes` episodes or for at
-        least `num_steps` steps (the last episode is always run until completion,
-        so the total number of steps may be slightly more than `num_steps`).
-        At least one of these two arguments has to be None.
-
-        Upon termination of an episode a new episode will be started. If the number
-        of episodes and the number of steps are not given then this will interact
-        with the environment infinitely.
-
-        Args:
-          num_episodes: number of episodes to run the loop for.
-          num_steps: minimal number of steps to run the loop for.
-
-        Returns:
-          Actual number of steps the loop executed.
-
-        Raises:
-          ValueError: If both 'num_episodes' and 'num_steps' are not None.
-        """
-
-        if not (num_episodes is None or num_steps is None):
-            raise ValueError('Either "num_episodes" or "num_steps" should be None.')
-
-        def should_terminate(episode_count: int, step_count: int) -> bool:
-            return (num_episodes is not None and episode_count >= num_episodes) or (
-                num_steps is not None and step_count >= num_steps
-            )
-
-        episode_count: int = 0
-        step_count: int = 0
-        while not should_terminate(episode_count, step_count):
-            episode_start = time.time()
-            result = self.run_episode()
-            result = {**result, **{"episode_duration": time.time() - episode_start}}
-            episode_count += 1
-            step_count += int(result["episode_length"])
-            # Log the given episode results.
-            self._logger.write(result)
-
-        return step_count
-
-
-def _generate_zeros_from_spec(spec: specs.Array) -> np.ndarray:
-    return np.zeros(spec.shape, spec.dtype)
-
-
-class EvaluatorActor:
-
-    def __init__(
-        self,
-        policy_network: snt.Module,
-        variable_client: tf2_variable_utils.VariableClient,
-    ):
-        self._variable_client = variable_client
-        self._policy_network = policy_network
-
-    @tf.function
-    def _policy(self, observation: types.NestedTensor) -> types.NestedTensor:
-        # Add a dummy batch dimension and as a side effect convert numpy to TF.
-        batched_observation = tf2_utils.add_batch_dim(observation)
-
-        # Compute the policy, conditioned on the observation.
-        policy = self._policy_network(batched_observation)
-
-        # Sample from the policy if it is stochastic.
-        action = policy.sample() if isinstance(policy, tfd.Distribution) else policy
-
-        return action
-
-    def select_action(self, observation: types.NestedArray) -> types.NestedArray:
-        # Pass the observation through the policy network.
-        action = self._policy(observation)
-
-        # Return a numpy array with squeezed out batch dimension.
-        return tf2_utils.to_numpy_squeeze(action)
-
-    def observe_first(self, _: dm_env.TimeStep):
-        pass
-
-    def observe(self, _: types.NestedArray, __: dm_env.TimeStep):
-        pass
-
-    def update(self):
-        self._variable_client.update()
-
-
-class FeedForwardActor:
-    """A feed-forward actor.
-
-    An actor based on a feed-forward policy which takes non-batched observations
-    and outputs non-batched actions. It also allows adding experiences to replay
-    and updating the weights from the policy on the learner.
-    """
-
-    def __init__(
-        self,
-        policy_network: snt.Module,
-        adder: acme_adders.Adder,
-        variable_client: tf2_variable_utils.VariableClient,
-    ):
-        self._adder = adder
-        self._variable_client = variable_client
-        self._policy_network = policy_network
-
-    @tf.function
-    def _policy(self, observation: types.NestedTensor) -> types.NestedTensor:
-        # Add a dummy batch dimension and as a side effect convert numpy to TF.
-        batched_observation = tf2_utils.add_batch_dim(observation)
-
-        # Compute the policy, conditioned on the observation.
-        policy = self._policy_network(batched_observation)
-
-        # Sample from the policy if it is stochastic.
-        action = policy.sample() if isinstance(policy, tfd.Distribution) else policy
-
-        return action
-
-    def select_action(self, observation: types.NestedArray) -> types.NestedArray:
-        # Pass the observation through the policy network.
-        action = self._policy(observation)
-
-        # Return a numpy array with squeezed out batch dimension.
-        return tf2_utils.to_numpy_squeeze(action)
-
-    def observe_first(self, timestep: dm_env.TimeStep):
-        self._adder.add_first(timestep)
-
-    def observe(self, action: types.NestedArray, next_timestep: dm_env.TimeStep):
-        self._adder.add(action, next_timestep)
-
-    def update(self):
-        # self._variable_client.update()
-        pass
-
-
-class StochasticMeanHead(snt.Module):
-    """Simple sonnet module to produce the mean of a tfp.Distribution."""
-
-    def __call__(self, distribution: tfd.Distribution):
-        return distribution.mean()
-
-
-class MPOLearner(acme.VariableSource):
+class MPOLearner:
 
     def __init__(
         self,
@@ -542,6 +279,274 @@ class MPOLearner(acme.VariableSource):
         return [tf2_utils.to_numpy(self._variables[name]) for name in names]
 
 
+class EvaluatorActor:
+
+    def __init__(
+        self, policy_network: snt.Module, learner: MPOLearner, update_period: int
+    ):
+        self._learner = learner
+        self._policy_network = policy_network
+        self._update_period = update_period
+
+    @tf.function
+    def _policy(self, observation: types.NestedTensor) -> types.NestedTensor:
+        # Add a dummy batch dimension and as a side effect convert numpy to TF.
+        batched_observation = tf2_utils.add_batch_dim(observation)
+
+        # Compute the policy, conditioned on the observation.
+        policy = self._policy_network(batched_observation)
+
+        # Sample from the policy if it is stochastic.
+        action = policy.sample() if isinstance(policy, tfd.Distribution) else policy
+
+        return action
+
+    def select_action(self, observation: types.NestedArray) -> types.NestedArray:
+        # Pass the observation through the policy network.
+        action = self._policy(observation)
+
+        # Return a numpy array with squeezed out batch dimension.
+        return tf2_utils.to_numpy_squeeze(action)
+
+    def observe_first(self, _: dm_env.TimeStep):
+        pass
+
+    def observe(self, _: types.NestedArray, __: dm_env.TimeStep):
+        pass
+
+    def update(self, total_steps: int):
+        if total_steps % self._update_period == 0:
+            new_data = self._learner.get_variables(["policy"])
+            self._policy_network.variables["policy"].assign(new_data)
+
+
+class FeedForwardActor:
+    """A feed-forward actor.
+
+    An actor based on a feed-forward policy which takes non-batched observations
+    and outputs non-batched actions. It also allows adding experiences to replay
+    and updating the weights from the policy on the learner.
+    """
+
+    def __init__(
+        self,
+        policy_network: snt.Module,
+        adder: acme_adders.Adder,
+        learner: MPOLearner,
+        update_period: int,
+    ):
+        self._adder = adder
+        self._learner = learner
+        self._policy_network = policy_network
+        self._update_period = update_period
+
+    @tf.function
+    def _policy(self, observation: types.NestedTensor) -> types.NestedTensor:
+        # Add a dummy batch dimension and as a side effect convert numpy to TF.
+        batched_observation = tf2_utils.add_batch_dim(observation)
+
+        # Compute the policy, conditioned on the observation.
+        policy = self._policy_network(batched_observation)
+
+        # Sample from the policy if it is stochastic.
+        action = policy.sample() if isinstance(policy, tfd.Distribution) else policy
+
+        return action
+
+    def select_action(self, observation: types.NestedArray) -> types.NestedArray:
+        # Pass the observation through the policy network.
+        action = self._policy(observation)
+
+        # Return a numpy array with squeezed out batch dimension.
+        return tf2_utils.to_numpy_squeeze(action)
+
+    def observe_first(self, timestep: dm_env.TimeStep):
+        self._adder.add_first(timestep)
+
+    def observe(self, action: types.NestedArray, next_timestep: dm_env.TimeStep):
+        self._adder.add(action, next_timestep)
+
+    def update(self, total_steps: int):
+        if total_steps % self._update_period == 0:
+            new_data = self._learner.get_variables(["policy"])
+            self._policy_network.variables["policy"].assign(new_data)
+
+
+class EnvironmentLoop(core.Worker):
+    """A simple RL environment loop.
+
+    This takes `Environment` and `Actor` instances and coordinates their
+    interaction. This can be used as:
+
+      loop = EnvironmentLoop(environment, actor)
+      loop.run(num_episodes)
+
+    A `Counter` instance can optionally be given in order to maintain counts
+    between different Acme components. If not given a local Counter will be
+    created to maintain counts between calls to the `run` method.
+
+    A `Logger` instance can also be passed in order to control the output of the
+    loop. If not given a platform-specific default logger will be used as defined
+    by utils.loggers.make_default_logger. A string `label` can be passed to easily
+    change the label associated with the default logger; this is ignored if a
+    `Logger` instance is given.
+
+    A list of 'Observer' instances can be specified to generate additional metrics
+    to be logged by the logger. They have access to the 'Environment' instance,
+    the current timestep datastruct and the current action.
+    """
+
+    def __init__(
+        self,
+        environment: dm_env.Environment,
+        actor: FeedForwardActor | EvaluatorActor,
+        counter: Optional[counting.Counter] = None,
+        logger: Optional[loggers.Logger] = None,
+        label: str = "environment_loop",
+    ):
+        # Internalize agent and environment.
+        self._environment = environment
+        self._actor = actor
+        self._counter = counter or counting.Counter()
+        self._logger = logger or loggers.make_default_logger(
+            label, steps_key=self._counter.get_steps_key()
+        )
+        self._total_steps = 0
+
+    def run_episode(self) -> loggers.LoggingData:
+        """Run one episode.
+
+        Each episode is a loop which interacts first with the environment to get an
+        observation and then give that observation to the agent in order to retrieve
+        an action.
+
+        Returns:
+          An instance of `loggers.LoggingData`.
+        """
+        # Reset any counts and start the environment.
+        episode_start_time = time.time()
+        select_action_durations: List[float] = []
+        env_step_durations: List[float] = []
+        episode_steps: int = 0
+
+        # For evaluation, this keeps track of the total undiscounted reward
+        # accumulated during the episode.
+        episode_return = tree.map_structure(
+            _generate_zeros_from_spec, self._environment.reward_spec()
+        )
+        env_reset_start = time.time()
+        timestep = self._environment.reset()
+        env_reset_duration = time.time() - env_reset_start
+        # Make the first observation.
+        self._actor.observe_first(timestep)
+
+        # Run an episode.
+        while not timestep.last():
+            # Book-keeping.
+            episode_steps += 1
+            self._total_steps += 1
+
+            # Generate an action from the agent's policy.
+            select_action_start = time.time()
+            action = self._actor.select_action(timestep.observation)
+            select_action_durations.append(time.time() - select_action_start)
+
+            # Step the environment with the agent's selected action.
+            env_step_start = time.time()
+            timestep = self._environment.step(action)
+            env_step_durations.append(time.time() - env_step_start)
+
+            # Have the agent and observers observe the timestep.
+            self._actor.observe(action, timestep)
+
+            # Give the actor the opportunity to update itself.
+            self._actor.update(self._total_steps)
+
+            # Equivalent to: episode_return += timestep.reward
+            # We capture the return value because if timestep.reward is a JAX
+            # DeviceArray, episode_return will not be mutated in-place. (In all other
+            # cases, the returned episode_return will be the same object as the
+            # argument episode_return.)
+            episode_return = tree.map_structure(
+                operator.iadd, episode_return, timestep.reward
+            )
+
+        # Record counts.
+        counts = self._counter.increment(episodes=1, steps=episode_steps)
+
+        # Collect the results and combine with counts.
+        steps_per_second = episode_steps / (time.time() - episode_start_time)
+        result = {
+            "episode_length": episode_steps,
+            "episode_return": episode_return,
+            "steps_per_second": steps_per_second,
+            "env_reset_duration_sec": env_reset_duration,
+            "select_action_duration_sec": np.mean(select_action_durations),
+            "env_step_duration_sec": np.mean(env_step_durations),
+        }
+        result.update(counts)
+        return result
+
+    def run(
+        self,
+        num_episodes: Optional[int] = None,
+        num_steps: Optional[int] = None,
+    ) -> int:
+        """Perform the run loop.
+
+        Run the environment loop either for `num_episodes` episodes or for at
+        least `num_steps` steps (the last episode is always run until completion,
+        so the total number of steps may be slightly more than `num_steps`).
+        At least one of these two arguments has to be None.
+
+        Upon termination of an episode a new episode will be started. If the number
+        of episodes and the number of steps are not given then this will interact
+        with the environment infinitely.
+
+        Args:
+          num_episodes: number of episodes to run the loop for.
+          num_steps: minimal number of steps to run the loop for.
+
+        Returns:
+          Actual number of steps the loop executed.
+
+        Raises:
+          ValueError: If both 'num_episodes' and 'num_steps' are not None.
+        """
+
+        if not (num_episodes is None or num_steps is None):
+            raise ValueError('Either "num_episodes" or "num_steps" should be None.')
+
+        def should_terminate(episode_count: int, step_count: int) -> bool:
+            return (num_episodes is not None and episode_count >= num_episodes) or (
+                num_steps is not None and step_count >= num_steps
+            )
+
+        episode_count: int = 0
+        step_count: int = 0
+        while not should_terminate(episode_count, step_count):
+            episode_start = time.time()
+            result = self.run_episode()
+            result = {**result, **{"episode_duration": time.time() - episode_start}}
+            episode_count += 1
+            step_count += int(result["episode_length"])
+            # Log the given episode results.
+            self._logger.write(result)
+
+        return step_count
+
+
+def _generate_zeros_from_spec(spec: specs.Array) -> np.ndarray:
+    return np.zeros(spec.shape, spec.dtype)
+
+
+class StochasticMeanHead(snt.Module):
+    """Simple sonnet module to produce the mean of a tfp.Distribution."""
+
+    def __call__(self, distribution: tfd.Distribution):
+        return distribution.mean()
+
+
 class MPO:
 
     def __init__(
@@ -704,18 +709,6 @@ class MPO:
 
         # Ensure network variables are created.
         tf2_utils.create_variables(behavior_network, [observation_spec])
-        policy_variables = {"policy": behavior_network.variables}
-
-        # Create the variable client responsible for keeping the actor up-to-date.
-        variable_client = tf2_variable_utils.VariableClient(
-            learner,
-            policy_variables,
-            update_period=self._variable_update_period,
-        )
-
-        # Make sure not to use a random policy after checkpoint restoration by
-        # assigning variables before running the environment loop.
-        # variable_client.update_and_wait()
 
         # Component to add things into replay.
         adder = adders.NStepTransitionAdder(
@@ -734,7 +727,8 @@ class MPO:
         actor = FeedForwardActor(
             policy_network=behavior_network,
             adder=adder,
-            variable_client=variable_client,
+            learner=learner,
+            update_period=self._variable_update_period,
         )
 
         # Create the run loop and return it.
@@ -767,18 +761,6 @@ class MPO:
 
         # Ensure network variables are created.
         tf2_utils.create_variables(evaluator_network, [observation_spec])
-        policy_variables = {"policy": evaluator_network.variables}
-
-        # Create the variable client responsible for keeping the actor up-to-date.
-        variable_client = tf2_variable_utils.VariableClient(
-            learner,
-            policy_variables,
-            update_period=self._variable_update_period,
-        )
-
-        # Make sure not to evaluate a random actor by assigning variables before
-        # running the environment loop.
-        variable_client.update_and_wait()
 
         # Create logger and counter.
         counter = counting.Counter(counter, "evaluator")
@@ -788,7 +770,8 @@ class MPO:
 
         evaluator = EvaluatorActor(
             policy_network=evaluator_network,
-            variable_client=variable_client,
+            learner=learner,
+            update_period=self._variable_update_period,
         )
 
         return EnvironmentLoop(environment, evaluator, counter, logger)
