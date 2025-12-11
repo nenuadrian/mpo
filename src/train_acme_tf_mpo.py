@@ -116,11 +116,6 @@ class EnvironmentLoop(core.Worker):
         timestep = self._environment.reset()
         env_reset_duration = time.time() - env_reset_start
         # Make the first observation.
-        self._actor.observe_first(timestep)
-        for observer in self._observers:
-            # Initialize the observer with the current state of the env after reset
-            # and the initial timestep.
-            observer.observe_first(self._environment, timestep)
 
         # Run an episode.
         while not timestep.last():
