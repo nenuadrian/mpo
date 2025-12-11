@@ -43,6 +43,10 @@ Very difficult to get it to build. TensorFlow version is only one that I was abl
 
 Combined all code necessary in `src/train_acme_tf_mpo.py`. But still need a lot of the tricks I have documented in my `acme` fork.
 
+```bash
+python src/train_acme_tf_mpo.py --max_actor_steps 3000000 --domain cheetah --task run
+```
+
 ### Visualise
 
 ```bash
@@ -61,7 +65,7 @@ source .venv_acme_pytorch/bin/activate
 pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb "shimmy[bsuite,atari,dm-control]" opencv-python torchrl
 
 
-python src/train_custom_acme_pytorch_mpo.py --max_actor_steps 300000 --wandb_project acme_pytorch_1 --env_names walker::walk,humanoid::run,cartpole::balance,walker::run,reacher::easy,reacher::hard,hopper::hop,walker::stand,acrobot::swingup,swimmer::swimmer6,swimmer::swimmer15,pendulum::swingup,cheetah::walk,cheetah::run --env_iterations 1
+python src/train_custom_acme_pytorch_mpo.py --max_actor_steps 3000000 --wandb_project acme_pytorch_3 --env_names walker::walk,humanoid::run,cartpole::balance,walker::run,reacher::easy,reacher::hard,hopper::hop,walker::stand,acrobot::swingup,swimmer::swimmer6,swimmer::swimmer15,pendulum::swingup,cheetah::walk,cheetah::run --env_iterations 1
 ```
 
 ### Visualize Acme in PyTorch
