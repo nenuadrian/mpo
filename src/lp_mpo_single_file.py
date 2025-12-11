@@ -830,17 +830,6 @@ class MPO:
 
         return program
 
-    def run(self):
-        steps = 0
-        self._max_actor_steps
-        counter = counting.Counter()
-        self._server = reverb.Server(tables=self.replay())
-        client = reverb.Client(f"localhost:{self._server.port}")
-
-        learner = self.learner(client, counter)
-        actor = self.actor(client, learner, counter)
-        evaluator = self.evaluator(learner, counter)
-
 
 """Implements the MPO losses.
 
