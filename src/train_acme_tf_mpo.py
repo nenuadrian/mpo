@@ -252,6 +252,7 @@ class MPOLearner:
         critic_optimizer: Optional[snt.Optimizer] = None,
         dual_optimizer: Optional[snt.Optimizer] = None,
         clipping: bool = True,
+        log_every: int = 100,
     ):
         self._discount = discount
         self._num_samples = num_samples
@@ -261,6 +262,7 @@ class MPOLearner:
         self._num_steps = tf.Variable(0, dtype=tf.int32)
         self._target_policy_update_period = target_policy_update_period
         self._target_critic_update_period = target_critic_update_period
+        self._log_every = log_every
 
         # Batch dataset and create iterator.
         # TODO(b/155086959): Fix type stubs and remove.
@@ -450,7 +452,8 @@ class MPOLearner:
         # Update our counts and record it.
         fetches.update({"total_steps": self._total_steps})
 
-        wandb.log({"learner/" + k: v for k, v in fetches.items()})
+        if self._total_steps % self._log_every == 0:
+            wandb.log({"learner/" + k: v for k, v in fetches.items()})
 
     def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:
         return [to_numpy(self._variables[name]) for name in names]

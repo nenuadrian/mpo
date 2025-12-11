@@ -7,6 +7,7 @@ import time
 from typing import Tuple, cast, Dict, Union
 import os
 import json
+import threading
 
 import gymnasium as gym
 import numpy as np
@@ -710,6 +711,9 @@ class MPOAgent:
         self._policy_optimizer = optim.Adam(self.policy_head.parameters(), lr=lr_policy)
         self._dual_optimizer = optim.Adam(self.mpo_loss.parameters(), lr=lr_dual)
 
+        self._replay_lock = threading.Lock()
+        self._param_lock = threading.Lock()
+
         self.replay = TensorDictReplayBuffer(
             storage=LazyTensorStorage(max_size=max_replay_size),
             batch_size=batch_size,
@@ -721,20 +725,25 @@ class MPOAgent:
         self._num_inserts = 0
         self._num_samples = 0
 
+    def copy_policy_to(self, obs_encoder: nn.Module, policy_head: nn.Module) -> None:
+        with self._param_lock:
+            obs_encoder.load_state_dict(self.obs_encoder.state_dict())
+            policy_head.load_state_dict(self.policy_head.state_dict())
+
     def select_action(self, obs: np.ndarray, stochastic: bool = True) -> np.ndarray:
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        with torch.no_grad():
-            emb = self.obs_encoder(obs_t)
-            mean, scale = self.policy_head(emb)
-            if stochastic:
-                eps = torch.randn_like(mean)
-                action = mean + scale * eps
-            else:
-                action = mean
-            action = action.squeeze(0)
-            # stable/clamped action output
-            action = torch.clamp(action, self.action_low, self.action_high)
-            return action.cpu().numpy()
+        with self._param_lock:
+            with torch.no_grad():
+                emb = self.obs_encoder(obs_t)
+                mean, scale = self.policy_head(emb)
+                if stochastic:
+                    action = mean + scale * torch.randn_like(mean)
+                else:
+                    action = mean
+                action = torch.clamp(
+                    action.squeeze(0), self.action_low, self.action_high
+                )
+        return action.cpu().numpy()
 
     def store_transition(self, obs, action, reward, discount, next_obs, done):
         ready = self._nstep_accumulator.push(
@@ -752,26 +761,30 @@ class MPOAgent:
                 },
                 batch_size=[],
             )
-            self.replay.add(data)
-            self._num_inserts += 1
+            with self._replay_lock:
+                self.replay.add(data)
+                self._num_inserts += 1
 
     def _can_sample(self):
-        if len(self.replay) < max(self.min_replay_size, self.batch_size):
-            return False
-        if self.samples_per_insert is None:
-            return True
-        target = (
-            self.samples_per_insert + self.ratio_tolerance * self.samples_per_insert
-        )
-        # block if we are sampling too fast relative to inserts
-        return self._num_samples <= target * max(1, self._num_inserts)
+        with self._replay_lock:
+            replay_len = len(self.replay)
+            if replay_len < max(self.min_replay_size, self.batch_size):
+                return False
+            if self.samples_per_insert is None:
+                return True
+            target = (
+                self.samples_per_insert + self.ratio_tolerance * self.samples_per_insert
+            )
+            return self._num_samples <= target * max(1, self._num_inserts)
 
     def learn_step(self):
         if not self._can_sample():
             return None
 
-        batch = self.replay.sample()
-        self._num_samples += 1
+        with self._replay_lock:
+            batch = self.replay.sample()
+            self._num_samples += 1
+
         device = self.device
         obs_b = batch["obs"].to(device)
         actions_b = batch["action"].to(device)
@@ -827,23 +840,23 @@ class MPOAgent:
             sampled_actions, q_samples, online_mean, online_scale, t_mean, t_scale
         )
 
-        self._critic_optimizer.zero_grad()
-        critic_loss.backward()
-        if self.clipping:
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 40.0)
-        self._critic_optimizer.step()
+        with self._param_lock:
+            self._critic_optimizer.zero_grad()
+            critic_loss.backward()
+            if self.clipping:
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 40.0)
+            self._critic_optimizer.step()
 
-        # update policy and duals together (total_loss contains dual terms)
-        self._policy_optimizer.zero_grad()
-        self._dual_optimizer.zero_grad()
-        total_loss.backward()
-        if self.clipping:
-            torch.nn.utils.clip_grad_norm_(
-                list(self.policy_head.parameters()),
-                40.0,
-            )
-        self._policy_optimizer.step()
-        self._dual_optimizer.step()
+            self._policy_optimizer.zero_grad()
+            self._dual_optimizer.zero_grad()
+            total_loss.backward()
+            if self.clipping:
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.policy_head.parameters()),
+                    40.0,
+                )
+            self._policy_optimizer.step()
+            self._dual_optimizer.step()
 
         self._learn_steps += 1
 
@@ -885,6 +898,27 @@ def flatten_observation(obs):
         return np.asarray(obs).ravel().astype(np.float32)
 
 
+def run_policy_modules(
+    obs_encoder: nn.Module,
+    policy_head: nn.Module,
+    obs: np.ndarray,
+    device: torch.device,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+    stochastic: bool,
+) -> np.ndarray:
+    obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+    with torch.no_grad():
+        emb = obs_encoder(obs_t)
+        mean, scale = policy_head(emb)
+        if stochastic:
+            action = mean + scale * torch.randn_like(mean)
+        else:
+            action = mean
+        action = torch.clamp(action.squeeze(0), action_low, action_high)
+    return action.cpu().numpy()
+
+
 def train(
     env_name: str,
     max_actor_steps: int,
@@ -902,6 +936,7 @@ def train(
     log_dir: str,
     max_eval_actor_steps: int,
     eval_freq: int,
+    policy_sync_interval: int,
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -909,27 +944,22 @@ def train(
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
     else:
         device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    env = make_env(env_name)
-    # separate environment for evaluation (keeps train env state intact)
-    eval_env = make_env(env_name)
-    obs0, _ = env.reset()
-    obs_flat = flatten_observation(obs0)
-    # determine obs and action dims
-    obs_space = env.observation_space
+    probe_env = make_env(env_name)
+    obs0, _ = probe_env.reset()
+    obs_space = probe_env.observation_space
     if isinstance(obs_space, gym.spaces.Dict):
         obs_dim = sum(int(np.prod(sp.shape)) for sp in obs_space.spaces.values())
     else:
         obs_dim = int(np.prod(obs_space.shape))
-    act_space = env.action_space
+    act_space = probe_env.action_space
     action_dim = int(np.prod(act_space.shape))
     action_low = act_space.low
     action_high = act_space.high
+    probe_env.close()
 
     agent = MPOAgent(
         obs_dim=obs_dim,
@@ -947,109 +977,204 @@ def train(
         lr_policy=lr,
         lr_critic=lr,
         lr_dual=lr_dual,
-        min_replay_size=min_replay_size,  # pass through
+        min_replay_size=min_replay_size,
     )
 
-    obs, _ = env.reset()
-    obs_flat = flatten_observation(obs)
-    episode_return = 0.0
-    episode_len = 0
-    start_time = time.time()
+    stop_event = threading.Event()
+    step_lock = threading.Lock()
+    shared_state = {"steps": 0}
+    policy_sync_interval = max(1, policy_sync_interval)
 
-    step = 0
-    while step < max_actor_steps:
-        done = False
-        while not done and step < max_actor_steps:
-            step += 1
-            action = agent.select_action(obs_flat, stochastic=True)
-            next_obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            next_flat = flatten_observation(next_obs)
-            # do not bootstrap from terminal states: use 0.0 discount on terminal steps
-            step_discount = 0.0 if done else 1.0
-            agent.store_transition(
-                obs_flat, action, float(reward), step_discount, next_flat, done
-            )
-            episode_return += float(reward)
-            episode_len += 1
-            obs_flat = next_flat
+    def actor_loop():
+        env = make_env(env_name)
+        try:
+            obs, _ = env.reset()
+            obs_flat_local = flatten_observation(obs)
+            actor_encoder = copy.deepcopy(agent.obs_encoder).to(device)
+            actor_policy_head = copy.deepcopy(agent.policy_head).to(device)
+            agent.copy_policy_to(actor_encoder, actor_policy_head)
+            actor_encoder.eval()
+            actor_policy_head.eval()
+            episode_return = 0.0
+            episode_len = 0
+            sync_counter = policy_sync_interval
+            while not stop_event.is_set():
+                if sync_counter >= policy_sync_interval:
+                    agent.copy_policy_to(actor_encoder, actor_policy_head)
+                    actor_encoder.eval()
+                    actor_policy_head.eval()
+                    sync_counter = 0
 
-            if done:
-                obs, _ = env.reset()
-                obs_flat = flatten_observation(obs)
-                print(
-                    f"[Step {step}] Episode finished, return={episode_return:.2f}, len={episode_len}"
+                action = run_policy_modules(
+                    actor_encoder,
+                    actor_policy_head,
+                    obs_flat_local,
+                    device,
+                    agent.action_low,
+                    agent.action_high,
+                    stochastic=True,
                 )
-                episode_return = 0.0
-                episode_len = 0
+                next_obs, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+                next_flat = flatten_observation(next_obs)
+                step_discount = 0.0 if done else 1.0
+                agent.store_transition(
+                    obs_flat_local,
+                    action,
+                    float(reward),
+                    step_discount,
+                    next_flat,
+                    done,
+                )
+                episode_return += float(reward)
+                episode_len += 1
+                obs_flat_local = next_flat
+                sync_counter += 1
 
-            stats = agent.learn_step()
-            if stats is not None:
-                log_dict = dict(stats)
-                log_dict.update(
-                    {
-                        "train/episode_return": episode_return,
-                        "train/episode_length": episode_len,
-                    }
-                )
-                wandb.log(log_dict, step=step)
+                with step_lock:
+                    shared_state["steps"] += 1
+                    global_step = shared_state["steps"]
 
-            if step % eval_freq == 0:
-                eval_returns, eval_lengths, eval_steps = [], [], 0
-                train_modes = (
-                    agent.obs_encoder.training,
-                    agent.policy_head.training,
-                    agent.critic.training,
-                )
-                # Disable gradients and restore modes even if eval errors.
-                with torch.inference_mode():
-                    agent.obs_encoder.eval()
-                    agent.policy_head.eval()
-                    agent.critic.eval()
-                    try:
-                        while eval_steps < max_eval_actor_steps:
-                            o, _ = eval_env.reset()
-                            o_flat = flatten_observation(o)
-                            done_eval, ep_ret, ep_len = False, 0.0, 0
-                            while not done_eval:
-                                eval_steps += 1
-                                a = agent.select_action(o_flat, stochastic=False)
-                                no, r, terminated, truncated, _ = eval_env.step(a)
-                                done_eval = terminated or truncated
-                                o_flat = flatten_observation(no)
-                                ep_ret += float(r)
-                                ep_len += 1
-                            eval_returns.append(ep_ret)
-                            eval_lengths.append(ep_len)
-                    finally:
-                        agent.obs_encoder.train(train_modes[0])
-                        agent.policy_head.train(train_modes[1])
-                        agent.critic.train(train_modes[2])
-                mean_r = float(np.mean(eval_returns))
-                std_r = float(np.std(eval_returns))
-                mean_len = float(np.mean(eval_lengths))
-                eval_log = {
-                    "eval/mean_reward": mean_r,
-                    "eval/std_return": std_r,
-                    "eval/mean_ep_length": mean_len,
-                }
-                wandb.log(eval_log, step=step)
-                print(
-                    f"[Eval @ step {step}] mean_reward={mean_r:.2f} std={std_r:.2f} mean_len={mean_len:.1f}"
-                )
+                if done:
+                    wandb.log(
+                        {
+                            "train/episode_return": episode_return,
+                            "train/episode_length": episode_len,
+                        },
+                    )
+                    print(
+                        f"[Actor step {global_step}] return={episode_return:.2f} len={episode_len}"
+                    )
+                    obs, _ = env.reset()
+                    obs_flat_local = flatten_observation(obs)
+                    episode_return = 0.0
+                    episode_len = 0
 
-            if stats is not None and step % 100 == 0:
-                elapsed = time.time() - start_time
-                print(
-                    f"Step {step} | Learn step {stats['train/learn_steps']} | critic_loss={stats['train/critic_loss']:.6f} | Ep Return {episode_return:.2f} | Ep Length {episode_len} | elapsed={elapsed:.1f}s"
-                )
-    env.close()
-    eval_env.close()
+                if global_step >= max_actor_steps:
+                    stop_event.set()
+                    break
+        except Exception as exc:
+            stop_event.set()
+            print(f"[Actor] error: {exc}")
+        finally:
+            env.close()
+
+    def learner_loop():
+        try:
+            while not stop_event.is_set():
+                stats = agent.learn_step()
+                if stats is None:
+                    time.sleep(0.01)
+                    continue
+                with step_lock:
+                    global_step = shared_state["steps"]
+                log_dict: Dict[str, Union[float, int]] = {}
+                for key, value in stats.items():
+                    if isinstance(value, torch.Tensor):
+                        log_dict[key] = float(value.detach().cpu().item())
+                    else:
+                        log_dict[key] = value
+                log_dict["train/global_actor_step"] = global_step
+                wandb.log(log_dict)
+        except Exception as exc:
+            stop_event.set()
+            print(f"[Learner] error: {exc}")
+
+    def evaluator_loop():
+        env = make_env(env_name)
+        try:
+            eval_encoder = copy.deepcopy(agent.obs_encoder).to(device)
+            eval_policy_head = copy.deepcopy(agent.policy_head).to(device)
+            agent.copy_policy_to(eval_encoder, eval_policy_head)
+            eval_encoder.eval()
+            eval_policy_head.eval()
+            next_eval_step = eval_freq
+            while not stop_event.is_set():
+                if eval_freq <= 0 or max_eval_actor_steps <= 0:
+                    break
+                with step_lock:
+                    global_step = shared_state["steps"]
+                if global_step >= next_eval_step and global_step > 0:
+                    agent.copy_policy_to(eval_encoder, eval_policy_head)
+                    eval_encoder.eval()
+                    eval_policy_head.eval()
+                    eval_returns = []
+                    eval_lengths = []
+                    eval_steps = 0
+                    while eval_steps < max_eval_actor_steps and not stop_event.is_set():
+                        obs, _ = env.reset()
+                        obs_flat_local = flatten_observation(obs)
+                        done = False
+                        ep_ret = 0.0
+                        ep_len = 0
+                        while (
+                            not done
+                            and eval_steps < max_eval_actor_steps
+                            and not stop_event.is_set()
+                        ):
+                            action = run_policy_modules(
+                                eval_encoder,
+                                eval_policy_head,
+                                obs_flat_local,
+                                device,
+                                agent.action_low,
+                                agent.action_high,
+                                stochastic=False,
+                            )
+                            next_obs, reward, terminated, truncated, _ = env.step(
+                                action
+                            )
+                            done = terminated or truncated
+                            obs_flat_local = flatten_observation(next_obs)
+                            ep_ret += float(reward)
+                            ep_len += 1
+                            eval_steps += 1
+                        eval_returns.append(ep_ret)
+                        eval_lengths.append(ep_len)
+                    if eval_returns:
+                        mean_r = float(np.mean(eval_returns))
+                        std_r = float(np.std(eval_returns))
+                        mean_len = float(np.mean(eval_lengths))
+                        wandb.log(
+                            {
+                                "eval/mean_reward": mean_r,
+                                "eval/std_return": std_r,
+                                "eval/mean_ep_length": mean_len,
+                            },
+                        )
+                        print(
+                            f"[Eval @ step {global_step}] mean_reward={mean_r:.2f} std={std_r:.2f} mean_len={mean_len:.1f}"
+                        )
+                    next_eval_step += eval_freq
+                else:
+                    time.sleep(0.5)
+        except Exception as exc:
+            stop_event.set()
+            print(f"[Evaluator] error: {exc}")
+        finally:
+            env.close()
+
+    threads = [
+        threading.Thread(target=actor_loop, name="actor_thread"),
+        threading.Thread(target=learner_loop, name="learner_thread"),
+    ]
+    if eval_freq > 0 and max_eval_actor_steps > 0:
+        threads.append(threading.Thread(target=evaluator_loop, name="evaluator_thread"))
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    stop_event.set()
+    step = shared_state["steps"]
 
     try:
         ckpt_dir = os.path.join(log_dir, "checkpoints")
         os.makedirs(ckpt_dir, exist_ok=True)
         ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{int(time.time())}.pt")
+        with agent._replay_lock:
+            replay_state = agent.replay.state_dict()
         checkpoint = {
             "obs_encoder": agent.obs_encoder.state_dict(),
             "policy_head": agent.policy_head.state_dict(),
@@ -1064,7 +1189,7 @@ def train(
             "learn_steps": agent._learn_steps,
             "step": step,
             "seed": seed,
-            "replay_state": agent.replay.state_dict(),
+            "replay_state": replay_state,
         }
         torch.save(checkpoint, ckpt_path)
         print(f"Saved checkpoint to {ckpt_path}")
@@ -1083,7 +1208,7 @@ def parse_args():
     parser.add_argument("--env_iterations", type=int, default=1)
     parser.add_argument("--max_actor_steps", type=int, default=3_000_000)
     parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--min_replay_size", type=int, default=1000)
+    parser.add_argument("--min_replay_size", type=int, default=512)
     parser.add_argument("--max_replay_size", type=int, default=1_000_000)
     parser.add_argument("--n_step", type=int, default=5)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -1098,6 +1223,7 @@ def parse_args():
     parser.add_argument("--base_log_dir", type=str, default="./logs/mpo_experiment")
     parser.add_argument("--eval_freq", type=int, default=3000)
     parser.add_argument("--max_eval_actor_steps", type=int, default=3000)
+    parser.add_argument("--policy_sync_interval", type=int, default=500)
     return parser.parse_args()
 
 
@@ -1162,6 +1288,7 @@ if __name__ == "__main__":
                 max_eval_actor_steps=args.max_eval_actor_steps,
                 min_replay_size=args.min_replay_size,
                 log_dir=log_dir,
+                policy_sync_interval=args.policy_sync_interval,
             )
 
             wandb.finish()
