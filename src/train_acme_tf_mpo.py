@@ -1592,75 +1592,34 @@ def make_networks(
     }
 
 
-class EnvironmentWrapper(dm_env.Environment):
-    """Environment that wraps another environment.
-
-    This exposes the wrapped environment with the `.environment` property and also
-    defines `__getattr__` so that attributes are invisibly forwarded to the
-    wrapped environment (and hence enabling duck-typing).
-    """
-
-    _environment: dm_env.Environment
-
-    def __init__(self, environment: dm_env.Environment):
+class CanonicalSinglePrecisionWrapper(dm_env.Environment):
+    def __init__(self, environment: dm_env.Environment, clip: bool = False):
         self._environment = environment
+        self._clip = clip
+        self._raw_action_spec = environment.action_spec()
 
     def __getattr__(self, name):
         if name.startswith("__"):
-            raise AttributeError(
-                "attempted to get missing private attribute '{}'".format(name)
-            )
+            raise AttributeError(f"attempted to get missing private attribute '{name}'")
         return getattr(self._environment, name)
 
     @property
     def environment(self) -> dm_env.Environment:
         return self._environment
 
-    # The following lines are necessary because methods defined in
-    # `dm_env.Environment` are not delegated through `__getattr__`, which would
-    # only be used to expose methods or properties that are not defined in the
-    # base `dm_env.Environment` class.
-
     def step(self, action) -> dm_env.TimeStep:
-        return self._environment.step(action)
-
-    def reset(self) -> dm_env.TimeStep:
-        return self._environment.reset()
-
-    def action_spec(self):
-        return self._environment.action_spec()
-
-    def discount_spec(self):
-        return self._environment.discount_spec()
-
-    def observation_spec(self):
-        return self._environment.observation_spec()
-
-    def reward_spec(self):
-        return self._environment.reward_spec()
-
-    def close(self):
-        return self._environment.close()
-
-
-class SinglePrecisionWrapper(EnvironmentWrapper):
-    """Wrapper which converts environments from double- to single-precision."""
-
-    def _convert_timestep(self, timestep: dm_env.TimeStep) -> dm_env.TimeStep:
-        return timestep._replace(
-            reward=self._convert_value(timestep.reward),
-            discount=self._convert_value(timestep.discount),
-            observation=self._convert_value(timestep.observation),
-        )
-
-    def step(self, action) -> dm_env.TimeStep:
-        return self._convert_timestep(self._environment.step(action))
+        scaled_action = _scale_nested_action(action, self._raw_action_spec, self._clip)
+        timestep = self._environment.step(scaled_action)
+        return self._convert_timestep(timestep)
 
     def reset(self) -> dm_env.TimeStep:
         return self._convert_timestep(self._environment.reset())
 
     def action_spec(self):
-        return self._convert_spec(self._environment.action_spec())
+        canonical_spec = tree.map_structure(
+            self._canonicalize_bounded_spec, self._raw_action_spec
+        )
+        return self._convert_spec(canonical_spec)
 
     def discount_spec(self):
         return self._convert_spec(self._environment.discount_spec())
@@ -1671,13 +1630,26 @@ class SinglePrecisionWrapper(EnvironmentWrapper):
     def reward_spec(self):
         return self._convert_spec(self._environment.reward_spec())
 
-    def _convert_spec(self, nested_spec):
-        """Convert a nested spec."""
+    def close(self):
+        return self._environment.close()
 
+    def _canonicalize_bounded_spec(self, spec: specs.Array) -> specs.Array:
+        if isinstance(spec, specs.BoundedArray):
+            return spec.replace(
+                minimum=-np.ones(spec.shape), maximum=np.ones(spec.shape)
+            )
+        return spec
+
+    def _convert_timestep(self, timestep: dm_env.TimeStep) -> dm_env.TimeStep:
+        return timestep._replace(
+            reward=self._convert_value(timestep.reward),
+            discount=self._convert_value(timestep.discount),
+            observation=self._convert_value(timestep.observation),
+        )
+
+    def _convert_spec(self, nested_spec):
         def _convert_single_spec(spec: specs.Array):
-            """Convert a single spec."""
             if spec.dtype == "O":
-                # Pass StringArray objects through unmodified.
                 return spec
             if np.issubdtype(spec.dtype, np.float64):
                 dtype = np.float32
@@ -1690,56 +1662,16 @@ class SinglePrecisionWrapper(EnvironmentWrapper):
         return tree.map_structure(_convert_single_spec, nested_spec)
 
     def _convert_value(self, nested_value):
-        """Convert a nested value given a desired nested spec."""
-
         def _convert_single_value(value):
             if value is not None:
                 value = np.asarray(value)
                 if np.issubdtype(value.dtype, np.float64):
-                    value = np.asarray(value, dtype=np.float32)
+                    value = value.astype(np.float32)
                 elif np.issubdtype(value.dtype, np.int64):
-                    value = np.asarray(value, dtype=np.int32)
+                    value = value.astype(np.int32)
             return value
 
         return tree.map_structure(_convert_single_value, nested_value)
-
-
-class CanonicalSpecWrapper(EnvironmentWrapper):
-    """Wrapper which converts environments to use canonical action specs.
-
-    This only affects action specs of type `specs.BoundedArray`.
-
-    For bounded action specs, we refer to a canonical action spec as the bounding
-    box [-1, 1]^d where d is the dimensionality of the spec. So the shape and
-    dtype of the spec is unchanged, while the maximum/minimum values are set
-    to +/- 1.
-    """
-
-    def __init__(self, environment: dm_env.Environment, clip: bool = False):
-        super().__init__(environment)
-        self._action_spec = environment.action_spec()
-        self._clip = clip
-
-    def step(self, action):
-        scaled_action = _scale_nested_action(action, self._action_spec, self._clip)
-        return self._environment.step(scaled_action)
-
-    def action_spec(self):
-        return self._convert_spec(self._environment.action_spec())
-
-    def _convert_spec(self, nested_spec):
-        """Converts all bounded specs in nested spec to the canonical scale."""
-
-        def _convert_single_spec(spec: specs.Array) -> specs.Array:
-            """Converts a single spec to canonical if bounded."""
-            if isinstance(spec, specs.BoundedArray):
-                return spec.replace(
-                    minimum=-np.ones(spec.shape), maximum=np.ones(spec.shape)
-                )
-            else:
-                return spec
-
-        return tree.map_structure(_convert_single_spec, nested_spec)
 
 
 def _scale_nested_action(
@@ -1777,8 +1709,7 @@ def _make_environment(
     task_name: str = "balance",
 ) -> dm_env.Environment:
     environment = suite.load(domain_name, task_name)
-    environment = CanonicalSpecWrapper(environment, clip=True)
-    environment = SinglePrecisionWrapper(environment)
+    environment = CanonicalSinglePrecisionWrapper(environment, clip=True)
     return environment
 
 
