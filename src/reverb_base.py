@@ -285,7 +285,7 @@ class ReverbAdder(Adder):
 
     @classmethod
     def signature(
-        cls, environment_spec: specs.EnvironmentSpec, extras_spec: types.NestedSpec = ()
+        cls, environment_spec, extras_spec = ()
     ):
         """This is a helper method for generating signatures for Reverb tables.
 
