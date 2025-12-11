@@ -165,8 +165,8 @@ class MPOLearner:
         dataset: tf.data.Dataset,
         counter: counting.Counter,
         logger: loggers.Logger,
-        observation_network = tf.identity,
-        target_observation_network = tf.identity,
+        observation_network=tf.identity,
+        target_observation_network=tf.identity,
         policy_loss_module: Optional[snt.Module] = None,
         policy_optimizer: Optional[snt.Optimizer] = None,
         critic_optimizer: Optional[snt.Optimizer] = None,
@@ -522,7 +522,7 @@ class EnvironmentLoop:
         self._logger = logger
         self._total_steps = 0
 
-    def run_episode(self) ->  Mapping[str, Any]:
+    def run_episode(self) -> Mapping[str, Any]:
         """Run one episode.
 
         Each episode is a loop which interacts first with the environment to get an
@@ -1066,6 +1066,8 @@ class MPOLoss(snt.Module):
                 )
             )
             online_action_distribution = tfd.Independent(
+                tfd.Normal(
+                    online_action_distribution.mean(),
                     online_action_distribution.stddev(),
                 )
             )
