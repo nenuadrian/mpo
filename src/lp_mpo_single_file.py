@@ -842,7 +842,12 @@ class MPO:
 
         learner = self.learner(client, counter)
         actor = self.actor(client, learner, counter)
+        
+        actor.run(num_steps=self._max_actor_steps)
+        
         evaluator = self.evaluator(learner, counter)
+        
+        actor.run
 
 
 """Implements the MPO losses.
