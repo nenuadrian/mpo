@@ -20,7 +20,6 @@ import reverb  # type: ignore
 import wandb
 import tree  # type: ignore
 import operator
-import itertools
 import os
 
 import reverb_transition as adders
@@ -300,10 +299,8 @@ class MPOLearner:
         self._timestamp = None
         self._total_steps = 0
 
-    def run(self, num_steps: Optional[int] = None) -> None:
-
-        iterator = range(num_steps) if num_steps is not None else itertools.count()
-
+    def run(self, num_steps: int):
+        iterator = range(num_steps)
         for _ in iterator:
             self.step()
 
@@ -779,9 +776,17 @@ class MPO:
         create_variables(target_networks["critic"], [emb_spec, act_spec])
 
         # The dataset object to learn from.
-        dataset = make_reverb_dataset(server_address=replay.server_address)
-        dataset = dataset.batch(self._batch_size, drop_remainder=True)
-        dataset = dataset.prefetch(self._prefetch_size)
+        # If the replay client is our in-memory client, obtain its iterator directly.
+        # This avoids the reverb/tf.data dependency for the simple single-writer/single-reader case.
+        if hasattr(replay, "get_iterator"):
+            # get_iterator returns a Python iterator that yields objects with `.data` whose fields
+            # are numpy arrays with leading batch dimension.
+            dataset_iterator = replay.get_iterator(batch_size=self._batch_size)
+            dataset = dataset_iterator
+        else:
+            dataset = make_reverb_dataset(replay.server_address)
+            dataset = dataset.batch(self._batch_size, drop_remainder=True)
+            dataset = dataset.prefetch(self._prefetch_size)
 
         # Return the learning agent.
         return MPOLearner(
@@ -885,8 +890,9 @@ class MPO:
         return EnvironmentLoop(environment=environment, actor=evaluator)
 
     def run(self):
-        server = reverb.Server(tables=self.replay())
-        client = reverb.Client(f"localhost:{server.port}")
+        # Use the in-memory server/client for single-process training (simple actor/learner).
+        server = adders.InMemoryServer(tables=self.replay())
+        client = adders.InMemoryClient(server)
         learner = self.learner(client)
         actor = self.actor(client, learner)
         evaluator = self.evaluator(learner)
