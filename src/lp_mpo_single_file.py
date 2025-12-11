@@ -1,8 +1,10 @@
 """Launch MPO agent on the control suite via Launchpad."""
 
 import functools
-from typing import List, Optional, Dict, Tuple, Union, Sequence, Callable
+from typing import List, Optional, Dict, Tuple, Union, Sequence, Callable, Mapping
 import time
+import datetime
+import abc
 
 
 from absl import app
@@ -19,7 +21,6 @@ from acme import types
 from acme import core
 from acme import adders as acme_adders
 from acme.tf import utils as tf2_utils
-from acme.tf import savers as tf2_savers
 from acme.utils import counting
 from acme.utils import loggers
 from acme import datasets
@@ -27,6 +28,8 @@ from acme.adders import reverb as adders
 from acme.tf import variable_utils as tf2_variable_utils
 from acme.utils import lp_utils
 from acme import wrappers
+from acme.utils import paths
+from acme.utils import signals
 
 import tensorflow as tf
 import tensorflow_probability as tfp
@@ -108,6 +111,221 @@ class FeedForwardActor(core.Actor):
     def update(self, wait: bool = False):
         if self._variable_client:
             self._variable_client.update(wait)
+
+
+PythonState = tf.train.experimental.PythonState
+Checkpointable = Union[tf.Module, tf.Variable, PythonState]
+
+_DEFAULT_CHECKPOINT_TTL = int(datetime.timedelta(days=5).total_seconds())
+
+
+class TFSaveable(abc.ABC):
+    """An interface for objects that expose their checkpointable TF state."""
+
+    @property
+    @abc.abstractmethod
+    def state(self) -> Mapping[str, Checkpointable]:
+        """Returns TensorFlow checkpointable state."""
+
+
+class Checkpointer:
+    """Convenience class for periodically checkpointing.
+
+    This can be used to checkpoint any object with trackable state (e.g.
+    tensorflow variables or modules); see tf.train.Checkpoint for
+    details. Objects inheriting from tf.train.experimental.PythonState can also
+    be checkpointed.
+
+    Typically people use Checkpointer to make sure that they can correctly recover
+    from a machine going down during learning. For more permanent storage of self-
+    contained "networks" see the Snapshotter object.
+
+    Usage example:
+
+    ```python
+    model = snt.Linear(10)
+    checkpointer = Checkpointer(objects_to_save={'model': model})
+
+    for _ in range(100):
+      # ...
+      checkpointer.save()
+    ```
+    """
+
+    def __init__(
+        self,
+        objects_to_save: Mapping[str, Union[Checkpointable, core.Saveable]],
+        *,
+        directory: str = "~/acme/",
+        subdirectory: str = "default",
+        time_delta_minutes: float = 10.0,
+        enable_checkpointing: bool = True,
+        add_uid: bool = True,
+        max_to_keep: int = 1,
+        checkpoint_ttl_seconds: Optional[int] = _DEFAULT_CHECKPOINT_TTL,
+        keep_checkpoint_every_n_hours: Optional[int] = None,
+    ):
+        """Builds the saver object.
+
+        Args:
+          objects_to_save: Mapping specifying what to checkpoint.
+          directory: Which directory to put the checkpoint in.
+          subdirectory: Sub-directory to use (e.g. if multiple checkpoints are being
+            saved).
+          time_delta_minutes: How often to save the checkpoint, in minutes.
+          enable_checkpointing: whether to checkpoint or not.
+          add_uid: If True adds a UID to the checkpoint path, see
+            `paths.get_unique_id()` for how this UID is generated.
+          max_to_keep: The maximum number of checkpoints to keep.
+          checkpoint_ttl_seconds: TTL (time to leave) in seconds for checkpoints.
+          keep_checkpoint_every_n_hours: keep_checkpoint_every_n_hours passed to
+            tf.train.CheckpointManager.
+        """
+
+        # Convert `Saveable` objects to TF `Checkpointable` first, if necessary.
+        def to_ckptable(x: Union[Checkpointable, core.Saveable]) -> Checkpointable:
+            return x
+
+        objects_to_save = {k: to_ckptable(v) for k, v in objects_to_save.items()}
+
+        self._time_delta_minutes = time_delta_minutes
+        self._last_saved = 0.0
+        self._enable_checkpointing = enable_checkpointing
+        self._checkpoint_manager = None
+
+        if enable_checkpointing:
+            # Checkpoint object that handles saving/restoring.
+            self._checkpoint = tf.train.Checkpoint(**objects_to_save)
+            self._checkpoint_dir = paths.process_path(
+                directory,
+                "checkpoints",
+                subdirectory,
+                ttl_seconds=checkpoint_ttl_seconds,
+                backups=False,
+                add_uid=add_uid,
+            )
+
+            # Create a manager to maintain different checkpoints.
+            self._checkpoint_manager = tf.train.CheckpointManager(
+                self._checkpoint,
+                directory=self._checkpoint_dir,
+                max_to_keep=max_to_keep,
+                keep_checkpoint_every_n_hours=keep_checkpoint_every_n_hours,
+            )
+
+            self.restore()
+
+    def save(self, force: bool = False) -> bool:
+        """Save the checkpoint if it's the appropriate time, otherwise no-ops.
+
+        Args:
+          force: Whether to force a save regardless of time elapsed since last save.
+
+        Returns:
+          A boolean indicating if a save event happened.
+        """
+        if not self._enable_checkpointing:
+            return False
+
+        if not force and time.time() - self._last_saved < 60 * self._time_delta_minutes:
+            return False
+
+        checkpoint_manager: tf.train.CheckpointManager = self.checkpoint_manager
+        # Save any checkpoints.
+        checkpoint_manager.save()
+        self._last_saved = time.time()
+
+        return True
+
+    def restore(self):
+        """Restore from most recent checkpoint."""
+
+        # Restore from the most recent checkpoint (if it exists).
+        checkpoint_to_restore = self.checkpoint_manager.latest_checkpoint
+        self._checkpoint.restore(checkpoint_to_restore)
+
+    @property
+    def directory(self):
+        return self.checkpoint_manager.directory
+
+    @property
+    def checkpoint_manager(self) -> tf.train.CheckpointManager:
+        if not self._enable_checkpointing:
+            raise ValueError(
+                "Check-point not enabled. No checkpoint manager available."
+            )
+
+        # At this point, _enable_checkpointing is true, so _checkpoint_manager
+        # should not be None.
+        assert self._checkpoint_manager is not None
+        return self._checkpoint_manager
+
+
+class CheckpointingRunner(core.Worker):
+    """Wrap an object and expose a run method which checkpoints periodically.
+
+    This internally creates a Checkpointer around `wrapped` object and exposes
+    all of the methods of `wrapped`. Additionally, any `**kwargs` passed to the
+    runner are forwarded to the internal Checkpointer.
+    """
+
+    def __init__(
+        self,
+        wrapped,
+        key: str = "wrapped",
+        *,
+        time_delta_minutes: int = 30,
+        **kwargs,
+    ):
+
+        # If the object to be wrapped exposes its TF State, checkpoint that.
+        objects_to_save = wrapped.state
+
+        self._wrapped = wrapped
+        self._time_delta_minutes = time_delta_minutes
+        self._checkpointer = Checkpointer(
+            objects_to_save={key: objects_to_save},
+            time_delta_minutes=time_delta_minutes,
+            **kwargs,
+        )
+
+    # Handle preemption signal. Note that this must happen in the main thread.
+    def _signal_handler(self):
+        self._checkpointer.save(force=True)
+
+    def step(self):
+        if isinstance(self._wrapped, core.Learner):
+            # Learners have a step() method, so alternate between that and ckpt call.
+            self._wrapped.step()
+            self._checkpointer.save()
+        else:
+            # Wrapped object doesn't have a run method; set our run method to ckpt.
+            self.checkpoint()
+
+    def run(self):
+        """Runs the checkpointer."""
+        with signals.runtime_terminator(self._signal_handler):
+            while True:
+                self.step()
+
+    def __dir__(self):
+        return dir(self._wrapped) + ["get_directory"]
+
+    # TODO(b/195915583) : Throw when wrapped object has get_directory() method.
+    def __getattr__(self, name):
+        if name == "get_directory":
+            return self.get_directory
+        return getattr(self._wrapped, name)
+
+    def checkpoint(self):
+        self._checkpointer.save()
+        # Do not sleep for a long period of time to avoid LaunchPad program
+        # termination hangs (time.sleep is not interruptible).
+        for _ in range(self._time_delta_minutes * 60):
+            time.sleep(1)
+
+    def get_directory(self):
+        return self._checkpointer.directory
 
 
 class StochasticMeanHead(snt.Module):
@@ -193,7 +411,7 @@ class DistributedMPO:
         return [replay_table]
 
     def counter(self):
-        return tf2_savers.CheckpointingRunner(
+        return CheckpointingRunner(
             counting.Counter(), time_delta_minutes=1, subdirectory="counter"
         )
 
@@ -266,7 +484,6 @@ class DistributedMPO:
             dataset=dataset,
             counter=counter,
             logger=logger,
-            checkpoint=False,
         )
 
     def actor(
@@ -914,8 +1131,6 @@ class MPOLearner(acme.Learner):
         clipping: bool = True,
         counter: Optional[counting.Counter] = None,
         logger: Optional[loggers.Logger] = None,
-        checkpoint: bool = True,
-        save_directory: str = "~/acme",
     ):
 
         self._counter = counter or counting.Counter()
@@ -968,39 +1183,6 @@ class MPOLearner(acme.Learner):
             "critic": self._target_critic_network.variables,
             "policy": policy_network_to_expose.variables,
         }
-
-        # Create a checkpointer and snapshotter object.
-        self._checkpointer = None
-        self._snapshotter = None
-
-        if checkpoint:
-            self._checkpointer = tf2_savers.Checkpointer(
-                directory=save_directory,
-                subdirectory="mpo_learner",
-                objects_to_save={
-                    "counter": self._counter,
-                    "policy": self._policy_network,
-                    "critic": self._critic_network,
-                    "observation_network": self._observation_network,
-                    "target_policy": self._target_policy_network,
-                    "target_critic": self._target_critic_network,
-                    "target_observation_network": self._target_observation_network,
-                    "policy_optimizer": self._policy_optimizer,
-                    "critic_optimizer": self._critic_optimizer,
-                    "dual_optimizer": self._dual_optimizer,
-                    "policy_loss_module": self._policy_loss_module,
-                    "num_steps": self._num_steps,
-                },
-            )
-
-            self._snapshotter = tf2_savers.Snapshotter(
-                directory=save_directory,
-                objects_to_save={
-                    "policy": snt.Sequential(
-                        [self._target_observation_network, self._target_policy_network]
-                    ),
-                },
-            )
 
         # Do not record timestamps until after the first learning step is done.
         # This is to avoid including the time it takes for actors to come online and
@@ -1146,11 +1328,6 @@ class MPOLearner(acme.Learner):
         counts = self._counter.increment(steps=1, walltime=elapsed_time)
         fetches.update(counts)
 
-        # Checkpoint and attempt to write the logs.
-        if self._checkpointer is not None:
-            self._checkpointer.save()
-        if self._snapshotter is not None:
-            self._snapshotter.save()
         self._logger.write(fetches)
 
     def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:
