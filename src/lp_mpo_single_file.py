@@ -3,7 +3,7 @@ import time
 import datetime
 import abc
 
-
+import functools
 from absl import app
 from absl import flags
 import numpy as np
@@ -546,6 +546,7 @@ class MPO:
         domain: str,
         task: str,
         network_factory: Callable[[specs.BoundedArray], Dict[str, snt.Module]],
+        environment_factory: Callable[[], dm_env.Environment],
         num_caches: int = 0,
         batch_size: int = 256,
         prefetch_size: int = 4,
@@ -563,8 +564,8 @@ class MPO:
         log_every: float = 10.0,
     ):
 
-        environment_spec = _make_environment(domain_name=domain, task_name=task)
-
+        environment_spec = environment_factory()
+        self._environment_factory = environment_factory
         self.domain = domain
         self.task = task
         self._network_factory = network_factory
@@ -699,7 +700,7 @@ class MPO:
         observation_spec = self._environment_spec.observations
 
         # Create environment and target networks to act with.
-        environment = _make_environment(domain_name=self.domain, task_name=self.task)
+        environment = self._environment_factory()
 
         agent_networks = self._network_factory(action_spec)
 
@@ -760,9 +761,7 @@ class MPO:
         action_spec = self._environment_spec.actions
         observation_spec = self._environment_spec.observations
 
-        environment = _make_environment(
-            domain_name=self.domain, task_name=self.task, evaluation=True
-        )
+        environment = self._environment_factory()
 
         agent_networks = self._network_factory(action_spec)
 
@@ -1795,6 +1794,9 @@ def main(_):
         max_actor_steps=_MAX_ACTOR_STEPS.value,
         domain=_DOMAIN.value,
         task=_TASK.value,
+        environment_factory=functools.partial(
+            _make_environment, domain_name=_DOMAIN.value, task_name=_TASK.value
+        ),
     )
 
     lp.launch(programs=program_builder.build())
