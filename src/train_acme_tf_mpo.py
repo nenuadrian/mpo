@@ -115,37 +115,34 @@ class SimpleReplayBuffer:
         with self._lock:
             assert self._storage, "Replay buffer is empty."
             indices = np.random.randint(len(self._storage), size=batch_size)
+            batch = [self._storage[i] for i in indices]
 
-            obs = np.stack(
-                [np.array(self._storage[i].observation) for i in indices], axis=0
-            )
-            actions = np.stack(
-                [np.array(self._storage[i].action) for i in indices], axis=0
-            )
-            rewards = np.stack(
-                [np.array(self._storage[i].reward) for i in indices], axis=0
-            )
-            discounts = np.stack(
-                [np.array(self._storage[i].discount) for i in indices], axis=0
-            )
-            next_obs = np.stack(
-                [np.array(self._storage[i].next_observation) for i in indices], axis=0
-            )
+        observation = tree.map_structure(
+            lambda *xs: np.stack(xs, axis=0),
+            *[transition.observation for transition in batch],
+        )
+        action = np.stack([transition.action for transition in batch], axis=0)
+        reward = np.stack([transition.reward for transition in batch], axis=0)
+        discount = np.stack([transition.discount for transition in batch], axis=0)
+        next_observation = tree.map_structure(
+            lambda *xs: np.stack(xs, axis=0),
+            *[transition.next_observation for transition in batch],
+        )
 
-            self._sample_count += 1
-
-        obs_tf = tf.convert_to_tensor(obs)
-        actions_tf = tf.convert_to_tensor(actions)
-        rewards_tf = tf.convert_to_tensor(rewards)
-        discounts_tf = tf.convert_to_tensor(discounts)
-        next_obs_tf = tf.convert_to_tensor(next_obs)
+        observation_tf = tf.nest.map_structure(tf.convert_to_tensor, observation)
+        action_tf = tf.convert_to_tensor(action)
+        reward_tf = tf.convert_to_tensor(reward)
+        discount_tf = tf.convert_to_tensor(discount)
+        next_observation_tf = tf.nest.map_structure(
+            tf.convert_to_tensor, next_observation
+        )
 
         return types.Transition(
-            observation=obs_tf,
-            action=actions_tf,
-            reward=rewards_tf,
-            discount=discounts_tf,
-            next_observation=next_obs_tf,
+            observation=observation_tf,
+            action=action_tf,
+            reward=reward_tf,
+            discount=discount_tf,
+            next_observation=next_observation_tf,
             extras=(),
         )
 
