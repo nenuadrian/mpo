@@ -28,7 +28,7 @@ from acme.tf import utils as tf2_utils
 from acme.utils import counting
 from acme.adders import reverb as adders
 from acme import wrappers
-from acme import loggers
+from acme.utils import loggers
 
 import dm_env
 from dm_env import specs
