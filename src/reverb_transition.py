@@ -61,7 +61,7 @@ def calculate_priorities(
       A dictionary mapping from table names to the priority (a float) for the
       given collection Trajectory or Transition.
     """
-    if any([priority_fn is not None for priority_fns.values()]):
+    if any([priority_fn is not None for priority_fn in priority_fns.values()]):
 
         trajectory_or_transition = tree.map_structure(
             lambda col: col.numpy(), trajectory_or_transition
