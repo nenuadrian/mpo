@@ -13,6 +13,7 @@ import launchpad as lp
 import dm_env
 import reverb
 import pickle
+import wandb
 from dm_control import suite
 
 import acme
@@ -661,8 +662,6 @@ Tensor shapes are annotated, where helpful, as follow:
 """
 
 
-
-
 class MPOLoss(snt.Module):
     """MPO loss with decoupled KL constraints as in (Abdolmaleki et al., 2018).
 
@@ -988,6 +987,7 @@ class MPOLoss(snt.Module):
         stats["pi_stddev_cond"] = tf.reduce_mean(
             tf.reduce_max(pi_stddev, axis=-1) / tf.reduce_min(pi_stddev, axis=-1)
         )
+        wandb.log(stats)
 
         return loss, stats
 
@@ -1166,7 +1166,7 @@ class MPOLearner(acme.Learner):
             epsilon_stddev=1e-6,
             init_log_temperature=10.0,
             init_log_alpha_mean=10.0,
-            init_log_alpha_stddev=10.0,
+            init_log_alpha_stddev=1000.0,
         )
 
         # Create the optimizers.
@@ -1326,6 +1326,8 @@ class MPOLearner(acme.Learner):
         # Update our counts and record it.
         counts = self._counter.increment(steps=1, walltime=elapsed_time)
         fetches.update(counts)
+        
+        wandb.log(fetches)
 
         self._logger.write(fetches)
 
@@ -1583,6 +1585,16 @@ def _make_environment(
 
 
 def main(_):
+    wandb.init(
+        entity="adrian-research",
+        group=_DOMAIN.value + "_" + _TASK.value,
+        project="lp_mpo_single_file",
+        config={
+            "domain": _DOMAIN.value,
+            "task": _TASK.value,
+            "max_actor_steps": _MAX_ACTOR_STEPS.value,
+        },
+    )
     make_environment = functools.partial(
         _make_environment, domain_name=_DOMAIN.value, task_name=_TASK.value
     )
