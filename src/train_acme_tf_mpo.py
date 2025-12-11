@@ -378,7 +378,6 @@ class MPOLearner:
 
         wandb.log(fetches)
 
-        print(fetches)
 
     def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:
         return [tf2_utils.to_numpy(self._variables[name]) for name in names]
@@ -636,8 +635,7 @@ class EnvironmentLoop:
             result = {**result, **{"episode_duration": time.time() - episode_start}}
             episode_count += 1
             step_count += int(result["episode_length"])
-            # Log the given episode results.
-            print(result)
+            wandb.log(result)
 
         return step_count
 
