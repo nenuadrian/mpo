@@ -524,7 +524,11 @@ class MPO:
         observation_spec = self._environment_spec.observations
 
         # Create environment and target networks to act with.
-        environment = self._environment_factory(False)
+        environment = _make_environment(
+            evaluation=False,
+            domain_name=_DOMAIN.value,
+            task_name=_TASK.value,
+        )
         agent_networks = self._network_factory(action_spec)
 
         # Create a stochastic behavior policy.
@@ -585,7 +589,11 @@ class MPO:
         observation_spec = self._environment_spec.observations
 
         # Create environment and target networks to act with.
-        environment = self._environment_factory(True)
+        environment = _make_environment(
+            evaluation=True,
+            domain_name=_DOMAIN.value,
+            task_name=_TASK.value,
+        )
         agent_networks = self._network_factory(action_spec)
 
         # Create a stochastic behavior policy.
