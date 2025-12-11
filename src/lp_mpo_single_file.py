@@ -16,7 +16,6 @@ import dm_env
 import reverb
 import pickle
 
-import acme
 from acme import specs
 from acme import types
 from acme import core
