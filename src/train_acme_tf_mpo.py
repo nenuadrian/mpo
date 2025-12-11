@@ -399,7 +399,7 @@ class EnvironmentLoop(core.Worker):
     def __init__(
         self,
         environment: dm_env.Environment,
-        actor: FeedForwardActor | EvaluatorActor,
+        actor: core.Actor,
         counter: Optional[counting.Counter] = None,
         logger: Optional[loggers.Logger] = None,
         label: str = "environment_loop",
