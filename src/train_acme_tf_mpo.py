@@ -316,8 +316,12 @@ class EvaluatorActor:
 
     def update(self, total_steps: int):
         if total_steps % self._update_period == 0:
-            new_data = self._learner.get_variables(["policy"])
-            self._policy_network.variables["policy"].assign(new_data)
+            new_variables = tree.flatten(self._learner.get_variables(["policy"]))
+            old_variables = tree.flatten(
+                list({"policy": self._policy_network.variables}.values())
+            )
+            for new, old in zip(new_variables, old_variables):
+                old.assign(new)
 
 
 class FeedForwardActor:
@@ -368,8 +372,12 @@ class FeedForwardActor:
 
     def update(self, total_steps: int):
         if total_steps % self._update_period == 0:
-            new_data = self._learner.get_variables(["policy"])
-            self._policy_network.variables["policy"].assign(new_data)
+            new_variables = tree.flatten(self._learner.get_variables(["policy"]))
+            old_variables = tree.flatten(
+                list({"policy": self._policy_network.variables}.values())
+            )
+            for new, old in zip(new_variables, old_variables):
+                old.assign(new)
 
 
 class EnvironmentLoop(core.Worker):
