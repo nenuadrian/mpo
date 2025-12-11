@@ -19,7 +19,7 @@ into a single transition, simplifying to a simple transition adder when N=1.
 """
 
 import copy
-from typing import Optional, Tuple, Any, Dict
+from typing import Optional, Tuple, Any, Dict, NamedTuple
 
 import reverb_base as base
 
@@ -27,6 +27,17 @@ import numpy as np
 import reverb
 import tree
 from dm_env import specs
+
+
+class Transition(NamedTuple):
+    """Container for a transition."""
+
+    observation: Any
+    action: Any
+    reward: Any
+    discount: Any
+    next_observation: Any
+    extras: Any = ()
 
 
 def calculate_priorities(
@@ -282,7 +293,7 @@ class NStepTransitionAdder(base.ReverbAdder):
         n_step_return, total_discount = tree.map_structure(
             lambda x: x[-1], (history["n_step_return"], history["total_discount"])
         )
-        transition = types.Transition(
+        transition = Transition(
             observation=s,
             action=a,
             reward=n_step_return,
