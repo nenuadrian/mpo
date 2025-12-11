@@ -17,8 +17,8 @@ import wandb
 import imageio
 import logging
 
-from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage
-from tensordict import TensorDict
+from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage # type: ignore
+from tensordict import TensorDict # type: ignore
 
 
 LOGGER_NAME = "mpo"

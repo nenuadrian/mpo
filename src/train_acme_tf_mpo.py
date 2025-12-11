@@ -297,7 +297,6 @@ class MPOLearner:
         # This is to avoid including the time it takes for actors to come online and
         # fill the replay buffer.
         self._timestamp = None
-        self._total_steps = 0
 
     def run(self, num_steps: int):
         iterator = range(num_steps)
@@ -431,7 +430,6 @@ class MPOLearner:
         return fetches
 
     def step(self):
-        self._total_steps = self._total_steps + 1
         fetches = self._step()
 
         # Compute elapsed time.
@@ -439,9 +437,9 @@ class MPOLearner:
         self._timestamp = timestamp
 
         # Update our counts and record it.
-        fetches.update({"total_steps": self._total_steps})
+        fetches.update({"total_steps": self._num_steps.numpy()})
 
-        if self._total_steps % self._log_every == 0:
+        if self._num_steps.numpy() % self._log_every == 0:
             wandb.log({"learner/" + k: v for k, v in fetches.items()})
 
     def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:
