@@ -225,6 +225,46 @@ def _generate_zeros_from_spec(spec: specs.Array) -> np.ndarray:
     return np.zeros(spec.shape, spec.dtype)
 
 
+class EvaluatorActor():
+
+    def __init__(
+        self,
+        policy_network: snt.Module,
+        variable_client: Optional[tf2_variable_utils.VariableClient] = None,
+    ):
+        self._variable_client = variable_client
+        self._policy_network = policy_network
+
+    @tf.function
+    def _policy(self, observation: types.NestedTensor) -> types.NestedTensor:
+        # Add a dummy batch dimension and as a side effect convert numpy to TF.
+        batched_observation = tf2_utils.add_batch_dim(observation)
+
+        # Compute the policy, conditioned on the observation.
+        policy = self._policy_network(batched_observation)
+
+        # Sample from the policy if it is stochastic.
+        action = policy.sample() if isinstance(policy, tfd.Distribution) else policy
+
+        return action
+
+    def select_action(self, observation: types.NestedArray) -> types.NestedArray:
+        # Pass the observation through the policy network.
+        action = self._policy(observation)
+
+        # Return a numpy array with squeezed out batch dimension.
+        return tf2_utils.to_numpy_squeeze(action)
+
+    def observe_first(self, timestep: dm_env.TimeStep):
+        pass
+
+    def observe(self, action: types.NestedArray, next_timestep: dm_env.TimeStep):
+        pass
+    
+    def update(self, wait: bool = False):
+        if self._variable_client:
+            self._variable_client.update(wait)
+            
 class FeedForwardActor(core.Actor):
     """A feed-forward actor.
 
@@ -769,10 +809,7 @@ class MPO:
         )
 
         # Create the agent.
-        evaluator = FeedForwardActor(
-            adder=None,
-            logger=logger,
-            counter=counter,
+        evaluator = EvaluatorActor(
             policy_network=evaluator_network,
             variable_client=variable_client,
         )
