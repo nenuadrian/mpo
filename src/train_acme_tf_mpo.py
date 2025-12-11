@@ -244,10 +244,10 @@ class MPOLearner:
         num_samples: int,
         target_policy_update_period: int,
         target_critic_update_period: int,
+        policy_loss_module: snt.Module,
         dataset: tf.data.Dataset,
         observation_network=tf.identity,
         target_observation_network=tf.identity,
-        policy_loss_module: Optional[snt.Module] = None,
         policy_optimizer: Optional[snt.Optimizer] = None,
         critic_optimizer: Optional[snt.Optimizer] = None,
         dual_optimizer: Optional[snt.Optimizer] = None,
@@ -278,15 +278,7 @@ class MPOLearner:
         self._observation_network = to_sonnet_module(observation_network)
         self._target_observation_network = to_sonnet_module(target_observation_network)
 
-        self._policy_loss_module = policy_loss_module or MPOLoss(
-            epsilon=1e-1,
-            epsilon_penalty=1e-3,
-            epsilon_mean=2.5e-3,
-            epsilon_stddev=1e-6,
-            init_log_temperature=10.0,
-            init_log_alpha_mean=10.0,
-            init_log_alpha_stddev=1000.0,
-        )
+        self._policy_loss_module = policy_loss_module
 
         # Create the optimizers.
         self._critic_optimizer = critic_optimizer or snt.optimizers.Adam(1e-4)
@@ -690,20 +682,18 @@ class MPO:
     def __init__(
         self,
         network_factory: Callable[[specs.BoundedArray], Dict[str, snt.Module]],
-        environment_spec: Optional[EnvironmentSpec] = None,
+        n_step: int,
+        max_actor_steps: int,
         batch_size: int = 256,
         prefetch_size: int = 4,
         min_replay_size: int = 1000,
         max_replay_size: int = 1000000,
         samples_per_insert=32.0,
-        n_step: int = 5,
         num_samples: int = 20,
         additional_discount: float = 0.99,
         target_policy_update_period: int = 100,
         target_critic_update_period: int = 100,
         variable_update_period: int = 1000,
-        policy_loss_factory: Optional[Callable[[], snt.Module]] = None,
-        max_actor_steps: Optional[int] = None,
         domain_name: str = "cartpole",
         task_name: str = "balance",
     ):
@@ -711,20 +701,19 @@ class MPO:
         self._domain_name = domain_name
         self._task_name = task_name
 
-        if environment_spec is None:
-            environment = _make_environment(
-                domain_name=self._domain_name,
-                task_name=self._task_name,
-            )
-            environment_spec = EnvironmentSpec(
-                observations=environment.observation_spec(),
-                actions=environment.action_spec(),
-                rewards=environment.reward_spec(),
-                discounts=environment.discount_spec(),
-            )
+        environment = _make_environment(
+            domain_name=self._domain_name,
+            task_name=self._task_name,
+        )
+        environment_spec = EnvironmentSpec(
+            observations=environment.observation_spec(),
+            actions=environment.action_spec(),
+            rewards=environment.reward_spec(),
+            discounts=environment.discount_spec(),
+        )
+        del environment
 
         self._network_factory = network_factory
-        self._policy_loss_factory = policy_loss_factory
         self._environment_spec = environment_spec
         self._batch_size = batch_size
         self._prefetch_size = prefetch_size
@@ -794,12 +783,6 @@ class MPO:
         dataset = dataset.batch(self._batch_size, drop_remainder=True)
         dataset = dataset.prefetch(self._prefetch_size)
 
-        # Create policy loss module if a factory is passed.
-        if self._policy_loss_factory:
-            policy_loss_module = self._policy_loss_factory()
-        else:
-            policy_loss_module = None
-
         # Return the learning agent.
         return MPOLearner(
             policy_network=online_networks["policy"],
@@ -812,7 +795,15 @@ class MPO:
             num_samples=self._num_samples,
             target_policy_update_period=self._target_policy_update_period,
             target_critic_update_period=self._target_critic_update_period,
-            policy_loss_module=policy_loss_module,
+            policy_loss_module=MPOLoss(
+                epsilon=1e-1,
+                epsilon_penalty=1e-3,
+                epsilon_mean=2.5e-3,
+                epsilon_stddev=1e-6,
+                init_log_temperature=10.0,
+                init_log_alpha_mean=10.0,
+                init_log_alpha_stddev=1000.0,
+            ),
             dataset=dataset,
         )
 
@@ -1721,6 +1712,7 @@ def parse_args():
     parser.add_argument("--domain", default="cartpole")
     parser.add_argument("--task", default="balance")
     parser.add_argument("--max_actor_steps", type=int, default=None)
+    parser.add_argument("--n_step", type=int, default=5)
     return parser.parse_args()
 
 
@@ -1741,6 +1733,7 @@ def main(args):
         max_actor_steps=args.max_actor_steps,
         domain_name=args.domain,
         task_name=args.task,
+        n_step=args.n_step,
     )
     program_builder.run()
 
