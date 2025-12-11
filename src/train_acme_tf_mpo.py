@@ -253,10 +253,7 @@ class EvaluatorActor:
         pass
 
     def observe(
-        self,
-        _: dm_env.Environment,
-        _: types.NestedArray,
-        _: dm_env.TimeStep,
+        self, _: dm_env.Environment, __: types.NestedArray, ___: dm_env.TimeStep
     ):
         self._variable_client.update()
 
