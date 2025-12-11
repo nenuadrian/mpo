@@ -921,10 +921,23 @@ class MPO:
         create_variables(target_networks["policy"], [emb_spec])
         create_variables(target_networks["critic"], [emb_spec, act_spec])
 
-        # The dataset object to learn from: use in-memory dataset created from the
-        # provided replay buffer. Build the tf output signature from the original
-        # NStepTransitionAdder.signature helper (no actual Reverb client needed).
-        transition_signature = rt.NStepTransitionAdder.signature(self._environment_spec)
+        # Build the tf output signature directly from the environment spec so it
+        # exactly matches the structure/shape/dtype the generator yields.
+        def spec_to_tfspec(spec):
+            # Leaves are specs.Array (or nested structures of them).
+            if isinstance(spec, specs.Array):
+                return tf.TensorSpec(shape=spec.shape, dtype=spec.dtype)
+            return tree.map_structure(spec_to_tfspec, spec)
+
+        transition_signature = Transition(
+            observation=spec_to_tfspec(self._environment_spec.observations),
+            action=spec_to_tfspec(self._environment_spec.actions),
+            reward=spec_to_tfspec(self._environment_spec.rewards),
+            discount=spec_to_tfspec(self._environment_spec.discounts),
+            next_observation=spec_to_tfspec(self._environment_spec.observations),
+            extras=(),  # extras are empty in this setup
+        )
+
         dataset = make_in_memory_dataset(replay, output_signature=transition_signature)
         dataset = dataset.batch(self._batch_size, drop_remainder=True)
         dataset = dataset.prefetch(self._prefetch_size)
