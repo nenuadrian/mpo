@@ -1,5 +1,3 @@
-"""Launch MPO agent on the control suite via Launchpad."""
-
 import functools
 from typing import List, Optional, Dict, Tuple, Union, Sequence, Callable, Mapping
 import time
@@ -16,6 +14,7 @@ import dm_env
 import reverb
 import pickle
 
+import acme
 from acme import specs
 from acme import types
 from acme import core
@@ -48,7 +47,6 @@ _MAX_ACTOR_STEPS = flags.DEFINE_integer(
 )
 _DOMAIN = flags.DEFINE_string("domain", "cartpole", "Control suite domain name.")
 _TASK = flags.DEFINE_string("task", "balance", "Control suite task name.")
-_NUM_ACTORS = flags.DEFINE_integer("num_actors", 1, "Number of actors to run.")
 
 
 class FeedForwardActor(core.Actor):
@@ -355,14 +353,12 @@ class StochasticMeanHead(snt.Module):
         return distribution.mean()
 
 
-class DistributedMPO:
-    """Program definition for MPO."""
+class MPO:
 
     def __init__(
         self,
         environment_factory: Callable[[bool], dm_env.Environment],
         network_factory: Callable[[specs.BoundedArray], Dict[str, snt.Module]],
-        num_actors: int = 1,
         num_caches: int = 0,
         environment_spec: Optional[specs.EnvironmentSpec] = None,
         batch_size: int = 256,
@@ -388,7 +384,6 @@ class DistributedMPO:
         self._network_factory = network_factory
         self._policy_loss_factory = policy_loss_factory
         self._environment_spec = environment_spec
-        self._num_actors = num_actors
         self._num_caches = num_caches
         self._batch_size = batch_size
         self._prefetch_size = prefetch_size
@@ -643,26 +638,8 @@ class DistributedMPO:
         with program.group("evaluator"):
             program.add_node(lp.CourierNode(self.evaluator, learner, counter))
 
-        if not self._num_caches:
-            # Use our learner as a single variable source.
-            sources = [learner]
-        else:
-            with program.group("cacher"):
-                # Create a set of learner caches.
-                sources = []
-                for _ in range(self._num_caches):
-                    cacher = program.add_node(
-                        lp.CacherNode(
-                            learner, refresh_interval_ms=2000, stale_after_ms=4000
-                        )
-                    )
-                    sources.append(cacher)
-
         with program.group("actor"):
-            # Add actors which pull round-robin from our variable sources.
-            for actor_id in range(self._num_actors):
-                source = sources[actor_id % len(sources)]
-                program.add_node(lp.CourierNode(self.actor, replay, source, counter))
+            program.add_node(lp.CourierNode(self.actor, replay, learner, counter))
 
         return program
 
@@ -1632,12 +1609,11 @@ def main(_):
         _make_environment, domain_name=_DOMAIN.value, task_name=_TASK.value
     )
 
-    program_builder = DistributedMPO(
+    program_builder = MPO(
         make_environment,
         make_networks,
         target_policy_update_period=25,
         max_actor_steps=_MAX_ACTOR_STEPS.value,
-        num_actors=_NUM_ACTORS.value,
     )
 
     lp.launch(programs=program_builder.build())
