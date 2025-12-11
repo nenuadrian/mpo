@@ -24,9 +24,9 @@ from typing import Optional, Tuple, Any, Dict, NamedTuple
 import reverb_base as base
 
 import numpy as np
-import reverb
-import tree
-from dm_env import specs
+import reverb  # type: ignore
+import tree  # type: ignore
+from dm_env import specs  # type: ignore
 
 
 class Transition(NamedTuple):
@@ -232,8 +232,9 @@ class NStepTransitionAdder(base.ReverbAdder):
 
     def reset(
         self,
-    ):  # pytype: disable=signature-mismatch  # overriding-parameter-count-checks
-        super().reset()
+        timeout_ms: Optional[int] = None,
+    ):
+        super().reset(timeout_ms=timeout_ms)
         self._first_idx = 0
         self._last_idx = 0
 
@@ -246,6 +247,7 @@ class NStepTransitionAdder(base.ReverbAdder):
         # Convenient getters for use in tree operations.
         get_first = lambda x: x[self._first_idx]
         get_last = lambda x: x[self._last_idx]
+
         # Note: this getter is meant to be used on a TrajectoryWriter.history to
         # obtain its numpy values.
         # Be tolerant if history arrays are numpy arrays or TF tensors.
@@ -265,6 +267,7 @@ class NStepTransitionAdder(base.ReverbAdder):
         s_ = tree.map_structure(get_last, history["observation"])
 
         # Maybe get extras to add to the transition later.
+        extras = ()
         if "extras" in history:
             extras = tree.map_structure(get_first, history["extras"])
 
@@ -273,7 +276,9 @@ class NStepTransitionAdder(base.ReverbAdder):
         # called from write_last) we will write the final transitions of size (N,
         # N-1, ...). See the Note in the docstring.
         # Get numpy view of the steps to be fed into the priority functions.
-        reward, discount = tree.map_structure(get_all_np, (history["reward"], history["discount"]))
+        reward, discount = tree.map_structure(
+            get_all_np, (history["reward"], history["discount"])
+        )
 
         # Compute discounted return and geometric discount over n steps.
         n_step_return, total_discount = self._compute_cumulative_quantities(
@@ -430,6 +435,7 @@ from types import SimpleNamespace
 from collections import defaultdict
 import time
 
+
 class _InMemoryTrajectoryWriter:
     """Simple writer that keeps a per-writer history and forwards created items to client storage."""
 
@@ -516,12 +522,15 @@ class InMemoryClient:
         with self._lock:
             self._server._storage[table_name].append((priority, trajectory))
 
-    def get_iterator(self, table_name="priority_table", batch_size=1, sleep_if_empty=0.01):
+    def get_iterator(
+        self, table_name="priority_table", batch_size=1, sleep_if_empty=0.01
+    ):
         """Return a Python iterator that yields objects compatible with learner expectations.
 
         Each yielded element has a `.data` attribute containing a Transition where every
         field is a numpy array with leading batch dimension = batch_size.
         """
+
         def generator():
             while True:
                 with self._lock:
@@ -531,12 +540,16 @@ class InMemoryClient:
                     time.sleep(sleep_if_empty)
                     continue
                 # Random uniform sample without replacement if possible.
-                idx = np.random.choice(len(stored), size=batch_size, replace=(len(stored) < batch_size))
+                idx = np.random.choice(
+                    len(stored), size=batch_size, replace=(len(stored) < batch_size)
+                )
                 batch = [stored[i][1] for i in idx]  # select the Transition objects
+
                 # Stack each field across the batch dimension.
                 def stack_field(getattr_name):
                     vals = [getattr(t, getattr_name) for t in batch]
                     return np.stack(vals, axis=0)
+
                 batched = Transition(
                     observation=stack_field("observation"),
                     action=stack_field("action"),
