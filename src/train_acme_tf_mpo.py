@@ -7,6 +7,7 @@ from absl import flags
 import numpy as np
 import sonnet as snt
 import dm_env
+import reverb
 import wandb
 from dm_control import suite
 import tree
@@ -21,6 +22,8 @@ from acme import adders as acme_adders
 from acme.tf import utils as tf2_utils
 from acme.utils import counting
 from acme.utils import loggers
+from acme import datasets
+from acme.adders import reverb as adders
 from acme.tf import variable_utils as tf2_variable_utils
 from acme import wrappers
 from acme.utils import observers as observers_lib
@@ -42,138 +45,6 @@ _MAX_ACTOR_STEPS = flags.DEFINE_integer(
 _DOMAIN = flags.DEFINE_string("domain", "cartpole", "Control suite domain name.")
 _TASK = flags.DEFINE_string("task", "balance", "Control suite task name.")
 _MPO_FLOAT_EPSILON = 1e-8
-
-
-class SimpleReplayBuffer:
-    """Thread-safe ring-buffer replay with uniform sampling + rate limiting."""
-
-    def __init__(self, capacity: int, logger: loggers.Logger):
-        self._capacity = int(capacity)
-        self._storage: list[types.Transition] = []
-        self._idx = 0
-        self._lock = threading.Lock()
-        self._insert_count = 0  # total number of transitions ever inserted
-        self._sample_count = 0  # total number of batches ever sampled
-        self._logger = logger
-
-    def add(self, transition: types.Transition) -> None:
-        with self._lock:
-            if len(self._storage) < self._capacity:
-                self._storage.append(transition)
-            else:
-                self._storage[self._idx] = transition
-            self._idx = (self._idx + 1) % self._capacity
-            self._insert_count += 1
-            if len(self._storage) % 1000 == 0:
-                self._logger.write(
-                    {"Replay buffer size": len(self._storage)}
-                )  # debug print
-
-    @property
-    def size(self) -> int:
-        with self._lock:
-            return len(self._storage)
-
-    @property
-    def insert_count(self) -> int:
-        with self._lock:
-            return self._insert_count
-
-    @property
-    def sample_count(self) -> int:
-        with self._lock:
-            return self._sample_count
-
-    def can_sample(
-        self,
-        samples_per_insert: float,
-        error_buffer: float,
-        min_replay_size: int,
-    ) -> bool:
-        """Reverb-like SampleToInsertRatio gate.
-
-        Allows sampling only if:
-            - enough items in replay
-            - S <= samples_per_insert * I + error_buffer
-        """
-        with self._lock:
-            if len(self._storage) < min_replay_size:
-                return False
-
-            I = float(self._insert_count)
-            S = float(self._sample_count)
-
-            # If no inserts yet, don't let learner sample.
-            if I == 0.0:
-                return False
-
-            allowed_samples = samples_per_insert * I + error_buffer
-            return S < allowed_samples
-
-    def sample(self, batch_size: int) -> types.Transition:
-        """Uniformly sample a batch and return a `types.Transition` of TF tensors."""
-        with self._lock:
-            assert self._storage, "Replay buffer is empty."
-            indices = np.random.randint(len(self._storage), size=batch_size)
-            batch = [self._storage[i] for i in indices]
-
-        observation = tree.map_structure(
-            lambda *xs: np.stack(xs, axis=0),
-            *[transition.observation for transition in batch],
-        )
-        action = np.stack([transition.action for transition in batch], axis=0)
-        reward = np.stack([transition.reward for transition in batch], axis=0)
-        discount = np.stack([transition.discount for transition in batch], axis=0)
-        next_observation = tree.map_structure(
-            lambda *xs: np.stack(xs, axis=0),
-            *[transition.next_observation for transition in batch],
-        )
-
-        observation_tf = tf.nest.map_structure(tf.convert_to_tensor, observation)
-        action_tf = tf.convert_to_tensor(action)
-        reward_tf = tf.convert_to_tensor(reward)
-        discount_tf = tf.convert_to_tensor(discount)
-        next_observation_tf = tf.nest.map_structure(
-            tf.convert_to_tensor, next_observation
-        )
-
-        return types.Transition(
-            observation=observation_tf,
-            action=action_tf,
-            reward=reward_tf,
-            discount=discount_tf,
-            next_observation=next_observation_tf,
-            extras=(),
-        )
-
-
-class SimpleAdder:
-    """Minimal 1-step adder that mirrors Acme's API `add_first`/`add`.
-
-    This ignores n-step logic and just stores 1-step transitions:
-        (s_t, a_t, r_{t+1}, discount_{t+1}, s_{t+1})
-    """
-
-    def __init__(self, replay_buffer: SimpleReplayBuffer):
-        self._replay_buffer = replay_buffer
-        self._prev_timestep: dm_env.TimeStep | None = None
-
-    def add_first(self, timestep: dm_env.TimeStep) -> None:
-        self._prev_timestep = timestep
-
-    def add(self, action: types.NestedArray, next_timestep: dm_env.TimeStep) -> None:
-        assert self._prev_timestep is not None, "add_first must be called before add."
-
-        transition = types.Transition(
-            observation=self._prev_timestep.observation,
-            action=action,
-            reward=next_timestep.reward,
-            discount=next_timestep.discount,
-            next_observation=next_timestep.observation,
-            extras=(),
-        )
-        self._replay_buffer.add(transition)
-        self._prev_timestep = next_timestep
 
 
 class EnvironmentLoop(core.Worker):
@@ -431,9 +302,7 @@ class MPOLearner(acme.VariableSource):
         num_samples: int,
         target_policy_update_period: int,
         target_critic_update_period: int,
-        replay_buffer: SimpleReplayBuffer,
-        batch_size: int,
-        min_replay_size: int,
+        dataset: tf.data.Dataset,
         counter: counting.Counter,
         observation_network: types.TensorTransformation = tf.identity,
         target_observation_network: types.TensorTransformation = tf.identity,
@@ -456,9 +325,9 @@ class MPOLearner(acme.VariableSource):
         self._target_policy_update_period = target_policy_update_period
         self._target_critic_update_period = target_critic_update_period
 
-        self._replay_buffer = replay_buffer
-        self._batch_size = batch_size
-        self._min_replay_size = min_replay_size
+        # Batch dataset and create iterator.
+        # TODO(b/155086959): Fix type stubs and remove.
+        self._iterator = iter(dataset)  # pytype: disable=wrong-arg-types
 
         # Store online and target networks.
         self._policy_network = policy_network
@@ -535,7 +404,11 @@ class MPOLearner(acme.VariableSource):
         self._num_steps.assign_add(1)
 
         # Get next batch of data.
-        transitions: types.Transition = self._replay_buffer.sample(self._batch_size)
+        inputs = next(self._iterator)
+
+        # Get data from replay (dropping extras if any). Note there is no
+        # extra data here because we do not insert any into Reverb.
+        transitions: types.Transition = inputs.data
 
         # Cast the additional discount to match the environment discount dtype.
         discount = tf.cast(self._discount, dtype=transitions.discount.dtype)
@@ -631,15 +504,6 @@ class MPOLearner(acme.VariableSource):
         return fetches
 
     def step(self):
-        if not self._replay_buffer.can_sample(
-            samples_per_insert=32.0,
-            error_buffer=self._min_replay_size * 0.1,
-            min_replay_size=self._min_replay_size,
-        ):
-            self._logger.write({"learner_waiting_for_replay": True})
-            time.sleep(1)
-            return
-
         # Run the learning step.
         fetches = self._step()
 
@@ -707,9 +571,29 @@ class MPO:
         self._max_actor_steps = max_actor_steps
         self._log_every = log_every
 
+    def replay(self):
+        # Create enough of an error buffer to give a 10% tolerance in rate.
+        samples_per_insert_tolerance = 0.1 * self._samples_per_insert
+        error_buffer = self._min_replay_size * samples_per_insert_tolerance
+
+        limiter = reverb.rate_limiters.SampleToInsertRatio(
+            min_size_to_sample=self._min_replay_size,
+            samples_per_insert=self._samples_per_insert,
+            error_buffer=error_buffer,
+        )
+        replay_table = reverb.Table(
+            name=adders.DEFAULT_PRIORITY_TABLE,
+            sampler=reverb.selectors.Uniform(),
+            remover=reverb.selectors.Fifo(),
+            max_size=self._max_replay_size,
+            rate_limiter=limiter,
+            signature=adders.NStepTransitionAdder.signature(self._environment_spec),
+        )
+        return [replay_table]
+
     def learner(
         self,
-        replay_buffer: SimpleReplayBuffer,
+        replay: reverb.Client,
         counter: counting.Counter,
     ):
         """The Learning part of the agent."""
@@ -740,6 +624,11 @@ class MPO:
         tf2_utils.create_variables(target_networks["policy"], [emb_spec])
         tf2_utils.create_variables(target_networks["critic"], [emb_spec, act_spec])
 
+        # The dataset object to learn from.
+        dataset = datasets.make_reverb_dataset(server_address=replay.server_address)
+        dataset = dataset.batch(self._batch_size, drop_remainder=True)
+        dataset = dataset.prefetch(self._prefetch_size)
+
         # Create a counter and logger for bookkeeping steps and performance.
         counter = counting.Counter(counter, "learner")
         logger = loggers.make_default_logger(
@@ -765,16 +654,14 @@ class MPO:
             target_policy_update_period=self._target_policy_update_period,
             target_critic_update_period=self._target_critic_update_period,
             policy_loss_module=policy_loss_module,
-            replay_buffer=replay_buffer,
-            batch_size=self._batch_size,
-            min_replay_size=self._min_replay_size,
+            dataset=dataset,
             counter=counter,
             logger=logger,
         )
 
     def actor(
         self,
-        replay_buffer: SimpleReplayBuffer,
+        replay: reverb.Client,
         learner: MPOLearner,
         counter: counting.Counter,
     ) -> EnvironmentLoop:
@@ -813,7 +700,9 @@ class MPO:
         variable_client.update_and_wait()
 
         # Component to add things into replay.
-        adder = SimpleAdder(replay_buffer)
+        adder = adders.NStepTransitionAdder(
+            client=replay, n_step=self._n_step, discount=self._additional_discount
+        )
 
         # Create logger and counter; actors will not spam bigtable.
         counter = counting.Counter(counter, "actor")
@@ -894,13 +783,11 @@ class MPO:
         return EnvironmentLoop(environment, evaluator, counter, logger)
 
     def run(self):
-        logger = loggers.make_default_logger(
-            "replay_buffer", time_delta=self._log_every
-        )
-        replay_buffer = SimpleReplayBuffer(self._max_replay_size, logger=logger)
         counter = counting.Counter()
-        learner = self.learner(replay_buffer, counter)
-        actor = self.actor(replay_buffer, learner, counter)
+        server = reverb.Server(tables=self.replay())
+        client = reverb.Client(f"localhost:{server.port}")
+        learner = self.learner(client, counter)
+        actor = self.actor(client, learner, counter)
         evaluator = self.evaluator(learner, counter)
         threads = [
             threading.Thread(
