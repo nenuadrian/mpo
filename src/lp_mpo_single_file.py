@@ -1,3 +1,4 @@
+import functools
 from typing import List, Optional, Dict, Tuple, Union, Sequence, Callable, Mapping
 import time
 import datetime
@@ -361,8 +362,10 @@ class MPO:
 
     def __init__(
         self,
+        environment_factory: Callable[[bool], dm_env.Environment],
         network_factory: Callable[[specs.BoundedArray], Dict[str, snt.Module]],
         num_caches: int = 0,
+        environment_spec: Optional[specs.EnvironmentSpec] = None,
         batch_size: int = 256,
         prefetch_size: int = 4,
         min_replay_size: int = 1000,
@@ -379,13 +382,10 @@ class MPO:
         log_every: float = 10.0,
     ):
 
-        environment_spec = _make_environment(
-            domain_name=_DOMAIN.value, task_name=_TASK.value
-        )
-
+        self._environment_factory = environment_factory
         self._network_factory = network_factory
         self._policy_loss_factory = policy_loss_factory
-        self._environment_spec = environment_spec
+        self._environment_spec = specs.make_environment_spec(environment_factory(False))
         self._num_caches = num_caches
         self._batch_size = batch_size
         self._prefetch_size = prefetch_size
@@ -515,10 +515,7 @@ class MPO:
         observation_spec = self._environment_spec.observations
 
         # Create environment and target networks to act with.
-        environment = _make_environment(
-            domain_name=_DOMAIN.value, task_name=_TASK.value
-        )
-
+        environment = self._environment_factory(False)
         agent_networks = self._network_factory(action_spec)
 
         # Create a stochastic behavior policy.
@@ -578,10 +575,8 @@ class MPO:
         action_spec = self._environment_spec.actions
         observation_spec = self._environment_spec.observations
 
-        environment = _make_environment(
-            domain_name=_DOMAIN.value, task_name=_TASK.value, evaluation=True
-        )
-
+        # Create environment and target networks to act with.
+        environment = self._environment_factory(True)
         agent_networks = self._network_factory(action_spec)
 
         # Create a stochastic behavior policy.
@@ -1596,8 +1591,12 @@ def main(_):
             "max_actor_steps": _MAX_ACTOR_STEPS.value,
         },
     )
+    make_environment = functools.partial(
+        _make_environment, domain_name=_DOMAIN.value, task_name=_TASK.value
+    )
 
     program_builder = MPO(
+        make_environment,
         network_factory=make_networks,
         target_policy_update_period=25,
         max_actor_steps=_MAX_ACTOR_STEPS.value,
