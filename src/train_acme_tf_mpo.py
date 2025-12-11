@@ -64,7 +64,7 @@ class SimpleReplayBuffer:
                 self._storage[self._idx] = transition
             self._idx = (self._idx + 1) % self._capacity
             self._insert_count += 1
-            if self._insert_count % 1000 == 0:
+            if len(self._storage) % 1000 == 0:
                 self._logger.write(
                     {"Replay buffer size": len(self._storage)}
                 )  # debug print
@@ -639,6 +639,7 @@ class MPOLearner(acme.VariableSource):
             error_buffer=self._min_replay_size * 0.1,
             min_replay_size=self._min_replay_size,
         ):
+            self._logger.write({"learner_waiting_for_replay": True})
             return
 
         # Run the learning step.
