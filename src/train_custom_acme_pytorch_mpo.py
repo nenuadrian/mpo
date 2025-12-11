@@ -880,6 +880,14 @@ class MPOAgent:
             }
         )
         fetches.update(stats)
+
+        if self._learn_steps % 100 == 0:
+            print(
+                f"[Learner step {self._learn_steps}] "
+                f"critic_loss={critic_loss.item():.4f} "
+                f"td_error_mean={td_error_mean:.4f} "
+                f"td_target_mean={target_mean:.4f}"
+            )
         return fetches
 
 
