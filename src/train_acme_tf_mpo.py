@@ -173,17 +173,17 @@ def to_sonnet_module(transformation) -> snt.Module:
     return snt.allow_empty_variables(module)
 
 
-def to_numpy(nest: types.NestedTensor) -> types.NestedArray:
+def to_numpy(nest):
     """Converts a nest of Tensors to a nest of numpy arrays."""
     return tree.map_structure(lambda x: x.numpy(), nest)
 
 
-def to_numpy_squeeze(nest: types.NestedTensor, axis=0) -> types.NestedArray:
+def to_numpy_squeeze(nest, axis=0):
     """Converts a nest of Tensors to a nest of numpy arrays and squeeze axis."""
     return tree.map_structure(lambda x: tf.squeeze(x, axis=axis).numpy(), nest)
 
 
-def zeros_like(nest: types.Nest) -> types.NestedTensor:
+def zeros_like(nest):
     """Given a nest of array-like objects, returns similarly nested tf.zeros."""
     return tree.map_structure(lambda x: tf.zeros(x.shape, x.dtype), nest)
 
