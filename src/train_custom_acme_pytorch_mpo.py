@@ -29,22 +29,31 @@ def init_weights(module):
             nn.init.zeros_(module.bias)
 
 
-# Cross-entropy loss: - E_{nonparametric}[ log pi_online(sampled_action) ]
-def weighted_cross_entropy(means, scales, N, sampled_actions, normalized_weights):
-    online_dist = dist.Independent(dist.Normal(means, scales), 1)
-    logp = online_dist.log_prob(sampled_actions)  # [N, B]
-    loss = -(logp * normalized_weights).sum(dim=0)
-    return loss.mean()
+class ClipToSpec(nn.Module):
+    def __init__(self, low: torch.Tensor, high: torch.Tensor):
+        super().__init__()
+        self.register_buffer("low", low)
+        self.register_buffer("high", high)
+
+    def forward(self, x):
+        return x.clamp(self.low, self.high)
 
 
-def kl_between_diag_normals(p_mean, p_scale, q_mean, q_scale, per_dim: bool):
-    base_p = dist.Normal(p_mean, p_scale)
-    base_q = dist.Normal(q_mean, q_scale)
-    if per_dim:
-        return dist.kl_divergence(base_p, base_q)
-    indep_p = dist.Independent(base_p, 1)
-    indep_q = dist.Independent(base_q, 1)
-    return dist.kl_divergence(indep_p, indep_q).unsqueeze(-1)
+class CriticMultiplexer(nn.Module):
+    def __init__(
+        self, obs_net: nn.Module | None, act_net: nn.Module | None, critic: nn.Module
+    ):
+        super().__init__()
+        self.obs_net = obs_net
+        self.act_net = act_net
+        self.critic = critic
+
+    def forward(self, obs, act):
+        if self.obs_net:
+            obs = self.obs_net(obs)
+        if self.act_net:
+            act = self.act_net(act)
+        return self.critic(torch.cat([obs, act], dim=-1))
 
 
 class LayerNormMLP(nn.Module):
@@ -82,10 +91,11 @@ class MultivariateNormalDiagHead(nn.Module):
         self,
         input_dim: int,
         action_dim: int,
-        init_scale: float = 0.3,
+        init_scale: float,
         min_scale: float = 1e-6,
         tanh_mean: bool = False,
         fixed_scale: bool = False,
+        use_independent: bool = True,
     ):
         super().__init__()
         self.mean_layer = nn.Linear(input_dim, action_dim)
@@ -93,33 +103,40 @@ class MultivariateNormalDiagHead(nn.Module):
         self.tanh_mean = tanh_mean
         self.init_scale = init_scale
         self.min_scale = min_scale
+        self.use_independent = use_independent
         if not fixed_scale:
             # output positive scale via softplus of a linear layer
             self.log_scale_layer = nn.Linear(input_dim, action_dim)
         else:
             self.register_buffer("_fixed_scale", torch.tensor(init_scale))
-        self.apply(init_weights)
 
-        # Make log-scale start near zero so softplus(0) leads to init_scale after rescaling.
-        if not fixed_scale:
-            with torch.no_grad():
-                # zero weights/bias for predictable initial stddev = init_scale
-                self.log_scale_layer.weight.zero_()
-                if self.log_scale_layer.bias is not None:
-                    self.log_scale_layer.bias.zero_()
         # make mean bias zero for stable initial means
         with torch.no_grad():
+            nn.init.uniform_(self.mean_layer.weight, a=-1e-4, b=1e-4)
+            if self.mean_layer.bias is not None:
+                self.mean_layer.bias.zero_()
+            if not fixed_scale:
+                nn.init.uniform_(self.log_scale_layer.weight, a=-1e-4, b=1e-4)
+                if self.log_scale_layer.bias is not None:
+                    self.log_scale_layer.bias.zero_()
             if self.mean_layer.bias is not None:
                 self.mean_layer.bias.zero_()
 
-    def forward(self, x):
-        mean = self.mean_layer(x)
+    def _make_dist(self, mean: torch.Tensor, scale: torch.Tensor) -> dist.Distribution:
+        if self.use_independent:
+            return dist.Independent(dist.Normal(loc=mean, scale=scale), 1)
+        else:
+            cov = torch.diag_embed(scale.pow(2))
+            return dist.MultivariateNormal(loc=mean, covariance_matrix=cov)
+
+    def forward(self, inputs):
+        mean = self.mean_layer(inputs)
         if self.tanh_mean:
             mean = torch.tanh(mean)
         if self.fixed_scale:
-            scale = torch.ones_like(mean) * float(self._fixed_scale)
+            scale = torch.ones_like(mean) * float(self.fixed_scale)
         else:
-            log_scale = self.log_scale_layer(x)
+            log_scale = self.log_scale_layer(inputs)
             scale = F.softplus(log_scale)
             zero = torch.zeros(1, device=scale.device)
             scale = scale * (self.init_scale / F.softplus(zero)) + self.min_scale
@@ -228,7 +245,9 @@ def compute_nonparametric_kl_from_normalized_weights(
         kl_nonparametric: [B]
     """
     num_action_samples = float(normalized_weights.shape[0])
-    integrand = torch.log(num_action_samples * normalized_weights + 1e-8)  # [N, B]
+    integrand = torch.log(
+        num_action_samples * normalized_weights + _MPO_FLOAT_EPSILON
+    )  # [N, B]
     return (normalized_weights * integrand).sum(dim=0)  # [B]
 
 
@@ -413,7 +432,7 @@ class MPOLoss(nn.Module):
         # Compute normalized weights for non-parametric E-step & temperature dual loss
         normalized_weights, loss_temperature = compute_weights_and_temperature_loss(
             q_values=q_values,  # [N, B]
-            epsilon=float(self.epsilon.item()),
+            epsilon=self._epsilon,
             temperature=temperature,
         )
 
@@ -435,7 +454,7 @@ class MPOLoss(nn.Module):
             penalty_normalized_weights, loss_penalty_temperature = (
                 compute_weights_and_temperature_loss(
                     q_values=cost_out_of_bound,
-                    epsilon=float(self.epsilon_penalty.item()),
+                    epsilon=self._epsilon_penalty,
                     temperature=penalty_temperature,
                 )
             )
@@ -495,71 +514,75 @@ class MPOLoss(nn.Module):
         loss_kl_mean, loss_alpha_mean = compute_parametric_kl_penalty_and_dual_loss(
             kl=kl_mean,
             alpha=alpha_mean,
-            epsilon=float(self.epsilon_mean.item()),
+            epsilon=self._epsilon_mean,
         )
         loss_kl_stddev, loss_alpha_stddev = compute_parametric_kl_penalty_and_dual_loss(
             kl=kl_stddev,
             alpha=alpha_stddev,
-            epsilon=float(self.epsilon_stddev.item()),
+            epsilon=self._epsilon_stddev,
         )
 
         loss_policy = loss_policy_mean + loss_policy_stddev
         loss_kl_penalty = loss_kl_mean + loss_kl_stddev
         loss_dual = loss_alpha_mean + loss_alpha_stddev + loss_temperature
 
-        total_loss = loss_policy + loss_kl_penalty + loss_dual
+        loss = loss_policy + loss_kl_penalty + loss_dual
 
         # Diagnostics
-        stats: Dict[str, Tensor] = {}
+        stats: Dict[str, torch.Tensor] = {}
 
         # Duals
-        stats["dual_alpha_mean"] = alpha_mean.mean()
-        stats["dual_alpha_stddev"] = alpha_stddev.mean()
-        stats["dual_temperature"] = temperature.mean()
+        stats["train/dual_alpha_mean"] = alpha_mean.mean()
+        stats["train/dual_alpha_stddev"] = alpha_stddev.mean()
+        stats["train/dual_temperature"] = temperature.mean()
 
         # Loss terms
-        stats["loss_policy"] = total_loss.detach()
-        stats["loss_alpha"] = (loss_alpha_mean + loss_alpha_stddev).detach()
-        stats["loss_temperature"] = loss_temperature.detach()
+        stats["train/loss_policy"] = loss.detach()
+        stats["train/loss_alpha"] = (loss_alpha_mean + loss_alpha_stddev).detach()
+        stats["train/loss_temperature"] = loss_temperature.detach()
 
         # KL diagnostics
-        stats["kl_q_rel"] = kl_nonparametric.mean() / self.epsilon
+        stats["train/kl_q_rel"] = kl_nonparametric.mean() / self._epsilon
 
         if self._action_penalization and penalty_kl_nonparametric is not None:
-            stats["penalty_kl_q_rel"] = (
-                penalty_kl_nonparametric.mean() / self.epsilon_penalty
+            stats["train/penalty_kl_q_rel"] = (
+                penalty_kl_nonparametric.mean() / self._epsilon_penalty
             )
 
-        stats["kl_mean_rel"] = kl_mean.mean() / self.epsilon_mean
-        stats["kl_stddev_rel"] = kl_stddev.mean() / self.epsilon_stddev
-
+        stats["train/kl_mean_rel"] = kl_mean.mean() / self._epsilon_mean
+        stats["train/kl_stddev_rel"] = kl_stddev.mean() / self._epsilon_stddev
         if self._per_dim_constraining:
             # per-dim summaries
             kl_mean_batch_mean = kl_mean.mean(dim=0)  # [D]
             kl_stddev_batch_mean = kl_stddev.mean(dim=0)  # [D]
 
-            stats["kl_mean_rel_min"] = kl_mean_batch_mean.min() / self.epsilon_mean
-            stats["kl_mean_rel_max"] = kl_mean_batch_mean.max() / self.epsilon_mean
-            stats["kl_stddev_rel_min"] = (
-                kl_stddev_batch_mean.min() / self.epsilon_stddev
+            stats["train/kl_mean_rel_min"] = (
+                kl_mean_batch_mean.min() / self._epsilon_mean
             )
-            stats["kl_stddev_rel_max"] = (
-                kl_stddev_batch_mean.max() / self.epsilon_stddev
+            stats["train/kl_mean_rel_max"] = (
+                kl_mean_batch_mean.max() / self._epsilon_mean
+            )
+            stats["train/kl_stddev_rel_min"] = (
+                kl_stddev_batch_mean.min() / self._epsilon_stddev
+            )
+            stats["train/kl_stddev_rel_max"] = (
+                kl_stddev_batch_mean.max() / self._epsilon_stddev
             )
 
         # Q statistics
-        stats["q_min"] = q_values.min(dim=0).values.mean()
-        stats["q_max"] = q_values.max(dim=0).values.mean()
+        stats["train/q_min"] = q_values.min(dim=0).values.mean()
+        stats["train/q_max"] = q_values.max(dim=0).values.mean()
 
         # Policy stddev statistics for the online policy
         pi_stddev = online_scale  # [B, D]
-        stats["pi_stddev_min"] = pi_stddev.min(dim=-1).values.mean()
-        stats["pi_stddev_max"] = pi_stddev.max(dim=-1).values.mean()
-        stats["pi_stddev_cond"] = (
-            pi_stddev.max(dim=-1).values / (pi_stddev.min(dim=-1).values + 1e-8)
+        stats["train/pi_stddev_min"] = pi_stddev.min(dim=-1).values.mean()
+        stats["train/pi_stddev_max"] = pi_stddev.max(dim=-1).values.mean()
+        stats["train/pi_stddev_cond"] = (
+            pi_stddev.max(dim=-1).values
+            / (pi_stddev.min(dim=-1).values + _MPO_FLOAT_EPSILON)
         ).mean()
 
-        return total_loss, stats
+        return loss, stats
 
 
 class NStepAccumulator:
@@ -647,8 +670,17 @@ class MPOAgent:
 
         # critic: input = obs_embedding + action (embedding from obs_encoder)
         critic_input_dim = policy_hidden[-1] + action_dim
-        self.critic = CriticNetwork(critic_input_dim, layer_sizes=critic_hidden).to(
-            device
+
+        self.clip_to_spec = ClipToSpec(
+            torch.tensor(action_low, dtype=torch.float32, device=device),
+            torch.tensor(action_high, dtype=torch.float32, device=device),
+        )
+        self.critic = CriticMultiplexer(
+            obs_net=self.obs_encoder,
+            act_net=self.clip_to_spec,
+            critic=CriticNetwork(critic_input_dim, layer_sizes=critic_hidden).to(
+                device
+            ),
         )
 
         # target networks (hard copy)
@@ -656,16 +688,6 @@ class MPOAgent:
         self.target_policy_head = copy.deepcopy(self.policy_head).to(device)
         self.target_critic = copy.deepcopy(self.critic).to(device)
 
-        # optimizers
-        # Critic optimizer trains both critic and observation encoder (like TF learner).
-        self.critic_opt = optim.Adam(
-            list(self.obs_encoder.parameters()) + list(self.critic.parameters()),
-            lr=lr_critic,
-        )
-        # Policy optimizer trains only the policy head (policy shouldn't train the obs encoder).
-        self.policy_opt = optim.Adam(list(self.policy_head.parameters()), lr=lr_policy)
-
-        # MPO loss with duals (parameters included)
         self.mpo_loss = MPOLoss(
             action_dim=action_dim,
             per_dim_constraining=per_dim,
@@ -679,7 +701,18 @@ class MPOAgent:
             init_log_alpha_mean=10.0,
             init_log_alpha_stddev=1000.0,
         ).to(device)
-        self.dual_opt = optim.Adam(self.mpo_loss.parameters(), lr=lr_dual)
+
+        # optimizers
+        # Critic optimizer trains both critic and observation encoder (like TF learner).
+        self._critic_optimizer = optim.Adam(
+            list(self.obs_encoder.parameters()) + list(self.critic.parameters()),
+            lr=lr_critic,
+        )
+        # Policy optimizer trains only the policy head (policy shouldn't train the obs encoder).
+        self._policy_optimizer = optim.Adam(
+            list(self.policy_head.parameters()), lr=lr_policy
+        )
+        self._dual_optimizer = optim.Adam(self.mpo_loss.parameters(), lr=lr_dual)
 
         # Replace replay buffer setup
         self.replay = TensorDictReplayBuffer(
@@ -794,27 +827,26 @@ class MPOAgent:
         )
 
         # update critic
-        self.critic_opt.zero_grad()
+        self._critic_optimizer.zero_grad()
         critic_loss.backward()
         if self.clipping:
             torch.nn.utils.clip_grad_norm_(
                 list(self.obs_encoder.parameters()) + list(self.critic.parameters()),
                 40.0,
             )
-        self.critic_opt.step()
+        self._critic_optimizer.step()
 
         # update policy and duals together (total_loss contains dual terms)
-        self.policy_opt.zero_grad()
-        self.dual_opt.zero_grad()
+        self._policy_optimizer.zero_grad()
+        self._dual_optimizer.zero_grad()
         total_loss.backward()
         if self.clipping:
             torch.nn.utils.clip_grad_norm_(
                 list(self.policy_head.parameters()),
                 40.0,
             )
-        self.policy_opt.step()
-        # dual optimizer step
-        self.dual_opt.step()
+        self._policy_optimizer.step()
+        self._dual_optimizer.step()
 
         self._learn_steps += 1
 
@@ -831,7 +863,6 @@ class MPOAgent:
             "train/critic_loss": float(critic_loss.item()),
             "train/learn_steps": self._learn_steps,
         }
-        # include TD diagnostics if available
         fetches.update(
             {
                 "train/td_error_mean": td_error_mean,
@@ -840,9 +871,6 @@ class MPOAgent:
         )
         fetches.update(stats)
         return fetches
-
-    def __len__(self):
-        return len(self.replay)
 
 
 def make_env(env_name: str, render_mode: str | None = None):
@@ -1033,9 +1061,9 @@ def train(
             "target_policy_head": agent.target_policy_head.state_dict(),
             "target_critic": agent.target_critic.state_dict(),
             "mpo_loss": agent.mpo_loss.state_dict(),
-            "critic_opt": agent.critic_opt.state_dict(),
-            "policy_opt": agent.policy_opt.state_dict(),
-            "dual_opt": agent.dual_opt.state_dict(),
+            "_critic_optimizer": agent._critic_optimizer.state_dict(),
+            "_policy_optimizer": agent._policy_optimizer.state_dict(),
+            "_dual_optimizer": agent._dual_optimizer.state_dict(),
             "learn_steps": agent._learn_steps,
             "step": step,
             "seed": seed,
