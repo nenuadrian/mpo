@@ -690,7 +690,7 @@ class MPO:
         replay: reverb.Client,
         variable_source: acme.VariableSource,
         counter: counting.Counter,
-    ) -> EnvironmentLoop:
+    ) -> acme.EnvironmentLoop:
         """The actor process."""
 
         action_spec = self._environment_spec.actions
@@ -748,7 +748,7 @@ class MPO:
         )
 
         # Create the run loop and return it.
-        return EnvironmentLoop(environment, actor, counter, logger)
+        return acme.EnvironmentLoop(environment, actor, counter, logger)
 
     def evaluator(
         self,
@@ -803,7 +803,8 @@ class MPO:
             "evaluator", time_delta=self._log_every, steps_key="evaluator_steps"
         )
 
-        return EnvironmentLoop(environment, evaluator, counter, logger)
+        # Create the run loop and return it.
+        return acme.EnvironmentLoop(environment, evaluator, counter, logger)
 
     def build(self, name="mpo"):
         """Build the distributed agent topology."""
