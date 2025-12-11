@@ -838,8 +838,10 @@ class MPO:
     def run(self):
         counter = counting.Counter()
         server = reverb.Server(tables=self.replay())
-        learner = self.learner(server, counter)
-        actor = self.actor(server, learner, counter)
+        client = reverb.Client(f'localhost:{server.port}')
+
+        learner = self.learner(client, counter)
+        actor = self.actor(client, learner, counter)
         evaluator = self.evaluator(learner, counter)
 
 
