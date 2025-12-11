@@ -768,15 +768,19 @@ class MPO:
         # running the environment loop.
         variable_client.update_and_wait()
 
-        # Create the agent.
-        evaluator = FeedForwardActor(
-            policy_network=evaluator_network, variable_client=variable_client
-        )
-
         # Create logger and counter.
         counter = counting.Counter(counter, "evaluator")
         logger = loggers.make_default_logger(
             "evaluator", time_delta=self._log_every, steps_key="evaluator_steps"
+        )
+
+        # Create the agent.
+        evaluator = FeedForwardActor(
+            adder=None,
+            logger=logger,
+            counter=counter,
+            policy_network=evaluator_network,
+            variable_client=variable_client,
         )
 
         return EnvironmentLoop(environment, evaluator, counter, logger)
