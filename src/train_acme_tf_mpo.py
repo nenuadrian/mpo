@@ -1499,9 +1499,9 @@ class CriticMultiplexer(snt.Module):
 
     def __init__(
         self,
-        critic_network: Optional[TensorTransformation] = None,
-        observation_network: Optional[TensorTransformation] = None,
-        action_network: Optional[TensorTransformation] = None,
+        critic_network: Optional[Any] = None,
+        observation_network: Optional[Any] = None,
+        action_network: Optional[Any] = None,
     ):
         self._critic_network = critic_network
         self._observation_network = observation_network
@@ -1547,7 +1547,7 @@ def make_networks(
     action_spec: specs.BoundedArray,
     policy_layer_sizes: Sequence[int] = (256, 256, 256),
     critic_layer_sizes: Sequence[int] = (512, 512, 256),
-) -> Dict[str, TensorTransformation]:
+) -> Dict[str, Any]:
     """Creates networks used by the agent."""
 
     num_dimensions = np.prod(action_spec.shape, dtype=int)
