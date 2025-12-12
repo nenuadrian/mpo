@@ -1154,6 +1154,7 @@ class Evaluator:
             self.setup_local_modules()
             # Run a single episode (EnvironmentLoop will log via wandb using actor.label).
             loop.run(num_episodes=1)
+            time.sleep(0.5)  # slight delay between episodes
         env.close()
 
 
