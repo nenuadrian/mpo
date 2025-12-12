@@ -251,7 +251,9 @@ def main() -> None:
             if runtime < min_runtime_seconds:
                 continue
             run_name = run.name or run.id
-            env_name = run_name.split("_")[0]
+            if "__" not in run_name:
+                continue
+            env_name = run_name.split("__")[0]
             df = _load_history_with_cache(
                 run, spec["metric"], cache_dir, args.max_samples
             )
