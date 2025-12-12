@@ -811,7 +811,7 @@ class MPOAgent:
 
         fetches = {
             "critic_loss": float(critic_loss.item()),
-            "learn_steps": self._learn_steps,
+            "total_steps": self._learn_steps,
             "td_error_mean": td_error_mean,
             "td_target_mean": target_mean,
             "q_min": q_min,
@@ -871,9 +871,9 @@ class EnvironmentLoop:
     def __init__(self, environment, actor, step_lock=None, shared_state=None):
         self._environment = environment
         self._actor = actor
-        # optional: used to terminate across threads and track global steps if actor.post_step uses them.
         self._step_lock = step_lock
         self._shared_state = shared_state
+        self._total_steps = 0
 
     def run_episode(self):
         episode_return = 0.0
@@ -882,11 +882,7 @@ class EnvironmentLoop:
         obs, _ = self._environment.reset()
         obs_flat = flatten_observation(obs)
 
-        # allow actor to observe the initial timestep
-        try:
-            self._actor.observe_first(obs_flat)
-        except Exception:
-            pass
+        self._actor.observe_first(obs_flat)
 
         done = False
         start_time = time.time()
@@ -902,10 +898,7 @@ class EnvironmentLoop:
             # Update/ sync actor as necessary (policy syncs etc.)
             # post_step should increment global step (for actors) or return current step (for evaluator).
             total_steps = self._actor.post_step()
-            try:
-                self._actor.update(total_steps)
-            except Exception:
-                pass
+            self._actor.update(total_steps)
 
             episode_return += float(reward)
             episode_steps += 1
@@ -923,6 +916,8 @@ class EnvironmentLoop:
             "episode_length": episode_steps,
             "episode_return": episode_return,
             "episode_duration": duration,
+            "steps_per_second": episode_steps / duration if duration > 0 else 0.0,
+            "total_steps": self._total_steps,
         }
         return result
 
@@ -1057,24 +1052,16 @@ class Actor:
 
     def run(self, max_actor_steps: int):
         env = make_env(self.env_name)
-        try:
-            # prepare local modules
-            self.setup_local_modules()
-            loop = EnvironmentLoop(
-                environment=env,
-                actor=self,
-                step_lock=self.step_lock,
-                shared_state=self.shared_state,
-            )
-            loop.run(num_steps=max_actor_steps)
-        except Exception as exc:
-            self.stop_event.set()
-            print(f"[Actor] error: {exc}")
-        finally:
-            try:
-                env.close()
-            except Exception:
-                pass
+        self.setup_local_modules()
+        loop = EnvironmentLoop(
+            environment=env,
+            actor=self,
+            step_lock=self.step_lock,
+            shared_state=self.shared_state,
+        )
+        loop.run(num_steps=max_actor_steps)
+        self.stop_event.set()
+        env.close()
 
 
 class Evaluator:
@@ -1161,29 +1148,21 @@ class Evaluator:
 
     def run(self):
         env = make_env(self.env_name)
-        try:
-            # Continuously run evaluation episodes until stop_event is set.
-            loop = EnvironmentLoop(
-                environment=env,
-                actor=self,
-                step_lock=self.step_lock,
-                shared_state=self.shared_state,
-            )
-            while not self.stop_event.is_set():
-                # Ensure local modules are in sync before each episode.
-                self.setup_local_modules()
-                # Run a single episode (EnvironmentLoop will log via wandb using actor.label).
-                loop.run(num_episodes=1)
-                # Brief sleep to avoid tight loop in case episodes are very short.
-                time.sleep(0.01)
-        except Exception as exc:
-            self.stop_event.set()
-            print(f"[Evaluator] error: {exc}")
-        finally:
-            try:
-                env.close()
-            except Exception:
-                pass
+        # Continuously run evaluation episodes until stop_event is set.
+        loop = EnvironmentLoop(
+            environment=env,
+            actor=self,
+            step_lock=self.step_lock,
+            shared_state=self.shared_state,
+        )
+        while not self.stop_event.is_set():
+            # Ensure local modules are in sync before each episode.
+            self.setup_local_modules()
+            # Run a single episode (EnvironmentLoop will log via wandb using actor.label).
+            loop.run(num_episodes=1)
+            # Brief sleep to avoid tight loop in case episodes are very short.
+            time.sleep(0.01)
+        env.close()
 
 
 class DmControlGymLikeWrapper:
@@ -1214,10 +1193,7 @@ class DmControlGymLikeWrapper:
         return obs, reward, terminated, truncated, {}
 
     def close(self):
-        try:
-            self._env.close()
-        except Exception:
-            pass
+        self._env.close()
 
 
 def make_env(env_name: str, render_mode: str | None = None):
@@ -1297,10 +1273,8 @@ def train(
     action_dim = int(np.prod(action_spec.shape))
     action_low = np.array(action_spec.minimum, dtype=np.float32)
     action_high = np.array(action_spec.maximum, dtype=np.float32)
-    try:
-        probe_env.close()
-    except Exception:
-        pass
+    probe_env.close()
+    del probe_env
 
     agent = MPOAgent(
         obs_dim=obs_dim,
@@ -1367,32 +1341,29 @@ def train(
     stop_event.set()
     step = shared_state["steps"]
 
-    try:
-        ckpt_dir = os.path.join(log_dir, "checkpoints")
-        os.makedirs(ckpt_dir, exist_ok=True)
-        ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{int(time.time())}.pt")
-        with agent._replay_lock:
-            replay_state = agent.replay.state_dict()
-        checkpoint = {
-            "obs_encoder": agent.obs_encoder.state_dict(),
-            "policy_head": agent.policy_head.state_dict(),
-            "critic": agent.critic.state_dict(),
-            "target_obs_encoder": agent.target_obs_encoder.state_dict(),
-            "target_policy_head": agent.target_policy_head.state_dict(),
-            "target_critic": agent.target_critic.state_dict(),
-            "mpo_loss": agent.mpo_loss.state_dict(),
-            "_critic_optimizer": agent._critic_optimizer.state_dict(),
-            "_policy_optimizer": agent._policy_optimizer.state_dict(),
-            "_dual_optimizer": agent._dual_optimizer.state_dict(),
-            "learn_steps": agent._learn_steps,
-            "step": step,
-            "seed": seed,
-            "replay_state": replay_state,
-        }
-        torch.save(checkpoint, ckpt_path)
-        print(f"Saved checkpoint to {ckpt_path}")
-    except Exception as e:
-        print(f"Failed to save checkpoint: {e}")
+    ckpt_dir = os.path.join(log_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{int(time.time())}.pt")
+    with agent._replay_lock:
+        replay_state = agent.replay.state_dict()
+    checkpoint = {
+        "obs_encoder": agent.obs_encoder.state_dict(),
+        "policy_head": agent.policy_head.state_dict(),
+        "critic": agent.critic.state_dict(),
+        "target_obs_encoder": agent.target_obs_encoder.state_dict(),
+        "target_policy_head": agent.target_policy_head.state_dict(),
+        "target_critic": agent.target_critic.state_dict(),
+        "mpo_loss": agent.mpo_loss.state_dict(),
+        "_critic_optimizer": agent._critic_optimizer.state_dict(),
+        "_policy_optimizer": agent._policy_optimizer.state_dict(),
+        "_dual_optimizer": agent._dual_optimizer.state_dict(),
+        "learn_steps": agent._learn_steps,
+        "step": step,
+        "seed": seed,
+        "replay_state": replay_state,
+    }
+    torch.save(checkpoint, ckpt_path)
+    print(f"Saved checkpoint to {ckpt_path}")
 
 
 def parse_args():
