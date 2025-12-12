@@ -6,8 +6,8 @@
     - [Video generation](#video-generation)
   - [Using Google DeepMind Acme](#using-google-deepmind-acme)
     - [Single file with Launchpad](#single-file-with-launchpad)
+      - [Visualise](#visualise)
     - [Single file TF and Reverb](#single-file-tf-and-reverb)
-    - [Visualise](#visualise)
   - [Implementing based on Acme in PyTorch](#implementing-based-on-acme-in-pytorch)
     - [Visualize Acme in PyTorch](#visualize-acme-in-pytorch)
     - [Video generation Acme in PyTorch](#video-generation-acme-in-pytorch)
@@ -53,6 +53,14 @@ Somewhat consolidated code from within acme still depending on acme but brought 
 python src/lp_mpo_single_file.py --max_actor_steps 3000000 --domain cheetah --task run
 ```
 
+#### Visualise
+
+```bash
+python src/visualize_acme_results.py --output results/acme_tf.png --metric episode_return --file "Cartpole_Balance::results/acme/mpo-tf-cartpole-balance.csv" --file "Hopper_Stand::results/acme/mpo-tf-hopper-stand.csv" --file "Hopper_Hop::results/acme/mpo-tf-hopper-hop.csv" --file "Walker_Walk::results/acme/mpo-tf-walker-walk.csv" --file "Walker_Run::results/acme/mpo-tf-walker-run.csv" --file "Walker_Stand::results/acme/mpo-tf-walker-stand.csv" --file "Reacher_Easy::results/acme/mpo-tf-reacher-easy.csv" --file "Reacher_Hard::results/acme/mpo-tf-reacher-hard.csv" --file "Reacher_Hard::results/acme/mpo-tf-reacher-hard.csv"  --file "Acrobot_Swingup::results/acme/mpo-tf-acrobot-swingup.csv"   --file "Pendulum_Swingup::results/acme/mpo-tf-pendulum-swingup.csv"  --file "Swimmer_Swimmer6::results/acme/mpo-tf-swimmer-swimmer6.csv" --file "Swimmer_Swimmer15::results/acme/mpo-tf-swimmer-swimmer15.csv" --file "Cheetah_Run::results/acme/mpo-tf-cheetah-run.csv" 
+```
+
+![Acme Results](results/acme_tf.png)
+
 ### Single file TF and Reverb
 
 Not able to remove dependencies further as Sonnet and Reverb are tightly integrated. But removed Acme and Launchpad dependencies.
@@ -60,14 +68,6 @@ Not able to remove dependencies further as Sonnet and Reverb are tightly integra
 ```bash
 python src/train_acme_tf_mpo.py --max_actor_steps 3000000 --domain cheetah --task run
 ```
-
-### Visualise
-
-```bash
-python src/visualize_acme_results.py --output results/acme_tf.png --metric episode_return --file "Cartpole_Balance::results/acme/mpo-tf-cartpole-balance.csv" --file "Hopper_Stand::results/acme/mpo-tf-hopper-stand.csv" --file "Hopper_Hop::results/acme/mpo-tf-hopper-hop.csv" --file "Walker_Walk::results/acme/mpo-tf-walker-walk.csv" --file "Walker_Run::results/acme/mpo-tf-walker-run.csv" --file "Walker_Stand::results/acme/mpo-tf-walker-stand.csv" --file "Reacher_Easy::results/acme/mpo-tf-reacher-easy.csv" --file "Reacher_Hard::results/acme/mpo-tf-reacher-hard.csv" --file "Reacher_Hard::results/acme/mpo-tf-reacher-hard.csv"  --file "Acrobot_Swingup::results/acme/mpo-tf-acrobot-swingup.csv"   --file "Pendulum_Swingup::results/acme/mpo-tf-pendulum-swingup.csv"  --file "Swimmer_Swimmer6::results/acme/mpo-tf-swimmer-swimmer6.csv" --file "Swimmer_Swimmer15::results/acme/mpo-tf-swimmer-swimmer15.csv" --file "Cheetah_Run::results/acme/mpo-tf-cheetah-run.csv" 
-```
-
-![Acme Results](results/acme_tf.png)
 
 ## Implementing based on Acme in PyTorch
 
@@ -79,7 +79,7 @@ source .venv_acme_pytorch/bin/activate
 pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb "shimmy[bsuite,atari,dm-control]" opencv-python torchrl
 
 
-python src/train_custom_acme_pytorch_mpo.py --max_actor_steps 3000000 --wandb_project acme_pytorch_3 --env_names walker::walk,humanoid::run,cartpole::balance,walker::run,reacher::easy,reacher::hard,hopper::hop,walker::stand,acrobot::swingup,swimmer::swimmer6,swimmer::swimmer15,pendulum::swingup,cheetah::walk,cheetah::run --env_iterations 1
+python src/train_custom_acme_pytorch_mpo.py --max_actor_steps 3000000 --wandb_project acme_pytorch_3 --env_name walker::walk
 ```
 
 ### Visualize Acme in PyTorch

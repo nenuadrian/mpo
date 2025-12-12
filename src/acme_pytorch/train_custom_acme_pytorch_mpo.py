@@ -4,12 +4,14 @@ import copy
 import math
 import random
 import time
-from typing import Tuple, cast, Dict, Union
+from typing import Tuple, cast, Dict, Union, Optional
 import os
 import json
 import threading
 
-import gymnasium as gym
+import dm_env
+from dm_control import suite
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,6 +23,8 @@ import torch.distributions as dist
 
 from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage
 from tensordict import TensorDict
+
+_MPO_FLOAT_EPSILON = 1e-8
 
 
 def init_weights(module):
@@ -213,25 +217,29 @@ def compute_weights_and_temperature_loss(
     temperature: torch.Tensor,  # scalar > 0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    PyTorch version of compute_weights_and_temperature_loss.
+    Match TensorFlow compute_weights_and_temperature_loss exactly:
+      - temper with temperature (no grad to q_values),
+      - softmax over axis=0 (action samples),
+      - detach normalized weights,
+      - temperature dual loss computed like TF and multiplied by temperature.
 
-    Returns:
-        normalized_weights: [N, B]
-        loss_temperature: scalar
+    This version ensures temperature is not re-created/detached and constants
+    are created using temperature.new_tensor(...) for consistent dtype/device.
     """
-
-    # Temper Q-values; no gradient flows back into Q for the E-step dual update
+    # Temper the given Q-values using the current temperature; stop gradient on q_values.
+    # IMPORTANT: do NOT re-create temperature via .to(...) here (that may break grad).
     tempered_q_values = q_values.detach() / temperature
 
-    # Softmax along action-sample dimension N
+    # Compute normalized importance weights across action-samples axis (N).
     normalized_weights = torch.softmax(tempered_q_values, dim=0).detach()
 
-    # Dual loss for temperature (E-step Lagrange multiplier)
-    # logsumexp over actions, averaged over batch
+    # Temperature loss per TF: epsilon + mean(logsumexp(tempered_q)) - log(num_actions)
     q_logsumexp = torch.logsumexp(tempered_q_values, dim=0)  # [B]
-    log_num_actions = math.log(q_values.shape[0])
-
-    loss_temperature_inner = epsilon + q_logsumexp.mean() - log_num_actions  # scalar
+    num_actions = float(q_values.shape[0])
+    # Create tensors matching temperature's dtype/device without breaking autograd.
+    log_num_actions = temperature.new_tensor(math.log(num_actions))
+    eps_t = temperature.new_tensor(float(epsilon))
+    loss_temperature_inner = eps_t + q_logsumexp.mean() - log_num_actions
     loss_temperature = temperature * loss_temperature_inner
 
     return normalized_weights, loss_temperature
@@ -241,69 +249,58 @@ def compute_nonparametric_kl_from_normalized_weights(
     normalized_weights: torch.Tensor,  # [N, B]
 ) -> torch.Tensor:
     """
-    Estimate KL between non-parametric policy and target policy, from normalized weights.
-
-    Returns:
-        kl_nonparametric: [B]
+    Estimate the actualized KL between the non-parametric and target policies,
+    matching the TF implementation:
+      integrand = log(N * w + eps)
+      return sum_w w * integrand  (expectation over non-parametric policy)
     """
     num_action_samples = float(normalized_weights.shape[0])
-    integrand = torch.log(
-        num_action_samples * normalized_weights + _MPO_FLOAT_EPSILON
-    )  # [N, B]
+    integrand = torch.log(num_action_samples * normalized_weights + _MPO_FLOAT_EPSILON)
     return (normalized_weights * integrand).sum(dim=0)  # [B]
 
 
 def compute_cross_entropy_loss(
     sampled_actions: torch.Tensor,  # [N, B, D]
     normalized_weights: torch.Tensor,  # [N, B]
-    online_action_distribution: dist.Distribution,  # Independent(Normal)
+    online_action_distribution: dist.Distribution,  # Independent(Normal) or Multivariate
 ) -> torch.Tensor:
     """
-    PyTorch version of compute_cross_entropy_loss.
-
-    Returns:
-        scalar: mean over batch of the weighted negative log-prob.
+    Compute the cross-entropy loss equivalent to TF:
+      - log_prob has shape [N, B]
+      - weighted sum over N then mean over batch B
     """
-    # log_prob: [N, B]
-    log_prob = online_action_distribution.log_prob(sampled_actions)
-
-    # Weighted sum over actions (N), then mean over batch (B)
-    loss_policy_gradient = -(log_prob * normalized_weights).sum(dim=0)  # [B]
+    log_prob = online_action_distribution.log_prob(sampled_actions)  # [N, B]
+    loss_policy_gradient = -torch.sum(log_prob * normalized_weights, dim=0)  # [B]
     return loss_policy_gradient.mean()  # scalar
 
 
 def compute_parametric_kl_penalty_and_dual_loss(
     kl: torch.Tensor,  # [B, D] or [B]
-    alpha: torch.Tensor,  # [D] or [1], nn.Parameter (after softplus)
+    alpha: torch.Tensor,  # post-softplus alpha (D,) or (1,)
     epsilon: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    PyTorch version of compute_parametric_kl_penalty_and_dual_loss.
-
-    Returns:
-        loss_kl: scalar (alpha-weighted KL regularizer)
-        loss_alpha: scalar (dual loss for alpha)
+    Match TF exactly:
+      mean_kl = reduce_mean(kl, axis=0) -> shape [D] or [1]
+      loss_kl = sum(stop_gradient(alpha) * mean_kl)
+      loss_alpha = sum(alpha * (epsilon - stop_gradient(mean_kl)))
     """
-    # Mean over batch
     mean_kl = kl.mean(dim=0)  # [D] or [1]
-
-    # KL regularization uses stop_gradient(alpha)
     loss_kl = (alpha.detach() * mean_kl).sum()
-
-    # Dual loss updates alpha but does not backprop through mean_kl
     loss_alpha = (alpha * (epsilon - mean_kl.detach())).sum()
-
     return loss_kl, loss_alpha
-
-
-_MPO_FLOAT_EPSILON = 1e-8
 
 
 class MPOLoss(nn.Module):
     """
-    PyTorch translation of the Sonnet MPOLoss with decoupled KL constraints.
-
-    This expects Gaussian policies represented as Independent(Normal).
+    PyTorch MPOLoss that mirrors the TensorFlow MPOLoss precisely in:
+      - creation and clamping of log-dual vars,
+      - softplus transform to get positive duals,
+      - E-step temperature computation with stop_gradient semantics,
+      - optional MO-MPO action penalty (identical operations and combination),
+      - decomposition into fixed-mean / fixed-stddev distributions,
+      - computation of cross-entropy losses, parametric KL penalties and dual losses,
+      - same returned diagnostics keys (names are PyTorch style but semantics match).
     """
 
     def __init__(
@@ -321,61 +318,43 @@ class MPOLoss(nn.Module):
         dtype: torch.dtype = torch.float32,
         device: Union[torch.device, str] = "cpu",
     ):
-        """
-        Args:
-            epsilon: KL constraint for non-parametric policy (temperature).
-            epsilon_mean: KL constraint for mean.
-            epsilon_stddev: KL constraint for stddev.
-            init_log_temperature: initial log-temperature (softplus parametrization).
-            init_log_alpha_mean: initial log-alpha for mean constraint.
-            init_log_alpha_stddev: initial log-alpha for stddev constraint.
-            action_dim: dimensionality of action space D.
-            per_dim_constraining: if True, constrain KL per dimension, else overall.
-            action_penalization: use MO-MPO penalty for |a| > 1.
-            epsilon_penalty: KL constraint for action penalty.
-            dtype, device: standard Torch options.
-        """
         super().__init__()
-
         self._epsilon = float(epsilon)
         self._epsilon_mean = float(epsilon_mean)
         self._epsilon_stddev = float(epsilon_stddev)
         self._epsilon_penalty = float(epsilon_penalty)
-
         self._per_dim_constraining = per_dim_constraining
         self._action_penalization = action_penalization
 
-        # Register epsilons as buffers so they move with .to(...)
+        # register epsilons (buffers) so they move with .to(...)
         self.register_buffer(
-            "epsilon", torch.tensor(self._epsilon, dtype=dtype, device=device)
+            "epsilon_buf", torch.tensor(self._epsilon, dtype=dtype, device=device)
         )
         self.register_buffer(
-            "epsilon_mean", torch.tensor(self._epsilon_mean, dtype=dtype, device=device)
+            "epsilon_mean_buf",
+            torch.tensor(self._epsilon_mean, dtype=dtype, device=device),
         )
         self.register_buffer(
-            "epsilon_stddev",
+            "epsilon_stddev_buf",
             torch.tensor(self._epsilon_stddev, dtype=dtype, device=device),
         )
         if self._action_penalization:
             self.register_buffer(
-                "epsilon_penalty",
+                "epsilon_penalty_buf",
                 torch.tensor(self._epsilon_penalty, dtype=dtype, device=device),
             )
 
-        # Dual variables in log space
+        # Duals in log-space (trainable)
         self.log_temperature = nn.Parameter(
             torch.tensor([init_log_temperature], dtype=dtype, device=device)
         )
-
         alpha_shape = (action_dim,) if per_dim_constraining else (1,)
-
         self.log_alpha_mean = nn.Parameter(
             torch.full(alpha_shape, init_log_alpha_mean, dtype=dtype, device=device)
         )
         self.log_alpha_stddev = nn.Parameter(
             torch.full(alpha_shape, init_log_alpha_stddev, dtype=dtype, device=device)
         )
-
         if self._action_penalization:
             self.log_penalty_temperature = nn.Parameter(
                 torch.tensor([init_log_temperature], dtype=dtype, device=device)
@@ -388,28 +367,15 @@ class MPOLoss(nn.Module):
         self,
         actions: torch.Tensor,  # [N, B, D]
         q_values: torch.Tensor,  # [N, B]
-        online_mean: torch.Tensor,
-        online_scale: torch.Tensor,
-        target_mean: torch.Tensor,
-        target_scale: torch.Tensor,
+        online_mean: torch.Tensor,  # [B, D]
+        online_scale: torch.Tensor,  # [B, D]
+        target_mean: torch.Tensor,  # [B, D]
+        target_scale: torch.Tensor,  # [B, D]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Compute the MPO loss and diagnostics.
-
-        Args:
-            online_action_distribution: online policy; batch [B], event [D].
-            target_action_distribution: target policy; same shapes.
-            actions: actions sampled from target policy; [N, B, D].
-            q_values: Q(s, a); [N, B].
-
-        Returns:
-            loss: scalar MPO loss.
-            stats: dict of scalars / small tensors for logging.
-        """
-
+        # dtype convenience
         dtype = q_values.dtype
 
-        # Clamp dual variables in log-space for stability
+        # Project dual variables' log-values (in-place, no grads).
         with torch.no_grad():
             self.log_temperature.data = torch.maximum(
                 self.log_temperature.data, self.min_log_temperature.to(dtype)
@@ -426,32 +392,31 @@ class MPOLoss(nn.Module):
                     self.min_log_temperature.to(dtype),
                 )
 
-        # Softplus (instead of exp) for numerical stability
+        # Transform dual variables from log-space using softplus, add epsilon for safety.
         temperature = F.softplus(self.log_temperature) + _MPO_FLOAT_EPSILON  # [1]
         alpha_mean = F.softplus(self.log_alpha_mean) + _MPO_FLOAT_EPSILON  # [D] or [1]
-        alpha_stddev = F.softplus(self.log_alpha_stddev) + _MPO_FLOAT_EPSILON
+        alpha_stddev = (
+            F.softplus(self.log_alpha_stddev) + _MPO_FLOAT_EPSILON
+        )  # [D] or [1]
 
-        # Compute normalized weights for non-parametric E-step & temperature dual loss
+        # E-step: compute normalized weights & temperature loss (detach semantics inside helper)
         normalized_weights, loss_temperature = compute_weights_and_temperature_loss(
-            q_values=q_values,  # [N, B]
-            epsilon=self._epsilon,
-            temperature=temperature,
+            q_values=q_values, epsilon=self._epsilon, temperature=temperature
         )
 
-        # Non-parametric KL diagnostic
+        # Diagnostic: KL between non-parametric and target
         kl_nonparametric = compute_nonparametric_kl_from_normalized_weights(
             normalized_weights
-        )  # [B]
+        )
+        penalty_kl_nonparametric = None
 
-        # Optional MO-MPO action penalization
+        # Optional MO-MPO penalty
         if self._action_penalization:
             penalty_temperature = (
                 F.softplus(self.log_penalty_temperature) + _MPO_FLOAT_EPSILON
             )
-
-            # Cost: 0 inside [-1,1], negative quadratic outside (we *maximize* cost)
-            diff_out_of_bound = actions - actions.clamp(-1.0, 1.0)  # [N, B, D]
-            cost_out_of_bound = -diff_out_of_bound.norm(dim=-1)  # [N, B]
+            diff_out_of_bound = actions - actions.clamp(-1.0, 1.0)  # [N,B,D]
+            cost_out_of_bound = -diff_out_of_bound.norm(dim=-1)  # [N,B]
 
             penalty_normalized_weights, loss_penalty_temperature = (
                 compute_weights_and_temperature_loss(
@@ -460,18 +425,15 @@ class MPOLoss(nn.Module):
                     temperature=penalty_temperature,
                 )
             )
-
             penalty_kl_nonparametric = compute_nonparametric_kl_from_normalized_weights(
                 penalty_normalized_weights
             )
 
-            # Combine weights and temperature losses
+            # Combine weights and temperature losses just like TF.
             normalized_weights = normalized_weights + penalty_normalized_weights
             loss_temperature = loss_temperature + loss_penalty_temperature
-        else:
-            penalty_kl_nonparametric = None
 
-        # Decompose online policy into fixed-stddev and fixed-mean components
+        # Decompose online policy into fixed-stddev and fixed-mean distributions (matching TF)
         fixed_stddev_dist = dist.Independent(
             dist.Normal(loc=online_mean, scale=target_scale), 1
         )
@@ -479,108 +441,80 @@ class MPOLoss(nn.Module):
             dist.Normal(loc=target_mean, scale=online_scale), 1
         )
 
-        # Decomposed cross-entropy policy losses (E-step → M-step)
+        # Cross-entropy (M-step) terms
         loss_policy_mean = compute_cross_entropy_loss(
-            sampled_actions=actions,
-            normalized_weights=normalized_weights,
-            online_action_distribution=fixed_stddev_dist,
+            actions, normalized_weights, fixed_stddev_dist
         )
         loss_policy_stddev = compute_cross_entropy_loss(
-            sampled_actions=actions,
-            normalized_weights=normalized_weights,
-            online_action_distribution=fixed_mean_dist,
+            actions, normalized_weights, fixed_mean_dist
         )
 
-        # KL terms between target and decomposed policies
+        # KL computations: target || fixed component (per-dim or aggregated)
         per_dim = self._per_dim_constraining
-
-        # KL for mean-constrained component
         kl_mean = _diag_normal_kl(
             p_mean=target_mean,
             p_std=target_scale,
             q_mean=fixed_stddev_dist.base_dist.loc,
             q_std=fixed_stddev_dist.base_dist.scale,
             per_dim=per_dim,
-        )  # [B, D] or [B]
-
-        # KL for stddev-constrained component
+        )
         kl_stddev = _diag_normal_kl(
             p_mean=target_mean,
             p_std=target_scale,
             q_mean=fixed_mean_dist.base_dist.loc,
             q_std=fixed_mean_dist.base_dist.scale,
             per_dim=per_dim,
-        )  # [B, D] or [B]
+        )
 
-        # Parametric KL penalization + dual losses
+        # Parametric KL penalties and dual losses (alpha adaptation)
         loss_kl_mean, loss_alpha_mean = compute_parametric_kl_penalty_and_dual_loss(
-            kl=kl_mean,
-            alpha=alpha_mean,
-            epsilon=self._epsilon_mean,
+            kl=kl_mean, alpha=alpha_mean, epsilon=self._epsilon_mean
         )
         loss_kl_stddev, loss_alpha_stddev = compute_parametric_kl_penalty_and_dual_loss(
-            kl=kl_stddev,
-            alpha=alpha_stddev,
-            epsilon=self._epsilon_stddev,
+            kl=kl_stddev, alpha=alpha_stddev, epsilon=self._epsilon_stddev
         )
 
+        # Combine everything exactly like TF
         loss_policy = loss_policy_mean + loss_policy_stddev
         loss_kl_penalty = loss_kl_mean + loss_kl_stddev
         loss_dual = loss_alpha_mean + loss_alpha_stddev + loss_temperature
-
         loss = loss_policy + loss_kl_penalty + loss_dual
 
-        # Diagnostics
+        # Prepare diagnostics similar to TF names/semantics
         stats: Dict[str, torch.Tensor] = {}
-
-        # Duals
-        stats["train/dual_alpha_mean"] = alpha_mean.mean()
-        stats["train/dual_alpha_stddev"] = alpha_stddev.mean()
-        stats["train/dual_temperature"] = temperature.mean()
-
-        # Loss terms
-        stats["train/loss_policy"] = loss_policy.detach()
-        stats["train/total_loss"] = loss.detach()
-        stats["train/loss_alpha"] = (loss_alpha_mean + loss_alpha_stddev).detach()
-        stats["train/loss_temperature"] = loss_temperature.detach()
-
-        # KL diagnostics
-        stats["train/kl_q_rel"] = kl_nonparametric.mean() / self._epsilon
-
+        stats["dual_alpha_mean"] = alpha_mean.mean()
+        stats["dual_alpha_stddev"] = alpha_stddev.mean()
+        stats["dual_temperature"] = temperature.mean()
+        stats["loss_policy"] = loss_policy.detach()
+        stats["total_loss"] = loss.detach()
+        stats["loss_alpha"] = (loss_alpha_mean + loss_alpha_stddev).detach()
+        stats["loss_temperature"] = loss_temperature.detach()
+        stats["kl_q_rel"] = kl_nonparametric.mean() / self._epsilon
         if self._action_penalization and penalty_kl_nonparametric is not None:
-            stats["train/penalty_kl_q_rel"] = (
+            stats["penalty_kl_q_rel"] = (
                 penalty_kl_nonparametric.mean() / self._epsilon_penalty
             )
+        stats["kl_mean_rel"] = kl_mean.mean() / self._epsilon_mean
+        stats["kl_stddev_rel"] = kl_stddev.mean() / self._epsilon_stddev
 
-        stats["train/kl_mean_rel"] = kl_mean.mean() / self._epsilon_mean
-        stats["train/kl_stddev_rel"] = kl_stddev.mean() / self._epsilon_stddev
-        if self._per_dim_constraining:
-            # per-dim summaries
-            kl_mean_batch_mean = kl_mean.mean(dim=0)  # [D]
-            kl_stddev_batch_mean = kl_stddev.mean(dim=0)  # [D]
-
-            stats["train/kl_mean_rel_min"] = (
-                kl_mean_batch_mean.min() / self._epsilon_mean
-            )
-            stats["train/kl_mean_rel_max"] = (
-                kl_mean_batch_mean.max() / self._epsilon_mean
-            )
-            stats["train/kl_stddev_rel_min"] = (
+        if per_dim:
+            kl_mean_batch_mean = kl_mean.mean(dim=0)
+            kl_stddev_batch_mean = kl_stddev.mean(dim=0)
+            stats["kl_mean_rel_min"] = kl_mean_batch_mean.min() / self._epsilon_mean
+            stats["kl_mean_rel_max"] = kl_mean_batch_mean.max() / self._epsilon_mean
+            stats["kl_stddev_rel_min"] = (
                 kl_stddev_batch_mean.min() / self._epsilon_stddev
             )
-            stats["train/kl_stddev_rel_max"] = (
+            stats["kl_stddev_rel_max"] = (
                 kl_stddev_batch_mean.max() / self._epsilon_stddev
             )
 
-        # Q statistics
-        stats["train/q_min"] = q_values.min(dim=0).values.mean()
-        stats["train/q_max"] = q_values.max(dim=0).values.mean()
-
-        # Policy stddev statistics for the online policy
-        pi_stddev = online_scale  # [B, D]
-        stats["train/pi_stddev_min"] = pi_stddev.min(dim=-1).values.mean()
-        stats["train/pi_stddev_max"] = pi_stddev.max(dim=-1).values.mean()
-        stats["train/pi_stddev_cond"] = (
+        stats["q_min"] = q_values.min(dim=0).values.mean()
+        stats["q_max"] = q_values.max(dim=0).values.mean()
+        pi_stddev = online_scale
+        stats["pi_stddev_min"] = pi_stddev.min(dim=-1).values.mean()
+        stats["pi_stddev_max"] = pi_stddev.max(dim=-1).values.mean()
+        stats["pi_stddev_cond"] = (
             pi_stddev.max(dim=-1).values
             / (pi_stddev.min(dim=-1).values + _MPO_FLOAT_EPSILON)
         ).mean()
@@ -818,6 +752,12 @@ class MPOAgent:
             q_samples = torch.nan_to_num(q_samples, nan=0.0, posinf=1e6, neginf=-1e6)
             q_t = q_samples.mean(dim=0)  # (B,)
 
+            # Compute scalar summaries for q (match TF learner logging):
+            # q_min := mean over batch of min over action-samples
+            # q_max := mean over batch of max over action-samples
+            q_min = float(q_samples.min(dim=0).values.mean().item())
+            q_max = float(q_samples.max(dim=0).values.mean().item())
+
         # critic loss (TD)
         target = rewards_b + discounts_b * q_t
 
@@ -870,30 +810,425 @@ class MPOAgent:
             self.target_critic.load_state_dict(self.critic.state_dict())
 
         fetches = {
-            "train/critic_loss": float(critic_loss.item()),
-            "train/learn_steps": self._learn_steps,
+            "critic_loss": float(critic_loss.item()),
+            "learn_steps": self._learn_steps,
         }
         fetches.update(
             {
-                "train/td_error_mean": td_error_mean,
-                "train/td_target_mean": target_mean,
+                "td_error_mean": td_error_mean,
+                "td_target_mean": target_mean,
             }
         )
-        fetches.update(stats)
 
-        if self._learn_steps % 100 == 0:
-            print(
-                f"[Learner step {self._learn_steps}] "
-                f"critic_loss={critic_loss.item():.4f} "
-                f"td_error_mean={td_error_mean:.4f} "
-                f"td_target_mean={target_mean:.4f}"
-            )
+        fetches["q_min"] = q_min
+        fetches["q_max"] = q_max
+
+        fetches.update(stats)
         return fetches
+
+
+class Learner:
+    """Learner encapsulates the learning loop calling agent.learn_step()."""
+
+    def __init__(
+        self,
+        agent: MPOAgent,
+        stop_event: threading.Event,
+        step_lock: threading.Lock,
+        shared_state: dict,
+    ):
+        self.agent = agent
+        self.stop_event = stop_event
+        self.step_lock = step_lock
+        self.shared_state = shared_state
+
+    def run(self):
+        while not self.stop_event.is_set():
+            stats = self.agent.learn_step()
+            if stats is None:
+                # Not ready to learn yet.
+                time.sleep(0.01)
+                continue
+            with self.step_lock:
+                global_step = self.shared_state["steps"]
+            log_dict: Dict[str, Union[float, int]] = {}
+            for key, value in stats.items():
+                if isinstance(value, torch.Tensor):
+                    log_dict[key] = float(value.detach().cpu().item())
+                else:
+                    log_dict[key] = value
+            log_dict["global_actor_step"] = global_step
+            wandb.log({"learner/" + key: value for key, value in log_dict.items()})
+
+
+class EnvironmentLoop:
+    """Run episodes for an actor-like object (select_action/observe_first/observe/update/post_step).
+
+    The actor must expose:
+      - observe_first(obs)
+      - select_action(obs) -> action (numpy)
+      - observe(prev_obs, action, reward, next_obs, done)
+      - update(total_steps)
+      - post_step() -> int  (increments/returns global step or returns current step)
+      - label: str  (used for logging)
+    """
+
+    def __init__(self, environment, actor, step_lock=None, shared_state=None):
+        self._environment = environment
+        self._actor = actor
+        # optional: used to terminate across threads and track global steps if actor.post_step uses them.
+        self._step_lock = step_lock
+        self._shared_state = shared_state
+
+    def run_episode(self):
+        episode_return = 0.0
+        episode_steps = 0
+
+        obs, _ = self._environment.reset()
+        obs_flat = flatten_observation(obs)
+
+        # allow actor to observe the initial timestep
+        try:
+            self._actor.observe_first(obs_flat)
+        except Exception:
+            pass
+
+        done = False
+        start_time = time.time()
+        while not done:
+            action = self._actor.select_action(obs_flat)
+            next_obs, reward, terminated, truncated, _ = self._environment.step(action)
+            done = bool(terminated or truncated)
+            next_flat = flatten_observation(next_obs)
+
+            # Let actor process transition (e.g., insert into replay)
+            self._actor.observe(obs_flat, action, float(reward), next_flat, done)
+
+            # Update/ sync actor as necessary (policy syncs etc.)
+            # post_step should increment global step (for actors) or return current step (for evaluator).
+            total_steps = self._actor.post_step()
+            try:
+                self._actor.update(total_steps)
+            except Exception:
+                pass
+
+            episode_return += float(reward)
+            episode_steps += 1
+            obs_flat = next_flat
+
+            # If the actor exposes a stop_event and it's set, break early.
+            if (
+                getattr(self._actor, "stop_event", None) is not None
+                and self._actor.stop_event.is_set()
+            ):
+                break
+
+        duration = time.time() - start_time
+        result = {
+            "episode_length": episode_steps,
+            "episode_return": episode_return,
+            "episode_duration": duration,
+        }
+        return result
+
+    def run(self, num_episodes: Optional[int] = None, num_steps: Optional[int] = None):
+        if not (num_episodes is None or num_steps is None):
+            raise ValueError('Either "num_episodes" or "num_steps" should be None.')
+
+        def should_terminate(episodes_done, steps_done):
+            if num_episodes is not None and episodes_done >= num_episodes:
+                return True
+            if num_steps is not None and steps_done >= num_steps:
+                return True
+            # also stop if actor requests it
+            if (
+                getattr(self._actor, "stop_event", None) is not None
+                and self._actor.stop_event.is_set()
+            ):
+                return True
+            return False
+
+        episodes = 0
+        steps_at_start = 0
+        # get current global steps if available
+        if self._shared_state is not None:
+            steps_at_start = int(self._shared_state.get("steps", 0))
+
+        steps_done = 0
+        while not should_terminate(episodes, steps_done):
+            episode_result = self.run_episode()
+            episodes += 1
+            # If shared_state exists, compute total steps relative to start.
+            if self._shared_state is not None:
+                steps_done = int(self._shared_state.get("steps", 0)) - steps_at_start
+            else:
+                steps_done += episode_result["episode_length"]
+
+            wandb.log(
+                {self._actor.label + "/" + k: v for k, v in episode_result.items()}
+            )
+        return (
+            self._shared_state.get("steps", None)
+            if self._shared_state is not None
+            else steps_done
+        )
+
+
+class Actor:
+    """Actor encapsulates environment interaction, policy syncing and replay insertion."""
+
+    def __init__(
+        self,
+        agent: MPOAgent,
+        env_name: str,
+        device: torch.device,
+        stop_event: threading.Event,
+        step_lock: threading.Lock,
+        shared_state: dict,
+        policy_sync_interval: int,
+    ):
+        self.agent = agent
+        self.env_name = env_name
+        self.device = device
+        self.stop_event = stop_event
+        self.step_lock = step_lock
+        self.shared_state = shared_state
+        self.policy_sync_interval = max(1, policy_sync_interval)
+        self._actor_encoder = None
+        self._actor_policy_head = None
+        self._sync_counter = 0
+        self.label = "actor"
+
+    def setup_local_modules(self):
+        """Create local copies of policy modules used by this actor thread."""
+        self._actor_encoder = copy.deepcopy(self.agent.obs_encoder).to(self.device)
+        self._actor_policy_head = copy.deepcopy(self.agent.policy_head).to(self.device)
+        # sync initial params
+        self.agent.copy_policy_to(self._actor_encoder, self._actor_policy_head)
+        self._actor_encoder.eval()
+        self._actor_policy_head.eval()
+        self._sync_counter = 0
+
+    def select_action(
+        self, obs_flat: np.ndarray, stochastic: bool = True
+    ) -> np.ndarray:
+        # draw action from local modules
+        if self._actor_encoder is None or self._actor_policy_head is None:
+            self.setup_local_modules()
+        return run_policy_modules(
+            self._actor_encoder,
+            self._actor_policy_head,
+            obs_flat,
+            self.device,
+            self.agent.action_low,
+            self.agent.action_high,
+            stochastic=stochastic,
+        )
+
+    def observe_first(self, obs_flat: np.ndarray):
+        # no-op required by EnvironmentLoop interface
+        return
+
+    def observe(
+        self,
+        prev_obs_flat: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_obs_flat: np.ndarray,
+        done: bool,
+    ):
+        # convert and store into replay using agent
+        step_discount = 0.0 if done else 1.0
+        self.agent.store_transition(
+            prev_obs_flat, action, float(reward), step_discount, next_obs_flat, done
+        )
+
+    def update(self, total_steps: int):
+        # sync local policy periodically
+        self._sync_counter += 1
+        if self._sync_counter >= self.policy_sync_interval:
+            if self._actor_encoder is None or self._actor_policy_head is None:
+                return
+            self.agent.copy_policy_to(self._actor_encoder, self._actor_policy_head)
+            self._actor_encoder.eval()
+            self._actor_policy_head.eval()
+            self._sync_counter = 0
+
+    def post_step(self) -> int:
+        # increment global step counter and return it
+        with self.step_lock:
+            self.shared_state["steps"] += 1
+            return int(self.shared_state["steps"])
+
+    def run(self, max_actor_steps: int):
+        env = make_env(self.env_name)
+        try:
+            # prepare local modules
+            self.setup_local_modules()
+            loop = EnvironmentLoop(
+                environment=env,
+                actor=self,
+                step_lock=self.step_lock,
+                shared_state=self.shared_state,
+            )
+            loop.run(num_steps=max_actor_steps)
+        except Exception as exc:
+            self.stop_event.set()
+            print(f"[Actor] error: {exc}")
+        finally:
+            try:
+                env.close()
+            except Exception:
+                pass
+
+
+class Evaluator:
+    """Evaluator runs continuous evaluation episodes and logs results."""
+
+    def __init__(
+        self,
+        agent: MPOAgent,
+        env_name: str,
+        device: torch.device,
+        stop_event: threading.Event,
+        step_lock: threading.Lock,
+        shared_state: dict,
+    ):
+        self.agent = agent
+        self.env_name = env_name
+        self.device = device
+        self.stop_event = stop_event
+        self.step_lock = step_lock
+        self.shared_state = shared_state
+
+        # local eval modules (created and synced as needed)
+        self._eval_encoder = None
+        self._eval_policy_head = None
+        self.label = "eval"
+
+    def setup_local_modules(self):
+        self._eval_encoder = copy.deepcopy(self.agent.obs_encoder).to(self.device)
+        self._eval_policy_head = copy.deepcopy(self.agent.policy_head).to(self.device)
+        self.agent.copy_policy_to(self._eval_encoder, self._eval_policy_head)
+        self._eval_encoder.eval()
+        self._eval_policy_head.eval()
+
+    def select_action(
+        self, obs_flat: np.ndarray, stochastic: bool = False
+    ) -> np.ndarray:
+        if self._eval_encoder is None or self._eval_policy_head is None:
+            self.setup_local_modules()
+        assert (
+            self._eval_encoder is not None and self._eval_policy_head is not None
+        ), "Evaluation modules must be initialized"
+        return run_policy_modules(
+            self._eval_encoder,
+            self._eval_policy_head,
+            obs_flat,
+            self.device,
+            self.agent.action_low,
+            self.agent.action_high,
+            stochastic=stochastic,
+        )
+
+    def observe_first(self, obs_flat: np.ndarray):
+        # no-op for evaluator
+        return
+
+    def observe(
+        self,
+        prev_obs_flat: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_obs_flat: np.ndarray,
+        done: bool,
+    ):
+        # evaluator doesn't insert into replay
+        return
+
+    def update(self, total_steps: int):
+        # Sync policy weights periodically based on total_steps (simple policy copy every N steps).
+        # Use agent.target intervals for a reasonable sync cadence.
+        update_period = max(1, self.agent.target_policy_update_period)
+        if total_steps % update_period == 0:
+            # refresh local modules from agent
+            if self._eval_encoder is None or self._eval_policy_head is None:
+                self.setup_local_modules()
+            else:
+                self.agent.copy_policy_to(self._eval_encoder, self._eval_policy_head)
+                self._eval_encoder.eval()
+                self._eval_policy_head.eval()
+
+    def post_step(self) -> int:
+        # Do not increment global steps during evaluation; just return current value
+        with self.step_lock:
+            return int(self.shared_state.get("steps", 0))
+
+    def run(self):
+        env = make_env(self.env_name)
+        try:
+            # Continuously run evaluation episodes until stop_event is set.
+            loop = EnvironmentLoop(
+                environment=env,
+                actor=self,
+                step_lock=self.step_lock,
+                shared_state=self.shared_state,
+            )
+            while not self.stop_event.is_set():
+                # Ensure local modules are in sync before each episode.
+                self.setup_local_modules()
+                # Run a single episode (EnvironmentLoop will log via wandb using actor.label).
+                loop.run(num_episodes=1)
+                # Brief sleep to avoid tight loop in case episodes are very short.
+                time.sleep(0.01)
+        except Exception as exc:
+            self.stop_event.set()
+            print(f"[Evaluator] error: {exc}")
+        finally:
+            try:
+                env.close()
+            except Exception:
+                pass
+
+
+class DmControlGymLikeWrapper:
+    """Adapter to present a minimal gym-like API around a dm_control environment.
+
+    It implements:
+      - reset() -> (observation, info)
+      - step(action) -> (observation, reward, terminated, truncated, info)
+      - close()
+
+    This keeps the rest of the code unchanged which expects gym-style tuples.
+    """
+
+    def __init__(self, env: dm_env.Environment):
+        self._env = env
+
+    def reset(self):
+        ts = self._env.reset()
+        return ts.observation, {}
+
+    def step(self, action):
+        # dm_control accepts numpy arrays in the action spec range.
+        ts = self._env.step(action)
+        obs = ts.observation
+        reward = float(ts.reward or 0.0)
+        terminated = bool(ts.last())
+        truncated = False
+        return obs, reward, terminated, truncated, {}
+
+    def close(self):
+        try:
+            self._env.close()
+        except Exception:
+            pass
 
 
 def make_env(env_name: str, render_mode: str | None = None):
     domain, task = env_name.split("::")
-    return gym.make(f"dm_control/{domain}-{task}-v0", render_mode=render_mode)
+    env = suite.load(domain, task)
+    return DmControlGymLikeWrapper(env)
 
 
 def flatten_observation(obs):
@@ -942,8 +1277,6 @@ def train(
     lr_dual: float,
     seed: int,
     log_dir: str,
-    max_eval_actor_steps: int,
-    eval_freq: int,
     policy_sync_interval: int,
 ):
     random.seed(seed)
@@ -956,18 +1289,23 @@ def train(
         device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    probe_env = make_env(env_name)
-    obs0, _ = probe_env.reset()
-    obs_space = probe_env.observation_space
-    if isinstance(obs_space, gym.spaces.Dict):
-        obs_dim = sum(int(np.prod(sp.shape)) for sp in obs_space.spaces.values())
+    # Use dm_control suite to infer observation/action shapes and bounds.
+    domain, task = env_name.split("::")
+    probe_env = suite.load(domain, task)
+    obs_spec = probe_env.observation_spec()
+    # observation spec is often a dict of ArraySpec(s)
+    if isinstance(obs_spec, dict):
+        obs_dim = sum(int(np.prod(sp.shape)) for sp in obs_spec.values())
     else:
-        obs_dim = int(np.prod(obs_space.shape))
-    act_space = probe_env.action_space
-    action_dim = int(np.prod(act_space.shape))
-    action_low = act_space.low
-    action_high = act_space.high
-    probe_env.close()
+        obs_dim = int(np.prod(obs_spec.shape))
+    action_spec = probe_env.action_spec()
+    action_dim = int(np.prod(action_spec.shape))
+    action_low = np.array(action_spec.minimum, dtype=np.float32)
+    action_high = np.array(action_spec.maximum, dtype=np.float32)
+    try:
+        probe_env.close()
+    except Exception:
+        pass
 
     agent = MPOAgent(
         obs_dim=obs_dim,
@@ -993,181 +1331,38 @@ def train(
     shared_state = {"steps": 0}
     policy_sync_interval = max(1, policy_sync_interval)
 
-    def actor_loop():
-        env = make_env(env_name)
-        try:
-            obs, _ = env.reset()
-            obs_flat_local = flatten_observation(obs)
-            actor_encoder = copy.deepcopy(agent.obs_encoder).to(device)
-            actor_policy_head = copy.deepcopy(agent.policy_head).to(device)
-            agent.copy_policy_to(actor_encoder, actor_policy_head)
-            actor_encoder.eval()
-            actor_policy_head.eval()
-            episode_return = 0.0
-            episode_len = 0
-            sync_counter = policy_sync_interval
-            while not stop_event.is_set():
-                if sync_counter >= policy_sync_interval:
-                    agent.copy_policy_to(actor_encoder, actor_policy_head)
-                    actor_encoder.eval()
-                    actor_policy_head.eval()
-                    sync_counter = 0
-
-                action = run_policy_modules(
-                    actor_encoder,
-                    actor_policy_head,
-                    obs_flat_local,
-                    device,
-                    agent.action_low,
-                    agent.action_high,
-                    stochastic=True,
-                )
-                next_obs, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                next_flat = flatten_observation(next_obs)
-                step_discount = 0.0 if done else 1.0
-                agent.store_transition(
-                    obs_flat_local,
-                    action,
-                    float(reward),
-                    step_discount,
-                    next_flat,
-                    done,
-                )
-                episode_return += float(reward)
-                episode_len += 1
-                obs_flat_local = next_flat
-                sync_counter += 1
-
-                with step_lock:
-                    shared_state["steps"] += 1
-                    global_step = shared_state["steps"]
-
-                if done:
-                    wandb.log(
-                        {
-                            "train/episode_return": episode_return,
-                            "train/episode_length": episode_len,
-                        },
-                    )
-                    print(
-                        f"[Actor step {global_step}] return={episode_return:.2f} len={episode_len}"
-                    )
-                    obs, _ = env.reset()
-                    obs_flat_local = flatten_observation(obs)
-                    episode_return = 0.0
-                    episode_len = 0
-
-                if global_step >= max_actor_steps:
-                    stop_event.set()
-                    break
-        except Exception as exc:
-            stop_event.set()
-            print(f"[Actor] error: {exc}")
-        finally:
-            env.close()
-
-    def learner_loop():
-        try:
-            while not stop_event.is_set():
-                stats = agent.learn_step()
-                if stats is None:
-                    time.sleep(0.01)
-                    continue
-                with step_lock:
-                    global_step = shared_state["steps"]
-                log_dict: Dict[str, Union[float, int]] = {}
-                for key, value in stats.items():
-                    if isinstance(value, torch.Tensor):
-                        log_dict[key] = float(value.detach().cpu().item())
-                    else:
-                        log_dict[key] = value
-                log_dict["train/global_actor_step"] = global_step
-                wandb.log(log_dict)
-        except Exception as exc:
-            stop_event.set()
-            print(f"[Learner] error: {exc}")
-
-    def evaluator_loop():
-        env = make_env(env_name)
-        try:
-            eval_encoder = copy.deepcopy(agent.obs_encoder).to(device)
-            eval_policy_head = copy.deepcopy(agent.policy_head).to(device)
-            agent.copy_policy_to(eval_encoder, eval_policy_head)
-            eval_encoder.eval()
-            eval_policy_head.eval()
-            next_eval_step = eval_freq
-            while not stop_event.is_set():
-                if eval_freq <= 0 or max_eval_actor_steps <= 0:
-                    break
-                with step_lock:
-                    global_step = shared_state["steps"]
-                if global_step >= next_eval_step and global_step > 0:
-                    agent.copy_policy_to(eval_encoder, eval_policy_head)
-                    eval_encoder.eval()
-                    eval_policy_head.eval()
-                    eval_returns = []
-                    eval_lengths = []
-                    eval_steps = 0
-                    while eval_steps < max_eval_actor_steps and not stop_event.is_set():
-                        obs, _ = env.reset()
-                        obs_flat_local = flatten_observation(obs)
-                        done = False
-                        ep_ret = 0.0
-                        ep_len = 0
-                        while (
-                            not done
-                            and eval_steps < max_eval_actor_steps
-                            and not stop_event.is_set()
-                        ):
-                            action = run_policy_modules(
-                                eval_encoder,
-                                eval_policy_head,
-                                obs_flat_local,
-                                device,
-                                agent.action_low,
-                                agent.action_high,
-                                stochastic=False,
-                            )
-                            next_obs, reward, terminated, truncated, _ = env.step(
-                                action
-                            )
-                            done = terminated or truncated
-                            obs_flat_local = flatten_observation(next_obs)
-                            ep_ret += float(reward)
-                            ep_len += 1
-                            eval_steps += 1
-                        eval_returns.append(ep_ret)
-                        eval_lengths.append(ep_len)
-                    if eval_returns:
-                        mean_r = float(np.mean(eval_returns))
-                        std_r = float(np.std(eval_returns))
-                        mean_len = float(np.mean(eval_lengths))
-                        wandb.log(
-                            {
-                                "eval/mean_reward": mean_r,
-                                "eval/std_return": std_r,
-                                "eval/mean_ep_length": mean_len,
-                            },
-                        )
-                        print(
-                            f"[Eval @ step {global_step}] mean_reward={mean_r:.2f} std={std_r:.2f} mean_len={mean_len:.1f}"
-                        )
-                    next_eval_step += eval_freq
-                else:
-                    time.sleep(0.5)
-        except Exception as exc:
-            stop_event.set()
-            print(f"[Evaluator] error: {exc}")
-        finally:
-            env.close()
+    # Instantiate actor / learner / evaluator objects and run them in threads.
+    actor_obj = Actor(
+        agent=agent,
+        env_name=env_name,
+        device=device,
+        stop_event=stop_event,
+        step_lock=step_lock,
+        shared_state=shared_state,
+        policy_sync_interval=policy_sync_interval,
+    )
+    learner_obj = Learner(
+        agent=agent,
+        stop_event=stop_event,
+        step_lock=step_lock,
+        shared_state=shared_state,
+    )
+    evaluator_obj = Evaluator(
+        agent=agent,
+        env_name=env_name,
+        device=device,
+        stop_event=stop_event,
+        step_lock=step_lock,
+        shared_state=shared_state,
+    )
 
     threads = [
-        threading.Thread(target=actor_loop, name="actor_thread"),
-        threading.Thread(target=learner_loop, name="learner_thread"),
+        threading.Thread(
+            target=actor_obj.run, name="actor_thread", args=(max_actor_steps,)
+        ),
+        threading.Thread(target=learner_obj.run, name="learner_thread"),
+        threading.Thread(target=evaluator_obj.run, name="evaluator_thread"),
     ]
-    if eval_freq > 0 and max_eval_actor_steps > 0:
-        threads.append(threading.Thread(target=evaluator_loop, name="evaluator_thread"))
 
     for t in threads:
         t.start()
@@ -1207,13 +1402,7 @@ def train(
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--env_names",
-        type=str,
-        default="cartpole::balance",
-        help="Comma-separated list of environment names to train on",
-    )
-    parser.add_argument("--env_iterations", type=int, default=1)
+    parser.add_argument("--env_name", type=str, default="cartpole::balance")
     parser.add_argument("--max_actor_steps", type=int, default=3_000_000)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--min_replay_size", type=int, default=512)
@@ -1229,79 +1418,57 @@ def parse_args():
     parser.add_argument("--wandb_entity", type=str, default="adrian-research")
     parser.add_argument("--wandb_group_prefix", type=str, default=None)
     parser.add_argument("--base_log_dir", type=str, default="./logs/mpo_experiment")
-    parser.add_argument("--eval_freq", type=int, default=3000)
-    parser.add_argument("--max_eval_actor_steps", type=int, default=3000)
     parser.add_argument("--policy_sync_interval", type=int, default=500)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    env_names = args.env_names.split(",")
-    for env_name in env_names:
-        for iteration in range(args.env_iterations):
-            print(
-                f"Training on environment: {env_name}. Starting iteration {iteration + 1}/{args.env_iterations}"
-            )
-            start_time = time.time()
+    seed = int(time.time()) % 10000
 
-            seed = int(time.time()) % 10000 + iteration * 1000
+    experiment_identifier = (
+        args.env_name + f"_seed{seed}" + "_" + time.strftime("%Y%m%d-%H%M%S")
+    )
+    log_dir = os.path.join(
+        args.base_log_dir, args.wandb_project + "_" + experiment_identifier
+    )
 
-            experiment_identifier = (
-                env_name
-                + "__iter"
-                + str(iteration + 1)
-                + f"_seed{seed}"
-                + "_"
-                + time.strftime("%Y%m%d-%H%M%S")
-            )
-            log_dir = os.path.join(
-                args.base_log_dir, args.wandb_project + "_" + experiment_identifier
-            )
+    os.makedirs(log_dir, exist_ok=True)
 
-            os.makedirs(log_dir, exist_ok=True)
+    print("Experiment Configuration:")
+    print(json.dumps(vars(args), indent=4))
 
-            print("Experiment Configuration:")
-            print(json.dumps(vars(args), indent=4))
+    with open(os.path.join(log_dir, "config.json"), "w") as f:
+        json.dump(vars(args), f, indent=4)
+    wandb.init(
+        name=experiment_identifier,
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        group=(
+            f"{args.wandb_group_prefix}_mpo_{args.env_name}"
+            if args.wandb_group_prefix
+            else f"mpo_{args.env_name}"
+        ),
+        config=vars(args),
+        dir=log_dir,
+    )
 
-            with open(os.path.join(log_dir, "config.json"), "w") as f:
-                json.dump(vars(args), f, indent=4)
-            wandb.init(
-                name=experiment_identifier,
-                project=args.wandb_project,
-                entity=args.wandb_entity,
-                group=(
-                    f"{args.wandb_group_prefix}_mpo_{env_name}"
-                    if args.wandb_group_prefix
-                    else f"mpo_{env_name}"
-                ),
-                config=vars(args),
-                dir=log_dir,
-            )
+    train(
+        env_name=args.env_name,
+        max_actor_steps=args.max_actor_steps,
+        min_replay_size=args.min_replay_size,
+        batch_size=args.batch_size,
+        max_replay_size=args.max_replay_size,
+        n_step=args.n_step,
+        gamma=args.gamma,
+        num_samples=args.num_samples,
+        target_policy_update_period=args.target_policy_update_period,
+        target_critic_update_period=args.target_critic_update_period,
+        lr=args.lr,
+        lr_dual=args.lr_dual,
+        seed=seed,
+        log_dir=log_dir,
+        policy_sync_interval=args.policy_sync_interval,
+    )
 
-            train(
-                env_name=env_name,
-                max_actor_steps=args.max_actor_steps,
-                batch_size=args.batch_size,
-                max_replay_size=args.max_replay_size,
-                n_step=args.n_step,
-                gamma=args.gamma,
-                num_samples=args.num_samples,
-                target_policy_update_period=args.target_policy_update_period,
-                target_critic_update_period=args.target_critic_update_period,
-                lr=args.lr,
-                lr_dual=args.lr_dual,
-                seed=seed,
-                eval_freq=args.eval_freq,
-                max_eval_actor_steps=args.max_eval_actor_steps,
-                min_replay_size=args.min_replay_size,
-                log_dir=log_dir,
-                policy_sync_interval=args.policy_sync_interval,
-            )
-
-            wandb.finish()
-            end_time = time.time()
-            print(
-                f"Iteration {iteration + 1}/{args.env_iterations} completed in "
-                f"{end_time - start_time:.2f} seconds."
-            )
+    wandb.finish()
