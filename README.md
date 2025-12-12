@@ -1,9 +1,7 @@
 # On implementing Maximum a Posteriori Policy Optimization (MPO)
 
 - [On implementing Maximum a Posteriori Policy Optimization (MPO)](#on-implementing-maximum-a-posteriori-policy-optimization-mpo)
-  - [Implementing from scratch in PyTorch](#implementing-from-scratch-in-pytorch)
-    - [Visualize](#visualize)
-    - [Video generation](#video-generation)
+  - [Original MPO Paper](#original-mpo-paper)
   - [Using Google DeepMind Acme](#using-google-deepmind-acme)
     - [Single file with Launchpad](#single-file-with-launchpad)
       - [Visualise](#visualise)
@@ -11,33 +9,13 @@
   - [Implementing based on Acme in PyTorch](#implementing-based-on-acme-in-pytorch)
     - [Visualize Acme in PyTorch](#visualize-acme-in-pytorch)
     - [Video generation Acme in PyTorch](#video-generation-acme-in-pytorch)
-  - [Original MPO Paper](#original-mpo-paper)
+  - [Implementing from scratch in PyTorch](#implementing-from-scratch-in-pytorch)
+    - [Visualize wandb](#visualize-wandb)
+    - [Video generation](#video-generation)
 
-## Implementing from scratch in PyTorch
+## Original MPO Paper
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb "imageio[ffmpeg]" torchrl
-
-python src/train_custom_pytorch_mpo.py --wandb_project custom_mpo9 --max_actor_steps 1500000 --env_names HalfCheetah-v5,Walker2d-v5 --env_iterations 1
-```
-
-### Visualize
-
-```bash
-python src/visualize_wandb.py --project-metric "ppo6::eval/mean_reward" --project-metric "custom_mpo6::eval/mean_reward" --entity "adrian-research" --cache-dir logs --show-individual --output results/custom_pytorch.png
-```
-
-![Custom Results](results/custom_pytorch.png)
-
-### Video generation
-
-```bash
-python src/generate_video_custom_pytorch_mpo.py logs/mpo_experiment/checkpoints/checkpoint_ep309.pt --env_name HalfCheetah-v5 --output mpo_halfcheetah.mp4
-```
-
-![MPO Video](assets/cheetah.gif)
+![MPO Original Results](results/original_mpo_paper.png)
 
 ## Using Google DeepMind Acme
 
@@ -96,6 +74,30 @@ python src/visualize_wandb.py --project-metric "acme_pytorch_3::eval/mean_reward
 python src/generate_video_acme_pytorch_mpo.py logs/mpo_experiment/identifier/checkpoints/checkpoint_34234.pt --env_name cheetah::run --output mpo_acme_pytorch_cheetah_run.mp4
 ```
 
-## Original MPO Paper
 
-![MPO Original Results](results/original_mpo_paper.png)
+
+## Implementing from scratch in PyTorch
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb "imageio[ffmpeg]" torchrl
+
+python src/train_custom_pytorch_mpo.py --wandb_project custom_mpo9 --max_actor_steps 1500000 --env_names HalfCheetah-v5,Walker2d-v5 --env_iterations 1
+```
+
+### Visualize wandb
+
+```bash
+python src/visualize_wandb.py --project-metric "ppo6::eval/mean_reward" --project-metric "custom_mpo6::eval/mean_reward" --entity "adrian-research" --cache-dir logs --show-individual --output results/custom_pytorch.png
+```
+
+![Custom Results](results/custom_pytorch.png)
+
+### Video generation
+
+```bash
+python src/generate_video_custom_pytorch_mpo.py logs/mpo_experiment/checkpoints/checkpoint_ep309.pt --env_name HalfCheetah-v5 --output mpo_halfcheetah.mp4
+```
+
+![MPO Video](assets/cheetah.gif)
