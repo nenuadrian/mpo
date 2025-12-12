@@ -638,7 +638,7 @@ class MPOAgent:
             epsilon_stddev=1e-6,
             init_log_temperature=10.0,
             init_log_alpha_mean=10.0,
-            init_log_alpha_stddev=100.0,
+            init_log_alpha_stddev=1000.0,
         ).to(device)
 
         self._critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
@@ -776,7 +776,7 @@ class MPOAgent:
 
         # target mean/scale already computed as t_mean/t_scale (from above, no_grad)
         # compute MPO loss with sampled_actions and q_samples
-        total_loss, stats = self.mpo_loss(
+        policy_loss, policy_stats  = self.mpo_loss(
             sampled_actions, q_samples, online_mean, online_scale, t_mean, t_scale
         )
 
@@ -789,7 +789,7 @@ class MPOAgent:
 
             self._policy_optimizer.zero_grad()
             self._dual_optimizer.zero_grad()
-            total_loss.backward()
+            policy_loss.backward()
             if self.clipping:
                 torch.nn.utils.clip_grad_norm_(
                     list(self.policy_head.parameters()),
@@ -810,6 +810,7 @@ class MPOAgent:
             self.target_obs_encoder.load_state_dict(self.obs_encoder.state_dict())
 
         fetches = {
+            "policy_loss": float(policy_loss.item()),
             "critic_loss": float(critic_loss.item()),
             "total_steps": self._learn_steps,
             "td_error_mean": td_error_mean,
@@ -818,7 +819,7 @@ class MPOAgent:
             "q_max": q_max,
         }
 
-        fetches.update(stats)
+        fetches.update(policy_stats)
         return fetches
 
 
@@ -868,7 +869,7 @@ class EnvironmentLoop:
       - label: str  (used for logging)
     """
 
-    def __init__(self, environment, actor, step_lock=None, shared_state=None):
+    def __init__(self, environment, actor, step_lock, shared_state):
         self._environment = environment
         self._actor = actor
         self._step_lock = step_lock
@@ -929,29 +930,22 @@ class EnvironmentLoop:
             if num_steps is not None and steps_done >= num_steps:
                 return True
             # also stop if actor requests it
-            if (
-                getattr(self._actor, "stop_event", None) is not None
-                and self._actor.stop_event.is_set()
-            ):
-                return True
-            return False
+            return self._actor.stop_event.is_set()
 
         episodes = 0
         steps_at_start = 0
         # get current global steps if available
-        if self._shared_state is not None:
-            steps_at_start = int(self._shared_state.get("steps", 0))
+        steps_at_start = int(self._shared_state.get("steps", 0))
 
         steps_done = 0
+        total_steps = 0
         while not should_terminate(episodes, steps_done):
             episode_result = self.run_episode()
             episodes += 1
-            # If shared_state exists, compute total steps relative to start.
-            if self._shared_state is not None:
-                steps_done = int(self._shared_state.get("steps", 0)) - steps_at_start
-            else:
-                steps_done += episode_result["episode_length"]
-
+            steps_done = int(self._shared_state.get("steps", 0)) - steps_at_start
+            total_steps += episode_result["episode_length"]
+            episode_result["total_episodes"] = episodes
+            episode_result["total_steps"] = steps_done
             wandb.log(
                 {self._actor.label + "/" + k: v for k, v in episode_result.items()}
             )
