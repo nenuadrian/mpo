@@ -276,6 +276,44 @@ def main() -> None:
     ncols = max(1, args.ncols)
     nrows = math.ceil(n_envs / ncols)
 
+    # --- New: compute global maximum y across all environments/projects ---
+    global_max = -math.inf
+    for env_name, project_map in env_to_project_dfs.items():
+        for project_label, dfs in project_map.items():
+            metric = project_metrics[project_label]
+            # use same smoothing window as plotting to consider aggregated envelopes
+            mean_series, std_series, min_series, max_series, _ = _aggregate_runs(
+                dfs, metric, smoothing_window=args.smoothing_window
+            )
+            # consider aggregated mean and max envelope
+            if not mean_series.empty:
+                try:
+                    agg_candidates = []
+                    if not mean_series.empty:
+                        agg_candidates.append(float(mean_series.max()))
+                    if not max_series.empty:
+                        agg_candidates.append(float(max_series.max()))
+                    if agg_candidates:
+                        global_max = max(global_max, max(agg_candidates))
+                except Exception:
+                    pass
+            # consider raw individual runs too
+            for df in dfs:
+                if metric in df.columns and not df[metric].dropna().empty:
+                    try:
+                        val = float(df[metric].max())
+                        if not math.isnan(val):
+                            global_max = max(global_max, val)
+                    except Exception:
+                        pass
+
+    if global_max == -math.inf:
+        y_top = None
+    else:
+        # add a small headroom so lines don't touch the top
+        y_top = (1.05 * global_max) if global_max != 0 else 1.0
+    # --- end new code ---
+
     fig, axes = plt.subplots(
         nrows=nrows,
         ncols=ncols,
@@ -287,7 +325,6 @@ def main() -> None:
     for idx, env_name in enumerate(env_names):
         ax = axes_iter[idx]
         project_map = env_to_project_dfs[env_name]
-        plotted = False
         total_runs = sum(len(dfs) for dfs in project_map.values())
         # iterate only projects that have data for this env, but use global colors
         for project_idx, project_label in enumerate(sorted(project_map)):
@@ -332,13 +369,17 @@ def main() -> None:
                     y_lower = std_bounds["lower"].to_numpy(dtype=float)
                     y_upper = std_bounds["upper"].to_numpy(dtype=float)
                     ax.fill_between(x_s, y_lower, y_upper, color=color, alpha=0.18)
-            plotted = True
 
         ax.set_title(f"{env_name} ({total_runs} run{'s' if total_runs != 1 else ''})")
         ax.set_xlabel("step")
         ax.set_ylabel("metric value")
         ax.grid(True, alpha=0.3)
         ax.legend(loc="best", fontsize=8)
+
+        # --- New: enforce same top y-limit across all subplots ---
+        if y_top is not None:
+            ax.set_ylim(top=y_top)
+        # --- end new code ---
 
     for ax in axes_iter[n_envs:]:
         ax.set_visible(False)
