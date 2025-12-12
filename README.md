@@ -8,6 +8,7 @@
     - [Single file Acme TF with Reverb and Sonnet](#single-file-acme-tf-with-reverb-and-sonnet)
     - [Visualize ATFRS](#visualize-atfrs)
   - [Implementing based on ATFRS in PyTorch](#implementing-based-on-atfrs-in-pytorch)
+    - [Visualize AcmePyTorch](#visualize-acmepytorch)
     - [Video generation Acme in PyTorch](#video-generation-acme-in-pytorch)
   - [Implementing from scratch in PyTorch](#implementing-from-scratch-in-pytorch)
     - [Visualize wandb](#visualize-wandb)
@@ -83,6 +84,14 @@ pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb 
 
 python src/acme_pytorch/train_custom_acme_pytorch_mpo.py --max_actor_steps 3000000 --wandb_project acme_pytorch_3 --env_name walker::walk
 ```
+
+### Visualize AcmePyTorch
+
+```bash
+python src/visualize_wandb.py --project-metric "acme_pytorch_perf::eval/episode_return" --entity "adrian-research" --cache-dir logs --show-individual --output results/custom_acme_pytorch.png
+```
+
+![Custom Results](results/custom_acme_pytorch.png)
 
 ### Video generation Acme in PyTorch
 

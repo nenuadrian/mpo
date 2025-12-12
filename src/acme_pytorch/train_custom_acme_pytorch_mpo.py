@@ -1293,9 +1293,7 @@ def train(
     stop_event = threading.Event()
     step_lock = threading.Lock()
     shared_state = {"steps": 0}
-    policy_sync_interval = max(1, policy_sync_interval)
 
-    # Instantiate actor / learner / evaluator objects and run them in threads.
     actor_obj = Actor(
         agent=agent,
         env_name=env_name,
