@@ -12,7 +12,7 @@ pairs=(
   "walker stand"
   "acrobot swingup"
   "swimmer swimmer6"
-  "sweimmer swimmer15"
+  "swimmer swimmer15"
   "pendulum swingup"
   "cheetah run"
 )
