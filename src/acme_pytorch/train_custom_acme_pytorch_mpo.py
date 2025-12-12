@@ -873,7 +873,6 @@ class EnvironmentLoop:
         self._actor = actor
         self._step_lock = step_lock
         self._shared_state = shared_state
-        self._total_steps = 0
 
     def run_episode(self):
         episode_return = 0.0
@@ -917,7 +916,6 @@ class EnvironmentLoop:
             "episode_return": episode_return,
             "episode_duration": duration,
             "steps_per_second": episode_steps / duration if duration > 0 else 0.0,
-            "total_steps": self._total_steps,
         }
         return result
 
