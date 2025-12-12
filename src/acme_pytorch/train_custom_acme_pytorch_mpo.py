@@ -575,8 +575,6 @@ class MPOAgent:
         lr_policy=1e-4,
         lr_critic=1e-4,
         clip_norm: float = 40.0,
-        use_torch_compile: bool = False,
-        use_fused_adam: bool = False,
         action_penalization=True,
         per_dim=True,
         samples_per_insert=32.0,
@@ -645,36 +643,9 @@ class MPOAgent:
             init_log_alpha_stddev=1000.0,
         ).to(device)
 
-        # Optionally use torch.compile on hot modules (PyTorch 2.0+). Do this before creating optimizers.
-        self._use_torch_compile = bool(use_torch_compile and hasattr(torch, "compile"))
-        if self._use_torch_compile:
-            try:
-                # compile the core modules used in the inner loop
-                self.obs_encoder = torch.compile(self.obs_encoder)
-                self.policy_head = torch.compile(self.policy_head)
-                self.critic = torch.compile(self.critic)
-                # mpo_loss is slightly heavier; compile if available
-                self.mpo_loss = torch.compile(self.mpo_loss)
-            except Exception:
-                # If compile fails, continue with uncompiled modules (safe fallback).
-                self._use_torch_compile = False
-
-        # Create optimizers after optional compilation so they reference right params.
-        self._use_fused_adam = bool(use_fused_adam)
-        OptimCls = optim.Adam
-        if self._use_fused_adam:
-            try:
-                # Try NVIDIA apex fused Adam if installed.
-                from apex.optimizers import FusedAdam
-
-                OptimCls = FusedAdam
-            except Exception:
-                # fallback to torch's Adam if fused optimizer not available.
-                OptimCls = optim.Adam
-
-        self._critic_optimizer = OptimCls(self.critic.parameters(), lr=lr_critic)
-        self._policy_optimizer = OptimCls(self.policy_head.parameters(), lr=lr_policy)
-        self._dual_optimizer = OptimCls(self.mpo_loss.parameters(), lr=lr_dual)
+        self._critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
+        self._policy_optimizer = optim.Adam(self.policy_head.parameters(), lr=lr_policy)
+        self._dual_optimizer = optim.Adam(self.mpo_loss.parameters(), lr=lr_dual)
 
         self._replay_lock = threading.Lock()
         self._param_lock = threading.Lock()
@@ -1183,7 +1154,7 @@ class Evaluator:
             self.setup_local_modules()
             # Run a single episode (EnvironmentLoop will log via wandb using actor.label).
             loop.run(num_episodes=1)
-            time.sleep(0.5)  # slight delay between episodes
+            time.sleep(2.0) 
         env.close()
 
 
@@ -1272,8 +1243,6 @@ def train(
     log_dir: str,
     policy_sync_interval: int,
     clip_norm: float = 40.0,
-    use_torch_compile: bool = False,
-    use_fused_adam: bool = False,
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -1319,8 +1288,6 @@ def train(
         lr_dual=lr_dual,
         min_replay_size=min_replay_size,
         clip_norm=clip_norm,
-        use_torch_compile=use_torch_compile,
-        use_fused_adam=use_fused_adam,
     )
 
     stop_event = threading.Event()
@@ -1419,16 +1386,6 @@ def parse_args():
         default=40.0,
         help="Gradient clipping max-norm; set to 0 to disable clipping.",
     )
-    parser.add_argument(
-        "--use_torch_compile",
-        action="store_true",
-        help="Enable torch.compile (PyTorch 2.0+) for model forward/backward acceleration.",
-    )
-    parser.add_argument(
-        "--use_fused_adam",
-        action="store_true",
-        help="Try to use fused Adam (apex) for optimizer speed; falls back to torch.optim.Adam.",
-    )
     return parser.parse_args()
 
 
@@ -1480,8 +1437,6 @@ if __name__ == "__main__":
         log_dir=log_dir,
         policy_sync_interval=args.policy_sync_interval,
         clip_norm=args.clip_norm,
-        use_torch_compile=args.use_torch_compile,
-        use_fused_adam=args.use_fused_adam,
     )
 
     wandb.finish()
