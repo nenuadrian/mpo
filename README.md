@@ -12,6 +12,20 @@
   - [Implementing from scratch in PyTorch](#implementing-from-scratch-in-pytorch)
     - [Visualize wandb](#visualize-wandb)
     - [Video generation](#video-generation)
+  - [discovery: ACME – Google DM](#discovery-acme--google-dm)
+    - [Overview](#overview)
+    - [Notes](#notes)
+    - [Important Code](#important-code)
+      - [Maximum a Posteriori Policy Optimisation (MPO)](#maximum-a-posteriori-policy-optimisation-mpo)
+      - [Distributional MPO (DMPO)](#distributional-mpo-dmpo)
+      - [Multi-Objective MPO (MO-MPO)](#multi-objective-mpo-mo-mpo)
+      - [Mixture of Gaussian Distributional MPO (MoG-DMPO)](#mixture-of-gaussian-distributional-mpo-mog-dmpo)
+    - [Baselines](#baselines)
+    - [MPO Benchmarks](#mpo-benchmarks)
+    - [RLAX – Google DM](#rlax--google-dm)
+      - [Overview rlax](#overview-rlax)
+      - [Important Docs and Code](#important-docs-and-code)
+    - [Other Implementations](#other-implementations)
 
 ## Original MPO Paper
 
@@ -101,3 +115,103 @@ python src/pytorch_custom/generate_video_custom_pytorch_mpo.py logs/mpo_experime
 ```
 
 ![MPO Video](assets/cheetah.gif)
+
+## discovery: ACME – Google DM
+
+### Overview
+
+- **Paper:** [2006.00979] *Acme: A Research Framework for Distributed Reinforcement Learning*  
+- **Code:** https://github.com/google-deepmind/acme/tree/master  
+- **Agents:** https://github.com/google-deepmind/acme/blob/master/docs/user/agents.md?plain=1  
+- **Docs:** https://dm-acme.readthedocs.io/en/latest/
+
+### Notes
+
+- Installation is difficult due to deprecated libraries, old NumPy versions, and CUDA dependencies that are incompatible with current GPUs.
+- A fork was created with modified `setup.py` and `README.md`, but errors persist:  
+  https://github.com/nenuadrian/acme
+- Test files do not run; version constraints are inconsistent and incompatible.
+- Official notebooks (Acme tutorial, Colab) do not work.
+- After extensive manual fixes, the framework still fails to run reliably.
+- Unable to execute successfully on CPU, GPU, or TPU.
+
+### Important Code
+
+#### Maximum a Posteriori Policy Optimisation (MPO)
+
+- **Paper:** [1806.06920] *Maximum a Posteriori Policy Optimisation*  
+- **Code:**
+  - https://github.com/google-deepmind/acme/tree/master/acme/agents/jax/mpo  
+  - https://github.com/google-deepmind/acme/blob/master/acme/agents/tf/mpo  
+
+#### Distributional MPO (DMPO)
+
+- **Paper:** Unpublished  
+- **Inspiration:** C51 — [1707.06887] *A Distributional Perspective on Reinforcement Learning*  
+- **Docs:** https://dm-acme.readthedocs.io/en/latest/user/agents.html#continuous-control  
+- **Code:** https://github.com/google-deepmind/acme/tree/master/acme/agents/tf/dmpo  
+
+#### Multi-Objective MPO (MO-MPO)
+
+- **Paper:** [2005.07513] *A Distributional View on Multi-Objective Policy Optimization*  
+- **Site:** https://sites.google.com/view/mo-mpo/humanoid  
+- **Code:** https://github.com/google-deepmind/acme/tree/master/acme/agents/tf/mompo  
+
+#### Mixture of Gaussian Distributional MPO (MoG-DMPO)
+
+- Uses Gaussian mixture critics instead of C51-style categorical critics.  
+- **Paper:** [2204.10256] *Revisiting Gaussian Mixture Critics in Off-Policy Reinforcement Learning: A Sample-Based Approach*  
+- **Code:**
+  - https://github.com/google-deepmind/acme/tree/master/acme/agents/tf/mog_mpo  
+  - https://github.com/google-deepmind/acme/tree/master/acme/agents/jax/mpo  
+- Comments in code indicate support for:
+  - MoG vs non-MoG critics
+  - Continuous vs discrete policies
+
+### Baselines
+
+- https://github.com/google-deepmind/acme/blob/master/examples/baselines/rl_continuous/run_dmpo.py  
+- https://github.com/google-deepmind/acme/blob/master/examples/baselines/rl_continuous/run_mogmpo.py  
+- https://github.com/google-deepmind/acme/blob/master/examples/tf/control_suite/lp_mpo.py  
+- https://github.com/google-deepmind/acme/blob/master/examples/tf/control_suite/lp_dmpo.py  
+
+### MPO Benchmarks
+
+- [2006.00979] *Acme: A Research Framework for Distributed Reinforcement Learning*  
+- [2204.10256] *Revisiting Gaussian Mixture Critics in Off-Policy Reinforcement Learning: A Sample-Based Approach*  
+- [2005.07513] *A Distributional View on Multi-Objective Policy Optimization*  
+
+### RLAX – Google DM
+
+#### Overview rlax
+
+- Functional RL library used by Acme.
+- **Code:** https://github.com/google-deepmind/rlax/tree/main  
+- **Docs:** https://rlax.readthedocs.io/en/latest/index.html  
+
+#### Important Docs and Code
+
+- **MPO Compute Weights and Temperature Loss:**  
+  https://rlax.readthedocs.io/en/latest/api.html#mpo-compute-weights-and-temperature-loss  
+
+- **MPO Loss:**  
+  https://rlax.readthedocs.io/en/latest/api.html#mpo-loss  
+
+- **MPO Compute Weights and Temperature Loss (duplicate reference):**  
+  https://rlax.readthedocs.io/en/latest/api.html#id1  
+
+- **VMPO Loss:**  
+  https://rlax.readthedocs.io/en/latest/api.html#vmpo-loss  
+
+---
+
+### Other Implementations
+
+- **JAX (≈5 years old, could not run):**  
+  https://github.com/escontra/MPO-JAX.git  
+
+- **PyTorch (≈5 years old, could not run):**  
+  https://github.com/acyclics/MPO  
+
+- **PyTorch (≈5 years old, could not run):**  
+  https://github.com/daisatojp/mpo  
