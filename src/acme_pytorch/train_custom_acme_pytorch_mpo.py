@@ -574,7 +574,7 @@ class MPOAgent:
         target_critic_update_period=100,
         lr_policy=1e-4,
         lr_critic=1e-4,
-        clipping=True,
+        clip_norm: float = 40.0,
         action_penalization=True,
         per_dim=True,
         samples_per_insert=32.0,
@@ -591,7 +591,9 @@ class MPOAgent:
         self.num_samples = num_samples
         self.target_policy_update_period = target_policy_update_period
         self.target_critic_update_period = target_critic_update_period
-        self.clipping = clipping
+        # clip_norm > 0 enables gradient clipping to that max-norm value.
+        self.clip_norm = float(clip_norm)
+        self.clipping_enabled = self.clip_norm > 0.0
 
         # new: store configurable minimum replay size for learning
         self.min_replay_size = int(min_replay_size)
@@ -776,24 +778,23 @@ class MPOAgent:
 
         # target mean/scale already computed as t_mean/t_scale (from above, no_grad)
         # compute MPO loss with sampled_actions and q_samples
-        policy_loss, policy_stats  = self.mpo_loss(
+        policy_loss, policy_stats = self.mpo_loss(
             sampled_actions, q_samples, online_mean, online_scale, t_mean, t_scale
         )
 
         with self._param_lock:
             self._critic_optimizer.zero_grad()
             critic_loss.backward()
-            if self.clipping:
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 40.0)
+            if self.clipping_enabled:
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.clip_norm)
             self._critic_optimizer.step()
 
             self._policy_optimizer.zero_grad()
             self._dual_optimizer.zero_grad()
             policy_loss.backward()
-            if self.clipping:
+            if self.clipping_enabled:
                 torch.nn.utils.clip_grad_norm_(
-                    list(self.policy_head.parameters()),
-                    40.0,
+                    list(self.policy_head.parameters()), self.clip_norm
                 )
             self._policy_optimizer.step()
             self._dual_optimizer.step()
@@ -874,8 +875,10 @@ class EnvironmentLoop:
         self._actor = actor
         self._step_lock = step_lock
         self._shared_state = shared_state
+        self._episodes = 0
+        self._total_steps = 0
 
-    def run_episode(self):
+    def _run_episode(self):
         episode_return = 0.0
         episode_steps = 0
 
@@ -904,7 +907,7 @@ class EnvironmentLoop:
             episode_steps += 1
             obs_flat = next_flat
 
-            if (self._actor.stop_event.is_set()):
+            if self._actor.stop_event.is_set():
                 break
 
         duration = time.time() - start_time
@@ -936,12 +939,15 @@ class EnvironmentLoop:
         steps_done = 0
         total_steps = 0
         while not should_terminate(episodes, steps_done):
-            episode_result = self.run_episode()
+            episode_result = self._run_episode()
+            self._episodes += 1
             episodes += 1
             steps_done = int(self._shared_state.get("steps", 0)) - steps_at_start
             total_steps += episode_result["episode_length"]
-            episode_result["total_episodes"] = episodes
-            episode_result["total_steps"] = steps_done
+            self._episodes += 1
+            self._total_steps += episode_result["episode_length"]
+            episode_result["total_episodes"] = self._episodes
+            episode_result["total_steps"] = self._total_steps
             wandb.log(
                 {self._actor.label + "/" + k: v for k, v in episode_result.items()}
             )
@@ -1148,8 +1154,6 @@ class Evaluator:
             self.setup_local_modules()
             # Run a single episode (EnvironmentLoop will log via wandb using actor.label).
             loop.run(num_episodes=1)
-            # Brief sleep to avoid tight loop in case episodes are very short.
-            time.sleep(0.01)
         env.close()
 
 
@@ -1237,6 +1241,7 @@ def train(
     seed: int,
     log_dir: str,
     policy_sync_interval: int,
+    clip_norm: float = 40.0,
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -1281,6 +1286,7 @@ def train(
         lr_critic=lr,
         lr_dual=lr_dual,
         min_replay_size=min_replay_size,
+        clip_norm=clip_norm,
     )
 
     stop_event = threading.Event()
@@ -1373,6 +1379,12 @@ def parse_args():
     parser.add_argument("--wandb_group_prefix", type=str, default=None)
     parser.add_argument("--base_log_dir", type=str, default="./logs/mpo_experiment")
     parser.add_argument("--policy_sync_interval", type=int, default=1000)
+    parser.add_argument(
+        "--clip_norm",
+        type=float,
+        default=40.0,
+        help="Gradient clipping max-norm; set to 0 to disable clipping.",
+    )
     return parser.parse_args()
 
 
@@ -1423,6 +1435,7 @@ if __name__ == "__main__":
         seed=seed,
         log_dir=log_dir,
         policy_sync_interval=args.policy_sync_interval,
+        clip_norm=args.clip_norm,
     )
 
     wandb.finish()
