@@ -67,7 +67,7 @@ python src/acme_tf_custom/train_acme_tf_mpo.py --max_actor_steps 3000000 --domai
 ### Visualize ATFRS
 
 ```bash
-python src/visualize_wandb.py --project-metric "lp_mpo_single_file::evaluator/episode_return"  --entity "adrian-research" --cache-dir logs --show-individual --output results/custom_acme_tf.png --ncols 4
+python src/visualize_wandb.py --project-metric "G_ACME_TF_CUSTOM::evaluator/episode_return"  --entity "adrian-research" --cache-dir logs --show-individual --output results/custom_acme_tf.png --ncols 2
 ```
 
 ![Custom Acme TF Results](results/custom_acme_tf.png)
