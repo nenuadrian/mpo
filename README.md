@@ -70,8 +70,6 @@ pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb 
 python src/acme_pytorch/train_custom_acme_pytorch_mpo.py --max_actor_steps 3000000 --wandb_project acme_pytorch_3 --env_name walker::walk
 ```
 
-![Acme PyTorch Results](results/custom_acme_pytorch.png)
-
 ### Video generation Acme in PyTorch
 
 ```bash
