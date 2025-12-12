@@ -22,6 +22,7 @@ import tree  # type: ignore
 import operator
 import os
 import sys
+import random
 
 import reverb_transition as adders
 
@@ -1714,7 +1715,28 @@ def parse_args():
 
 
 def main(args):
+    # Determine and set seed early to ensure reproducibility.
+    seed = int(time.time() * 1000) % (2**31 - 1)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        tf.random.set_seed(seed)
+    except Exception:
+        pass
+    # Try enabling TF deterministic ops if available (best-effort).
+    try:
+        tf.config.experimental.enable_op_determinism()
+    except Exception:
+        # Not available on all TF versions; ignore if not present.
+        pass
+
+    # Use domain/task-based identifier and log seed into wandb config.
+    experiment_identifier = f"{args.domain}_{args.task}__{seed}_" + time.strftime(
+        "%Y%m%d-%H%M%S"
+    )
     wandb.init(
+        name=experiment_identifier,
         entity="adrian-research",
         group=f"{args.domain}_{args.task}",
         project="lp_mpo_single_file",
@@ -1722,6 +1744,7 @@ def main(args):
             "domain": args.domain,
             "task": args.task,
             "max_actor_steps": args.max_actor_steps,
+            "seed": seed,
         },
     )
     _timeout_timer = None

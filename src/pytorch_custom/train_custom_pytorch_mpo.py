@@ -17,8 +17,8 @@ import wandb
 import imageio
 import logging
 
-from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage # type: ignore
-from tensordict import TensorDict # type: ignore
+from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage  # type: ignore
+from tensordict import TensorDict  # type: ignore
 
 
 LOGGER_NAME = "mpo"
@@ -1220,12 +1220,7 @@ def train_mpo(config: MPOConfig, device: torch.device) -> GaussianPolicy:
 
 def main():
     parser = argparse.ArgumentParser(description="Train MPO")
-    parser.add_argument(
-        "--env_names",
-        type=str,
-        default="HalfCheetah-v5",
-        help="Comma-separated list of environment names to train on",
-    )
+    parser.add_argument("--env_name", type=str, default="HalfCheetah-v5")
     parser.add_argument("--env_iterations", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--max_actor_steps", type=int, default=1500000)
@@ -1260,94 +1255,72 @@ def main():
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
     else:
         device = torch.device("cpu")
     print(f"Using device: {device}")
-    env_names = [name.strip() for name in args.env_names.split(",")]
-    for env_name in env_names:
-        for iteration in range(args.env_iterations):
-            print(
-                f"Training on environment: {env_name}. Starting iteration {iteration + 1}/{args.env_iterations}"
+    seed = int(time.time()) % 10000
+
+    experiment_identifier = (
+        args.env_name + f"_seed{seed}" + "_" + time.strftime("%Y%m%d-%H%M%S")
+    )
+
+    config = MPOConfig(
+        env_name=args.env_name,
+        seed=seed,
+        log_dir=os.path.join(
+            args.base_log_dir, args.wandb_project + "_" + experiment_identifier
+        ),
+        **vars(args),
+    )
+    os.makedirs(config.log_dir, exist_ok=True)
+
+    print("Experiment Configuration:")
+    print(json.dumps(vars(config), indent=4))
+
+    with open(os.path.join(config.log_dir, "config.json"), "w") as f:
+        json.dump(vars(config), f, indent=4)
+    wandb.init(
+        name=experiment_identifier,
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        group=(
+            f"{args.wandb_group_prefix}_mpo_{args.env_name}"
+            if args.wandb_group_prefix
+            else f"mpo_{args.env_name}"
+        ),
+        config=vars(args),
+        dir=config.log_dir,
+    )
+
+    train_mpo(config, device)
+
+    try:
+        env = make_offscreen_env(args.env_name)
+        policy = GaussianPolicy(
+            env.observation_space.shape[0],
+            env.action_space.shape[0],
+            env.action_space.low,
+            env.action_space.high,
+        )
+        policy.eval()
+        ckpt_path = os.path.join(config.log_dir, "checkpoints", "checkpoint_maxeval.pt")
+        print(f"Loading policy from checkpoint: {ckpt_path}")
+        with torch.inference_mode():
+            load_policy_from_checkpoint(ckpt_path, policy)
+            generate_video(
+                env_name=args.env_name,
+                env=env,
+                policy=policy,
+                output_path=os.path.join(config.log_dir, "video.mp4"),
+                num_episodes=2,
+                max_steps=1000,
+                fps=30,
+                deterministic=False,
             )
-            start_time = time.time()
+    except Exception as e:
+        print(f"[ERROR] Warning: video generation failed: {e}")
 
-            seed = int(time.time()) % 10000
-
-            experiment_identifier = (
-                env_name
-                + "__iter"
-                + str(iteration + 1)
-                + f"_seed{seed}"
-                + "_"
-                + time.strftime("%Y%m%d-%H%M%S")
-            )
-
-            config = MPOConfig(
-                env_name=env_name,
-                seed=seed,
-                log_dir=os.path.join(
-                    args.base_log_dir, args.wandb_project + "_" + experiment_identifier
-                ),
-                **vars(args),
-            )
-            os.makedirs(config.log_dir, exist_ok=True)
-
-            print("Experiment Configuration:")
-            print(json.dumps(vars(config), indent=4))
-
-            with open(os.path.join(config.log_dir, "config.json"), "w") as f:
-                json.dump(vars(config), f, indent=4)
-            wandb.init(
-                name=experiment_identifier,
-                project=args.wandb_project,
-                entity=args.wandb_entity,
-                group=(
-                    f"{args.wandb_group_prefix}_mpo_{env_name}"
-                    if args.wandb_group_prefix
-                    else f"mpo_{env_name}"
-                ),
-                config=vars(args),
-                dir=config.log_dir,
-            )
-
-            train_mpo(config, device)
-
-            try:
-                env = make_offscreen_env(env_name)
-                policy = GaussianPolicy(
-                    env.observation_space.shape[0],
-                    env.action_space.shape[0],
-                    env.action_space.low,
-                    env.action_space.high,
-                )
-                policy.eval()
-                ckpt_path = os.path.join(
-                    config.log_dir, "checkpoints", "checkpoint_maxeval.pt"
-                )
-                print(f"Loading policy from checkpoint: {ckpt_path}")
-                with torch.inference_mode():
-                    load_policy_from_checkpoint(ckpt_path, policy)
-                    generate_video(
-                        env_name=env_name,
-                        env=env,
-                        policy=policy,
-                        output_path=os.path.join(config.log_dir, "video.mp4"),
-                        num_episodes=2,
-                        max_steps=1000,
-                        fps=30,
-                        deterministic=False,
-                    )
-            except Exception as e:
-                print(f"[ERROR] Warning: video generation failed: {e}")
-
-            wandb.finish()
-            end_time = time.time()
-            print(
-                f"Iteration {iteration + 1}/{args.env_iterations} completed in "
-                f"{end_time - start_time:.2f} seconds."
-            )
+    wandb.finish()
 
 
 if __name__ == "__main__":

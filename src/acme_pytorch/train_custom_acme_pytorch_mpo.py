@@ -18,7 +18,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import wandb
-import shimmy
 import torch.distributions as dist
 
 from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage
@@ -1427,7 +1426,7 @@ if __name__ == "__main__":
     seed = int(time.time()) % 10000
 
     experiment_identifier = (
-        args.env_name + f"_seed{seed}" + "_" + time.strftime("%Y%m%d-%H%M%S")
+        args.env_name + f"__seed{seed}" + "_" + time.strftime("%Y%m%d-%H%M%S")
     )
     log_dir = os.path.join(
         args.base_log_dir, args.wandb_project + "_" + experiment_identifier
