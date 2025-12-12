@@ -625,6 +625,7 @@ class MPOAgent:
         self.target_obs_encoder = copy.deepcopy(self.obs_encoder).to(device)
         self.target_policy_head = copy.deepcopy(self.policy_head).to(device)
         self.target_critic = copy.deepcopy(self.critic).to(device)
+        self.target_critic.obs_net = self.target_obs_encoder
 
         self.mpo_loss = MPOLoss(
             action_dim=action_dim,
@@ -803,24 +804,19 @@ class MPOAgent:
         # Update target policy head (periodic).
         if self._learn_steps % self.target_policy_update_period == 0:
             self.target_policy_head.load_state_dict(self.policy_head.state_dict())
-            self.target_obs_encoder.load_state_dict(self.obs_encoder.state_dict())
         # Update target critic and the target observation encoder (periodic).
         if self._learn_steps % self.target_critic_update_period == 0:
-            self.target_critic.load_state_dict(self.critic.state_dict())
+            self.target_critic.critic.load_state_dict(self.critic.critic.state_dict())
+            self.target_obs_encoder.load_state_dict(self.obs_encoder.state_dict())
 
         fetches = {
             "critic_loss": float(critic_loss.item()),
             "learn_steps": self._learn_steps,
+            "td_error_mean": td_error_mean,
+            "td_target_mean": target_mean,
+            "q_min": q_min,
+            "q_max": q_max,
         }
-        fetches.update(
-            {
-                "td_error_mean": td_error_mean,
-                "td_target_mean": target_mean,
-            }
-        )
-
-        fetches["q_min"] = q_min
-        fetches["q_max"] = q_max
 
         fetches.update(stats)
         return fetches
@@ -1417,7 +1413,7 @@ def parse_args():
     parser.add_argument("--wandb_entity", type=str, default="adrian-research")
     parser.add_argument("--wandb_group_prefix", type=str, default=None)
     parser.add_argument("--base_log_dir", type=str, default="./logs/mpo_experiment")
-    parser.add_argument("--policy_sync_interval", type=int, default=500)
+    parser.add_argument("--policy_sync_interval", type=int, default=1000)
     return parser.parse_args()
 
 

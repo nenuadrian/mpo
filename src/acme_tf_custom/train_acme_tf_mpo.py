@@ -690,7 +690,7 @@ class MPO:
         additional_discount: float = 0.99,
         target_policy_update_period: int = 100,
         target_critic_update_period: int = 100,
-        variable_update_period: int = 1000,
+        policy_sync_interval: int = 1000,
         domain_name: str = "cartpole",
         task_name: str = "balance",
     ):
@@ -722,7 +722,7 @@ class MPO:
         self._num_samples = num_samples
         self._target_policy_update_period = target_policy_update_period
         self._target_critic_update_period = target_critic_update_period
-        self._variable_update_period = variable_update_period
+        self._policy_sync_interval = policy_sync_interval
         self._max_actor_steps = max_actor_steps
 
     def replay(self):
@@ -840,7 +840,7 @@ class MPO:
             policy_network=behavior_network,
             adder=adder,
             learner=learner,
-            update_period=self._variable_update_period,
+            update_period=self._policy_sync_interval,
         )
 
         # Create the run loop and return it.
@@ -876,7 +876,7 @@ class MPO:
         evaluator = EvaluatorActor(
             policy_network=evaluator_network,
             learner=learner,
-            update_period=self._variable_update_period,
+            update_period=self._policy_sync_interval,
         )
 
         return EnvironmentLoop(environment=environment, actor=evaluator)
@@ -1708,7 +1708,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train ACME MPO agent.")
     parser.add_argument("--domain", default="cartpole")
     parser.add_argument("--task", default="balance")
-    parser.add_argument("--max_actor_steps", type=int, default=None)
+    parser.add_argument("--max_actor_steps", type=int, default=3_000_000)
     parser.add_argument("--n_step", type=int, default=5)
     parser.add_argument("--timeout", type=int, default=None)
     return parser.parse_args()
