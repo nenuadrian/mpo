@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 
 pairs=(
-    #  "cheetah run"
+    "cheetah run"
     "hopper stand"
     "walker walk"
-    "humanoid run"
     "cartpole balance"
     "walker run"
     "reacher easy"
@@ -26,5 +25,5 @@ for pair in "${pairs[@]}"; do
         --domain "${domain}" \
         --task "${task}" \
         --max_actor_steps 10000000 \
-        --n_step 5 --timeout 3600
+        --n_step 5 --timeout 1800 --wandb_project "train_acme_tf_mpo_5"
 done

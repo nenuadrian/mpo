@@ -1711,6 +1711,9 @@ def parse_args():
     parser.add_argument("--max_actor_steps", type=int, default=3_000_000)
     parser.add_argument("--n_step", type=int, default=5)
     parser.add_argument("--timeout", type=int, default=None)
+    parser.add_argument("--wandb_project", type=str, default="mpo_project")
+    parser.add_argument("--wandb_entity", type=str, default="adrian-research")
+    parser.add_argument("--wandb_group_prefix", type=str, default=None)
     return parser.parse_args()
 
 
@@ -1720,31 +1723,27 @@ def main(args):
 
     random.seed(seed)
     np.random.seed(seed)
-    try:
-        tf.random.set_seed(seed)
-    except Exception:
-        pass
-    # Try enabling TF deterministic ops if available (best-effort).
-    try:
-        tf.config.experimental.enable_op_determinism()
-    except Exception:
-        # Not available on all TF versions; ignore if not present.
-        pass
+    tf.random.set_seed(seed)
 
-    # Use domain/task-based identifier and log seed into wandb config.
     experiment_identifier = f"{args.domain}_{args.task}__{seed}_" + time.strftime(
         "%Y%m%d-%H%M%S"
     )
     wandb.init(
         name=experiment_identifier,
-        entity="adrian-research",
-        group=f"{args.domain}_{args.task}",
-        project="lp_mpo_single_file",
+        entity=args.wandb_entity,
+        group=(
+            f"{args.wandb_group_prefix}_{args.domain}_{args.task}"
+            if args.wandb_group_prefix
+            else f"{args.domain}_{args.task}"
+        ),
+        project=args.wandb_project,
         config={
             "domain": args.domain,
             "task": args.task,
             "max_actor_steps": args.max_actor_steps,
             "seed": seed,
+            "n_step": args.n_step,
+            "timeout": args.timeout,
         },
     )
     _timeout_timer = None

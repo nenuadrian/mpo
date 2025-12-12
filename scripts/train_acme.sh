@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 
 pairs=(
-# "hopper stand"
-# "walker walk"
-  "humanoid run"
+  "hopper stand"
+  "hopper hop"
   "cartpole balance"
+  "walker walk"
   "walker run"
+  "walker stand"
   "reacher easy"
   "reacher hard"
-  "hopper hop"
-  "walker stand"
   "acrobot swingup"
   "swimmer swimmer6"
   "swimmer swimmer15"
