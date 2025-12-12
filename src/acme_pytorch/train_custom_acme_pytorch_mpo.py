@@ -355,7 +355,7 @@ class MPOLoss(nn.Module):
             torch.full(alpha_shape, init_log_alpha_stddev, dtype=dtype, device=device)
         )
         if self._action_penalization:
-            self.log_penalty_temperature = nn.Parameter(
+            self._log_penalty_temperature = nn.Parameter(
                 torch.tensor([init_log_temperature], dtype=dtype, device=device)
             )
 
@@ -386,8 +386,8 @@ class MPOLoss(nn.Module):
                 self.log_alpha_stddev.data, self.min_log_alpha.to(dtype)
             )
             if self._action_penalization:
-                self.log_penalty_temperature.data = torch.maximum(
-                    self.log_penalty_temperature.data,
+                self._log_penalty_temperature.data = torch.maximum(
+                    self._log_penalty_temperature.data,
                     self.min_log_temperature.to(dtype),
                 )
 
@@ -412,7 +412,7 @@ class MPOLoss(nn.Module):
         # Optional MO-MPO penalty
         if self._action_penalization:
             penalty_temperature = (
-                F.softplus(self.log_penalty_temperature) + _MPO_FLOAT_EPSILON
+                F.softplus(self._log_penalty_temperature) + _MPO_FLOAT_EPSILON
             )
             diff_out_of_bound = actions - actions.clamp(-1.0, 1.0)  # [N,B,D]
             cost_out_of_bound = -diff_out_of_bound.norm(dim=-1)  # [N,B]
@@ -904,11 +904,7 @@ class EnvironmentLoop:
             episode_steps += 1
             obs_flat = next_flat
 
-            # If the actor exposes a stop_event and it's set, break early.
-            if (
-                getattr(self._actor, "stop_event", None) is not None
-                and self._actor.stop_event.is_set()
-            ):
+            if (self._actor.stop_event.is_set()):
                 break
 
         duration = time.time() - start_time
@@ -1371,7 +1367,7 @@ def parse_args():
     parser.add_argument("--target_policy_update_period", type=int, default=25)
     parser.add_argument("--target_critic_update_period", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--lr_dual", type=float, default=5e-4)
+    parser.add_argument("--lr_dual", type=float, default=1e-2)
     parser.add_argument("--wandb_project", type=str, default="mpo_project")
     parser.add_argument("--wandb_entity", type=str, default="adrian-research")
     parser.add_argument("--wandb_group_prefix", type=str, default=None)
