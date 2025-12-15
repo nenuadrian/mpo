@@ -864,8 +864,8 @@ class EnvironmentLoop:
             # Trigger evaluation periodically (actor has .evaluator)
             if hasattr(self._actor, "evaluator") and getattr(self._actor, "eval_interval_steps", None):
                 steps = int(self._shared_state.get("steps", 0))
-                # if steps > 0 and steps % self._actor.eval_interval_steps == 0:
-                self._actor.evaluator.run()
+                if steps > 0 and steps % self._actor.eval_interval_steps == 0:
+                    self._actor.evaluator.run()
 
             episode_return += float(reward)
             episode_steps += 1
@@ -1046,6 +1046,44 @@ class Actor:
             log_dict["global_actor_step"] = int(self.shared_state.get("steps", 0))
             wandb.log(log_dict)
             steps += 1
+
+    # New: collect steps without triggering learning (used for controlled data collection)
+    def collect_steps(self, max_steps: int):
+        """Collect up to max_steps environment interactions, inserting into replay but
+        without invoking learner or evaluator. Returns number of env steps collected."""
+        env = make_env(self.env_name)
+        self.setup_local_modules()
+        steps_left = max_steps
+        steps_collected = 0
+        obs, _ = env.reset()
+        obs_flat = flatten_observation(obs)
+        # observe_first is a no-op but keep call for symmetry
+        self.observe_first(obs_flat)
+        while steps_left > 0 and not self.stop_event.is_set():
+            action = self.select_action(obs_flat)
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = bool(terminated or truncated)
+            next_flat = flatten_observation(next_obs)
+            # insert transition (agent handles n-step accumulation)
+            self.observe(obs_flat, action, float(reward), next_flat, done)
+            # increment global step
+            self.post_step()
+            # periodic local policy sync (same logic as update uses a counter; emulate here)
+            self._sync_counter += 1
+            if self._sync_counter >= self.policy_sync_interval:
+                if self._actor_encoder is not None and self._actor_policy_head is not None:
+                    self.agent.copy_policy_to(self._actor_encoder, self._actor_policy_head)
+                    self._actor_encoder.eval()
+                    self._actor_policy_head.eval()
+                self._sync_counter = 0
+            obs_flat = next_flat
+            steps_left -= 1
+            steps_collected += 1
+            if done:
+                obs, _ = env.reset()
+                obs_flat = flatten_observation(obs)
+        env.close()
+        return steps_collected
 
 
 class Evaluator:
@@ -1228,6 +1266,9 @@ def train(
     clip_norm: float = 40.0,
     eval_interval_steps: int = 5000,
     max_learn_steps_per_call: int = 10,
+    # new params:
+    observations_per_iteration: int = 10000,
+    learner_steps_per_iteration: int = 1000,
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -1289,13 +1330,52 @@ def train(
         max_learn_steps_per_call=max_learn_steps_per_call,
     )
 
-    # Run actor and learning synchronously in the main thread (actor.maybe_learn performs learning).
-    actor_obj.run(max_actor_steps)
+    # 1) Fill buffer until it reaches min_replay_size (blocking collection).
+    while len(agent.replay) < max(1, agent.min_replay_size) and not stop_event.is_set():
+        needed = max(1, agent.min_replay_size) - len(agent.replay)
+        # collect in chunks to avoid overshooting excessively
+        chunk = min(needed, observations_per_iteration)
+        collected = actor_obj.collect_steps(chunk)
+        print(f"Collected {collected} steps; replay_size={len(agent.replay)}")
 
+    # 2) Iterative loop: collect data, run learner, then evaluator.
+    total_target = max_actor_steps
+    while shared_state.get("steps", 0) < total_target and not stop_event.is_set():
+        # collect specified number of observations (no learning during this collect)
+        collected = actor_obj.collect_steps(observations_per_iteration)
+        print(f"Iteration collect: {collected} steps; replay_size={len(agent.replay)}")
+
+        # run learner for up to learner_steps_per_iteration or until replay not ready
+        learner_steps = 0
+        while learner_steps < learner_steps_per_iteration and not stop_event.is_set():
+            stats = agent.learn_step()
+            if stats is None:
+                # if learner ran out of data/allowed samples, break early
+                break
+            # log learner stats to wandb
+            log_dict = {}
+            for key, value in stats.items():
+                if isinstance(value, torch.Tensor):
+                    log_dict["learner/" + key] = float(value.detach().cpu().item())
+                else:
+                    log_dict["learner/" + key] = value
+            log_dict["global_actor_step"] = int(shared_state.get("steps", 0))
+            wandb.log(log_dict)
+            learner_steps += 1
+
+        print(f"Learner ran {learner_steps} steps")
+
+        # always run evaluator after learner
+        try:
+            actor_obj.evaluator.run()
+        except Exception as e:
+            print(f"Evaluator run failed: {e}")
+
+    # finalize: save checkpoint as before
     ckpt_dir = os.path.join(log_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpt_path = os.path.join(ckpt_dir, f"checkpoint_{int(time.time())}.pt")
-    replay_state = agent.replay.state_dict()  # direct access (no locking)
+    replay_state = agent.replay.state_dict()
     checkpoint = {
         "obs_encoder": agent.obs_encoder.state_dict(),
         "policy_head": agent.policy_head.state_dict(),
@@ -1352,6 +1432,18 @@ def parse_args():
         default=10,
         help="Max learner steps executed each time maybe_learn is invoked.",
     )
+    parser.add_argument(
+        "--observations_per_iteration",
+        type=int,
+        default=10000,
+        help="Number of environment steps to collect into replay each iteration.",
+    )
+    parser.add_argument(
+        "--learner_steps_per_iteration",
+        type=int,
+        default=1000,
+        help="Maximum number of learner steps to run each iteration.",
+    )
     return parser.parse_args()
 
 
@@ -1405,6 +1497,9 @@ if __name__ == "__main__":
         clip_norm=args.clip_norm,
         eval_interval_steps=args.eval_interval_steps,
         max_learn_steps_per_call=args.max_learn_steps_per_call,
+        # new params
+        observations_per_iteration=args.observations_per_iteration,
+        learner_steps_per_iteration=args.learner_steps_per_iteration,
     )
 
     wandb.finish()
