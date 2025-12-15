@@ -106,6 +106,8 @@ python src/acme_pytorch/generate_video_acme_pytorch_mpo.py logs/mpo_experiment/i
 
 [src/acme_pytorch_sync/train_custom_acme_pytorch_mpo.py](src/acme_pytorch_sync/train_custom_acme_pytorch_mpo.py)
 
+![Custom Results](results/custom_acme_pytorch_sync.png)
+
 ## V - Implementation from scratch in PyTorch (not working)
 
 ```bash
