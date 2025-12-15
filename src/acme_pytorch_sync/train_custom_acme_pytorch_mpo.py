@@ -1336,14 +1336,12 @@ def train(
         # collect in chunks to avoid overshooting excessively
         chunk = min(needed, observations_per_iteration)
         collected = actor_obj.collect_steps(chunk)
-        print(f"Collected {collected} steps; replay_size={len(agent.replay)}")
 
     # 2) Iterative loop: collect data, run learner, then evaluator.
     total_target = max_actor_steps
     while shared_state.get("steps", 0) < total_target and not stop_event.is_set():
         # collect specified number of observations (no learning during this collect)
         collected = actor_obj.collect_steps(observations_per_iteration)
-        print(f"Iteration collect: {collected} steps; replay_size={len(agent.replay)}")
 
         # run learner for up to learner_steps_per_iteration or until replay not ready
         learner_steps = 0
@@ -1363,13 +1361,8 @@ def train(
             wandb.log(log_dict)
             learner_steps += 1
 
-        print(f"Learner ran {learner_steps} steps")
 
-        # always run evaluator after learner
-        try:
-            actor_obj.evaluator.run()
-        except Exception as e:
-            print(f"Evaluator run failed: {e}")
+        actor_obj.evaluator.run()
 
     # finalize: save checkpoint as before
     ckpt_dir = os.path.join(log_dir, "checkpoints")
