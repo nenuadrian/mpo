@@ -3,17 +3,17 @@
 - [On implementing Maximum a Posteriori Policy Optimization (MPO)](#on-implementing-maximum-a-posteriori-policy-optimization-mpo)
   - [Original MPO Paper](#original-mpo-paper)
   - [Using Google DeepMind Acme](#using-google-deepmind-acme)
-    - [Single file Acme TF with Launchpad and other dm- dependencies (ATFLDM)](#single-file-acme-tf-with-launchpad-and-other-dm--dependencies-atfldm)
+    - [I - Single file Acme TF with Launchpad and other dm- dependencies (ATFLDM)](#i---single-file-acme-tf-with-launchpad-and-other-dm--dependencies-atfldm)
       - [Visualize ATFLDM](#visualize-atfldm)
-    - [Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)](#single-file-acme-tf-with-only-dm-reverb-and-dm-sonnet-atfrs)
-    - [Visualize ATFRS](#visualize-atfrs)
-  - [PyTorch implementation based on ATFRS](#pytorch-implementation-based-on-atfrs)
+    - [II - Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)](#ii---single-file-acme-tf-with-only-dm-reverb-and-dm-sonnet-atfrs)
+      - [Visualize ATFRS](#visualize-atfrs)
+  - [III - PyTorch implementation based on ATFRS](#iii---pytorch-implementation-based-on-atfrs)
     - [Visualize AcmePyTorch](#visualize-acmepytorch)
     - [Video generation AcmePyTorch](#video-generation-acmepytorch)
-  - [Implementation from scratch in PyTorch (not working)](#implementation-from-scratch-in-pytorch-not-working)
+  - [IV - Implementation from scratch in PyTorch (not working)](#iv---implementation-from-scratch-in-pytorch-not-working)
     - [Visualize](#visualize)
     - [Video generation](#video-generation)
-  - [discovery: ACME – Google DM](#discovery-acme--google-dm)
+  - [Discovery: ACME – Google DM](#discovery-acme--google-dm)
     - [Overview](#overview)
     - [Notes](#notes)
     - [Important Code](#important-code)
@@ -26,7 +26,7 @@
     - [RLAX – Google DM](#rlax--google-dm)
       - [Overview rlax](#overview-rlax)
       - [Important Docs and Code](#important-docs-and-code)
-    - [Other Implementations](#other-implementations)
+  - [Other Implementations](#other-implementations)
 
 ## Original MPO Paper
 
@@ -34,11 +34,13 @@
 
 ## Using Google DeepMind Acme
 
-Very difficult to get it to build. TensorFlow version is only one that I was able to get working.
+Very difficult to get it to build. TensorFlow version is only one that I was able to get working: [examples/tf/control_suite/lp_mpo.py](https://github.com/nenuadrian/acme/blob/master/examples/tf/control_suite/lp_mpo.py).
 
-Combined all code necessary in [src/acme_tf_custom/train_acme_tf_mpo.py](src/acme_tf_custom/train_acme_tf_mpo.py). But still need a lot of the tricks I have documented in my `acme` fork.
+```bash
+python examples/tf/control_suite/lp_mpo.py
+```
 
-### Single file Acme TF with Launchpad and other dm- dependencies (ATFLDM)
+### I - Single file Acme TF with Launchpad and other dm- dependencies (ATFLDM)
 
 Somewhat consolidated code from within acme still depending on acme but brought toegther in one file. Depends on many DM projects such as `dm-reverb`, `dm-env`, `dm-tree`, `dm-launchpad`, `acme`, `sonnet` etc.
 
@@ -56,7 +58,7 @@ python src/acme_launchpad_tf/visualize_acme_results.py --output results/acme_tf.
 
 ![Acme Results](results/acme_tf.png)
 
-### Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)
+### II - Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)
 
 Not able to remove dependencies further as Sonnet and Reverb are tightly integrated. But removed Acme and Launchpad dependencies. [src/acme_tf_custom/train_acme_tf_mpo.py](src/acme_tf_custom/train_acme_tf_mpo.py)
 
@@ -64,7 +66,7 @@ Not able to remove dependencies further as Sonnet and Reverb are tightly integra
 python src/acme_tf_custom/train_acme_tf_mpo.py --max_actor_steps 3000000 --domain cheetah --task run
 ```
 
-### Visualize ATFRS
+#### Visualize ATFRS
 
 ```bash
 python src/visualize_wandb.py --project-metric "G_ACME_TF_CUSTOM::evaluator/episode_return"  --entity "adrian-research" --cache-dir logs --show-individual --output results/custom_acme_tf.png --ncols 2
@@ -72,7 +74,7 @@ python src/visualize_wandb.py --project-metric "G_ACME_TF_CUSTOM::evaluator/epis
 
 ![Custom Acme TF Results](results/custom_acme_tf.png)
 
-## PyTorch implementation based on ATFRS
+## III - PyTorch implementation based on ATFRS
 
 Python 3.10/3.11 is recommended. Based on the TF single file above.
 
@@ -99,7 +101,7 @@ python src/visualize_wandb.py --project-metric "acme_pytorch_perf::eval/episode_
 python src/acme_pytorch/generate_video_acme_pytorch_mpo.py logs/mpo_experiment/identifier/checkpoints/checkpoint_34234.pt --env_name cheetah::run --output mpo_acme_pytorch_cheetah_run.mp4
 ```
 
-## Implementation from scratch in PyTorch (not working)
+## IV - Implementation from scratch in PyTorch (not working)
 
 ```bash
 python3 -m venv .venv
@@ -125,7 +127,7 @@ python src/pytorch_custom/generate_video_custom_pytorch_mpo.py logs/mpo_experime
 
 ![MPO Video](assets/cheetah.gif)
 
-## discovery: ACME – Google DM
+## Discovery: ACME – Google DM
 
 ### Overview
 
@@ -214,7 +216,7 @@ python src/pytorch_custom/generate_video_custom_pytorch_mpo.py logs/mpo_experime
 
 ---
 
-### Other Implementations
+## Other Implementations
 
 - **JAX (≈5 years old, could not run):**  
   https://github.com/escontra/MPO-JAX.git  
