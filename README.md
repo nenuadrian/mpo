@@ -3,15 +3,15 @@
 - [On implementing Maximum a Posteriori Policy Optimization (MPO)](#on-implementing-maximum-a-posteriori-policy-optimization-mpo)
   - [Original MPO Paper](#original-mpo-paper)
   - [Using Google DeepMind Acme](#using-google-deepmind-acme)
-    - [Single file Acme TF with Launchpad and other dm- dependencies](#single-file-acme-tf-with-launchpad-and-other-dm--dependencies)
-      - [Visualize ALTFDM](#visualize-altfdm)
-    - [Single file Acme TF with Reverb and Sonnet](#single-file-acme-tf-with-reverb-and-sonnet)
+    - [Single file Acme TF with Launchpad and other dm- dependencies (ATFLDM)](#single-file-acme-tf-with-launchpad-and-other-dm--dependencies-atfldm)
+      - [Visualize ATFLDM](#visualize-atfldm)
+    - [Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)](#single-file-acme-tf-with-only-dm-reverb-and-dm-sonnet-atfrs)
     - [Visualize ATFRS](#visualize-atfrs)
-  - [Implementing based on ATFRS in PyTorch](#implementing-based-on-atfrs-in-pytorch)
+  - [PyTorch implementation based on ATFRS](#pytorch-implementation-based-on-atfrs)
     - [Visualize AcmePyTorch](#visualize-acmepytorch)
-    - [Video generation Acme in PyTorch](#video-generation-acme-in-pytorch)
-  - [Implementing from scratch in PyTorch](#implementing-from-scratch-in-pytorch)
-    - [Visualize wandb](#visualize-wandb)
+    - [Video generation AcmePyTorch](#video-generation-acmepytorch)
+  - [Implementation from scratch in PyTorch (not working)](#implementation-from-scratch-in-pytorch-not-working)
+    - [Visualize](#visualize)
     - [Video generation](#video-generation)
   - [discovery: ACME – Google DM](#discovery-acme--google-dm)
     - [Overview](#overview)
@@ -38,7 +38,7 @@ Very difficult to get it to build. TensorFlow version is only one that I was abl
 
 Combined all code necessary in [src/acme_tf_custom/train_acme_tf_mpo.py](src/acme_tf_custom/train_acme_tf_mpo.py). But still need a lot of the tricks I have documented in my `acme` fork.
 
-### Single file Acme TF with Launchpad and other dm- dependencies
+### Single file Acme TF with Launchpad and other dm- dependencies (ATFLDM)
 
 Somewhat consolidated code from within acme still depending on acme but brought toegther in one file. Depends on many DM projects such as `dm-reverb`, `dm-env`, `dm-tree`, `dm-launchpad`, `acme`, `sonnet` etc.
 
@@ -48,7 +48,7 @@ Somewhat consolidated code from within acme still depending on acme but brought 
 python src/acme_launchpad_tf/train_lp_mpo_single_file.py --max_actor_steps 3000000 --domain cheetah --task run
 ```
 
-#### Visualize ALTFDM
+#### Visualize ATFLDM
 
 ```bash
 python src/acme_launchpad_tf/visualize_acme_results.py --output results/acme_tf.png --metric episode_return --file "Cartpole_Balance::results/acme/mpo-tf-cartpole-balance.csv" --file "Hopper_Stand::results/acme/mpo-tf-hopper-stand.csv" --file "Hopper_Hop::results/acme/mpo-tf-hopper-hop.csv" --file "Walker_Walk::results/acme/mpo-tf-walker-walk.csv" --file "Walker_Run::results/acme/mpo-tf-walker-run.csv" --file "Walker_Stand::results/acme/mpo-tf-walker-stand.csv" --file "Reacher_Easy::results/acme/mpo-tf-reacher-easy.csv" --file "Reacher_Hard::results/acme/mpo-tf-reacher-hard.csv"  --file "Acrobot_Swingup::results/acme/mpo-tf-acrobot-swingup.csv"   --file "Pendulum_Swingup::results/acme/mpo-tf-pendulum-swingup.csv"  --file "Swimmer_Swimmer6::results/acme/mpo-tf-swimmer-swimmer6.csv" --file "Swimmer_Swimmer15::results/acme/mpo-tf-swimmer-swimmer15.csv" --file "Cheetah_Run::results/acme/mpo-tf-cheetah-run.csv" 
@@ -56,7 +56,7 @@ python src/acme_launchpad_tf/visualize_acme_results.py --output results/acme_tf.
 
 ![Acme Results](results/acme_tf.png)
 
-### Single file Acme TF with Reverb and Sonnet
+### Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)
 
 Not able to remove dependencies further as Sonnet and Reverb are tightly integrated. But removed Acme and Launchpad dependencies. [src/acme_tf_custom/train_acme_tf_mpo.py](src/acme_tf_custom/train_acme_tf_mpo.py)
 
@@ -72,7 +72,7 @@ python src/visualize_wandb.py --project-metric "G_ACME_TF_CUSTOM::evaluator/epis
 
 ![Custom Acme TF Results](results/custom_acme_tf.png)
 
-## Implementing based on ATFRS in PyTorch
+## PyTorch implementation based on ATFRS
 
 Python 3.10/3.11 is recommended. Based on the TF single file above.
 
@@ -93,13 +93,13 @@ python src/visualize_wandb.py --project-metric "acme_pytorch_perf::eval/episode_
 
 ![Custom Results](results/custom_acme_pytorch.png)
 
-### Video generation Acme in PyTorch
+### Video generation AcmePyTorch
 
 ```bash
 python src/acme_pytorch/generate_video_acme_pytorch_mpo.py logs/mpo_experiment/identifier/checkpoints/checkpoint_34234.pt --env_name cheetah::run --output mpo_acme_pytorch_cheetah_run.mp4
 ```
 
-## Implementing from scratch in PyTorch
+## Implementation from scratch in PyTorch (not working)
 
 ```bash
 python3 -m venv .venv
@@ -109,7 +109,7 @@ pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb 
 python src/pytorch_custom/train_custom_pytorch_mpo.py --wandb_project custom_mpo9 --max_actor_steps 1500000 --env_names HalfCheetah-v5,Walker2d-v5 --env_iterations 1
 ```
 
-### Visualize wandb
+### Visualize
 
 ```bash
 python src/visualize_wandb.py --project-metric "ppo6::eval/mean_reward" --project-metric "custom_mpo6::eval/mean_reward" --entity "adrian-research" --cache-dir logs --show-individual --output results/custom_pytorch.png
@@ -223,4 +223,4 @@ python src/pytorch_custom/generate_video_custom_pytorch_mpo.py logs/mpo_experime
   https://github.com/acyclics/MPO  
 
 - **PyTorch (≈5 years old, could not run):**  
-  https://github.com/daisatojp/mpo  
+  https://github.com/daisatojp/mpo
