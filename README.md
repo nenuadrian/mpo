@@ -10,7 +10,8 @@
   - [III - PyTorch implementation based on ATFRS](#iii---pytorch-implementation-based-on-atfrs)
     - [Visualize AcmePyTorch](#visualize-acmepytorch)
     - [Video generation AcmePyTorch](#video-generation-acmepytorch)
-  - [IV - Implementation from scratch in PyTorch (not working)](#iv---implementation-from-scratch-in-pytorch-not-working)
+  - [IV - Single-threaded Implementation if III](#iv---single-threaded-implementation-if-iii)
+  - [V - Implementation from scratch in PyTorch (not working)](#v---implementation-from-scratch-in-pytorch-not-working)
     - [Visualize](#visualize)
     - [Video generation](#video-generation)
   - [Discovery: ACME – Google DM](#discovery-acme--google-dm)
@@ -101,7 +102,11 @@ python src/visualize_wandb.py --project-metric "acme_pytorch_perf::eval/episode_
 python src/acme_pytorch/generate_video_acme_pytorch_mpo.py logs/mpo_experiment/identifier/checkpoints/checkpoint_34234.pt --env_name cheetah::run --output mpo_acme_pytorch_cheetah_run.mp4
 ```
 
-## IV - Implementation from scratch in PyTorch (not working)
+## IV - Single-threaded Implementation if III
+
+[src/acme_pytorch_sync/train_custom_acme_pytorch_mpo.py](src/acme_pytorch_sync/train_custom_acme_pytorch_mpo.py)
+
+## V - Implementation from scratch in PyTorch (not working)
 
 ```bash
 python3 -m venv .venv
