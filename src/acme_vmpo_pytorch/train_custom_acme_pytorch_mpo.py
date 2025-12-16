@@ -9,8 +9,8 @@ import os
 import json
 import threading
 
-import dm_env
-from dm_control import suite
+import dm_env # type: ignore
+from dm_control import suite # type: ignore
 
 import numpy as np
 import torch
@@ -20,8 +20,8 @@ import torch.optim as optim
 import wandb
 import torch.distributions as dist
 
-from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage
-from tensordict import TensorDict
+from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage # type: ignore
+from tensordict import TensorDict # type: ignore
 
 _MPO_FLOAT_EPSILON = 1e-8
 
@@ -779,18 +779,25 @@ class MPOAgent:
         with torch.no_grad():
             # Ensure MPO dual log vars are clamped like MPOLoss would (so temperature computed below matches MPOLoss)
             self.mpo_loss.log_temperature.data = torch.maximum(
-                self.mpo_loss.log_temperature.data, self.mpo_loss.min_log_temperature.to(self.mpo_loss.log_temperature.dtype)
+                self.mpo_loss.log_temperature.data,
+                self.mpo_loss.min_log_temperature.to(
+                    self.mpo_loss.log_temperature.dtype
+                ),
             )
             self.mpo_loss.log_alpha_mean.data = torch.maximum(
-                self.mpo_loss.log_alpha_mean.data, self.mpo_loss.min_log_alpha.to(self.mpo_loss.log_alpha_mean.dtype)
+                self.mpo_loss.log_alpha_mean.data,
+                self.mpo_loss.min_log_alpha.to(self.mpo_loss.log_alpha_mean.dtype),
             )
             self.mpo_loss.log_alpha_stddev.data = torch.maximum(
-                self.mpo_loss.log_alpha_stddev.data, self.mpo_loss.min_log_alpha.to(self.mpo_loss.log_alpha_stddev.dtype)
+                self.mpo_loss.log_alpha_stddev.data,
+                self.mpo_loss.min_log_alpha.to(self.mpo_loss.log_alpha_stddev.dtype),
             )
 
         # baseline computed from obs_encoder -> value_head; detach encoder embedding so value update only affects value_head
         emb_for_value_detached = self.obs_encoder(next_obs_b).detach()
-        v_baseline = self.value_head(emb_for_value_detached).squeeze(-1).detach()  # (B,)
+        v_baseline = (
+            self.value_head(emb_for_value_detached).squeeze(-1).detach()
+        )  # (B,)
 
         # advantages across sampled actions (N,B)
         advantages = q_samples - v_baseline.unsqueeze(0)
@@ -799,7 +806,9 @@ class MPOAgent:
         with torch.no_grad():
             temperature = F.softplus(self.mpo_loss.log_temperature) + _MPO_FLOAT_EPSILON
             normalized_weights, _loss_temp = compute_weights_and_temperature_loss(
-                q_values=advantages, epsilon=self.mpo_loss._epsilon, temperature=temperature
+                q_values=advantages,
+                epsilon=self.mpo_loss._epsilon,
+                temperature=temperature,
             )
             # weighted target value for V update
             target_v = (normalized_weights * q_samples).sum(dim=0)  # (B,)
@@ -945,7 +954,9 @@ class EnvironmentLoop:
                 self._actor.maybe_learn(self._actor.max_learn_steps_per_call)
 
             # Trigger evaluation periodically (actor has .evaluator)
-            if hasattr(self._actor, "evaluator") and getattr(self._actor, "eval_interval_steps", None):
+            if hasattr(self._actor, "evaluator") and getattr(
+                self._actor, "eval_interval_steps", None
+            ):
                 steps = int(self._shared_state.get("steps", 0))
                 if steps > 0 and steps % self._actor.eval_interval_steps == 0:
                     self._actor.evaluator.run()
@@ -1154,8 +1165,13 @@ class Actor:
             # periodic local policy sync (same logic as update uses a counter; emulate here)
             self._sync_counter += 1
             if self._sync_counter >= self.policy_sync_interval:
-                if self._actor_encoder is not None and self._actor_policy_head is not None:
-                    self.agent.copy_policy_to(self._actor_encoder, self._actor_policy_head)
+                if (
+                    self._actor_encoder is not None
+                    and self._actor_policy_head is not None
+                ):
+                    self.agent.copy_policy_to(
+                        self._actor_encoder, self._actor_policy_head
+                    )
                     self._actor_encoder.eval()
                     self._actor_policy_head.eval()
                 self._sync_counter = 0
@@ -1349,9 +1365,10 @@ def train(
     clip_norm: float = 40.0,
     eval_interval_steps: int = 5000,
     max_learn_steps_per_call: int = 10,
-    # new params:
     observations_per_iteration: int = 10000,
     learner_steps_per_iteration: int = 1000,
+    action_penalization: bool = True,
+    per_dim: bool = True,
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -1397,6 +1414,8 @@ def train(
         lr_dual=lr_dual,
         min_replay_size=min_replay_size,
         clip_norm=clip_norm,
+        action_penalization=action_penalization,
+        per_dim=per_dim,
     )
 
     stop_event = threading.Event()
@@ -1443,7 +1462,6 @@ def train(
             log_dict["global_actor_step"] = int(shared_state.get("steps", 0))
             wandb.log(log_dict)
             learner_steps += 1
-
 
         actor_obj.evaluator.run()
 
@@ -1524,6 +1542,18 @@ def parse_args():
         default=1000,
         help="Maximum number of learner steps to run each iteration.",
     )
+    parser.add_argument(
+        "--action_penalization",
+        type=lambda s: s.lower() in ("true", "1", "t", "yes"),
+        default=True,
+        help="Enable action penalization (MO-MPO penalty). Accepts true/false.",
+    )
+    parser.add_argument(
+        "--per_dim_constraining",
+        type=lambda s: s.lower() in ("true", "1", "t", "yes"),
+        default=True,
+        help="Use per-dimension KL constraining. Accepts true/false.",
+    )
     return parser.parse_args()
 
 
@@ -1580,6 +1610,8 @@ if __name__ == "__main__":
         # new params
         observations_per_iteration=args.observations_per_iteration,
         learner_steps_per_iteration=args.learner_steps_per_iteration,
+        action_penalization=args.action_penalization,
+        per_dim_constraining=args.per_dim_constraining,
     )
 
     wandb.finish()

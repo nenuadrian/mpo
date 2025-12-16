@@ -9,8 +9,8 @@ import os
 import json
 import threading
 
-import dm_env
-from dm_control import suite
+import dm_env # type: ignore
+from dm_control import suite # type: ignore
 
 import numpy as np
 import torch
@@ -20,8 +20,8 @@ import torch.optim as optim
 import wandb
 import torch.distributions as dist
 
-from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage
-from tensordict import TensorDict
+from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage # type: ignore
+from tensordict import TensorDict # type: ignore
 
 _MPO_FLOAT_EPSILON = 1e-8
 
@@ -1243,6 +1243,8 @@ def train(
     log_dir: str,
     policy_sync_interval: int,
     clip_norm: float = 40.0,
+    action_penalization: bool = True,
+    per_dim_constraining: bool = True,
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -1288,6 +1290,8 @@ def train(
         lr_dual=lr_dual,
         min_replay_size=min_replay_size,
         clip_norm=clip_norm,
+        action_penalization=action_penalization,
+        per_dim=per_dim_constraining,
     )
 
     stop_event = threading.Event()
@@ -1384,6 +1388,18 @@ def parse_args():
         default=40.0,
         help="Gradient clipping max-norm; set to 0 to disable clipping.",
     )
+    parser.add_argument(
+        "--action_penalization",
+        type=lambda s: s.lower() in ("true", "1", "t", "yes"),
+        default=True,
+        help="Enable action penalization (MO-MPO penalty). Accepts true/false.",
+    )
+    parser.add_argument(
+        "--per_dim_constraining",
+        type=lambda s: s.lower() in ("true", "1", "t", "yes"),
+        default=True,
+        help="Use per-dimension KL constraining. Accepts true/false.",
+    )
     return parser.parse_args()
 
 
@@ -1435,6 +1451,8 @@ if __name__ == "__main__":
         log_dir=log_dir,
         policy_sync_interval=args.policy_sync_interval,
         clip_norm=args.clip_norm,
+        action_penalization=args.action_penalization,
+        per_dim_constraining=args.per_dim_constraining,
     )
 
     wandb.finish()
