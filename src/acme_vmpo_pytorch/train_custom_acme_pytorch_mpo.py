@@ -9,8 +9,8 @@ import os
 import json
 import threading
 
-import dm_env # type: ignore
-from dm_control import suite # type: ignore
+import dm_env  # type: ignore
+from dm_control import suite  # type: ignore
 
 import numpy as np
 import torch
@@ -20,8 +20,8 @@ import torch.optim as optim
 import wandb
 import torch.distributions as dist
 
-from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage # type: ignore
-from tensordict import TensorDict # type: ignore
+from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage  # type: ignore
+from tensordict import TensorDict  # type: ignore
 
 _MPO_FLOAT_EPSILON = 1e-8
 
@@ -181,7 +181,7 @@ def _diag_normal_kl(
     p_std: torch.Tensor,
     q_mean: torch.Tensor,
     q_std: torch.Tensor,
-    per_dim: bool,
+    per_dim_constraining: bool,
 ) -> torch.Tensor:
     """
     KL( N(p_mean, p_std^2) || N(q_mean, q_std^2) ) for diagonal Gaussians.
@@ -204,7 +204,7 @@ def _diag_normal_kl(
     frac_term = (var_p + diff.pow(2)) / (2.0 * var_q)
     kl_elem = log_term + frac_term - 0.5  # [B, D]
 
-    if per_dim:
+    if per_dim_constraining:
         return kl_elem  # [B, D]
     else:
         return kl_elem.sum(dim=-1)  # [B]
@@ -214,10 +214,12 @@ def compute_weights_and_temperature_loss(
     q_values: torch.Tensor,  # [N, B]
     epsilon: float,
     temperature: torch.Tensor,  # scalar > 0
+    use_baseline: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Match TensorFlow compute_weights_and_temperature_loss exactly:
-      - temper with temperature (no grad to q_values),
+    V-MPO variant of compute_weights_and_temperature_loss:
+      - optionally subtract per-state baseline (mean over action samples) to get advantages,
+        then temper with temperature (no grad to q_values/advantages),
       - softmax over axis=0 (action samples),
       - detach normalized weights,
       - temperature dual loss computed like TF and multiplied by temperature.
@@ -225,8 +227,13 @@ def compute_weights_and_temperature_loss(
     This version ensures temperature is not re-created/detached and constants
     are created using temperature.new_tensor(...) for consistent dtype/device.
     """
-    # Temper the given Q-values using the current temperature; stop gradient on q_values.
-    tempered_q_values = q_values.detach() / temperature
+    # Optionally form advantages by subtracting mean across action samples per batch.
+    if use_baseline:
+        # q_values: [N, B] -> baseline shape [1, B]
+        baseline = q_values.mean(dim=0, keepdim=True)
+        tempered_q_values = (q_values.detach() - baseline.detach()) / temperature
+    else:
+        tempered_q_values = q_values.detach() / temperature
 
     # Compute normalized importance weights across action-samples axis (N).
     normalized_weights = torch.softmax(tempered_q_values, dim=0).detach()
@@ -289,16 +296,10 @@ def compute_parametric_kl_penalty_and_dual_loss(
     return loss_kl, loss_alpha
 
 
-class MPOLoss(nn.Module):
+class VMPOLoss(nn.Module):
     """
-    PyTorch MPOLoss that mirrors the TensorFlow MPOLoss precisely in:
-      - creation and clamping of log-dual vars,
-      - softplus transform to get positive duals,
-      - E-step temperature computation with stop_gradient semantics,
-      - optional MO-MPO action penalty (identical operations and combination),
-      - decomposition into fixed-mean / fixed-stddev distributions,
-      - computation of cross-entropy losses, parametric KL penalties and dual losses,
-      - same returned diagnostics keys (names are PyTorch style but semantics match).
+    PyTorch V-MPO loss: same as MPOLoss but uses advantage-based tempering in the E-step
+    (handled via compute_weights_and_temperature_loss(use_baseline=True)).
     """
 
     def __init__(
@@ -397,9 +398,12 @@ class MPOLoss(nn.Module):
             F.softplus(self.log_alpha_stddev) + _MPO_FLOAT_EPSILON
         )  # [D] or [1]
 
-        # E-step: compute normalized weights & temperature loss (detach semantics inside helper)
+        # E-step: compute normalized weights & temperature loss using advantages (V-MPO)
         normalized_weights, loss_temperature = compute_weights_and_temperature_loss(
-            q_values=q_values, epsilon=self._epsilon, temperature=temperature
+            q_values=q_values,
+            epsilon=self._epsilon,
+            temperature=temperature,
+            use_baseline=True,
         )
 
         # Diagnostic: KL between non-parametric and target
@@ -408,7 +412,7 @@ class MPOLoss(nn.Module):
         )
         penalty_kl_nonparametric = None
 
-        # Optional MO-MPO penalty
+        # Optional MO-MPO penalty (unchanged, no baseline for cost)
         if self._action_penalization:
             penalty_temperature = (
                 F.softplus(self._log_penalty_temperature) + _MPO_FLOAT_EPSILON
@@ -421,6 +425,7 @@ class MPOLoss(nn.Module):
                     q_values=cost_out_of_bound,
                     epsilon=self._epsilon_penalty,
                     temperature=penalty_temperature,
+                    use_baseline=False,
                 )
             )
             penalty_kl_nonparametric = compute_nonparametric_kl_from_normalized_weights(
@@ -448,20 +453,19 @@ class MPOLoss(nn.Module):
         )
 
         # KL computations: target || fixed component (per-dim or aggregated)
-        per_dim = self._per_dim_constraining
         kl_mean = _diag_normal_kl(
             p_mean=target_mean,
             p_std=target_scale,
             q_mean=fixed_stddev_dist.base_dist.loc,
             q_std=fixed_stddev_dist.base_dist.scale,
-            per_dim=per_dim,
+            per_dim_constraining=self._per_dim_constraining,
         )
         kl_stddev = _diag_normal_kl(
             p_mean=target_mean,
             p_std=target_scale,
             q_mean=fixed_mean_dist.base_dist.loc,
             q_std=fixed_mean_dist.base_dist.scale,
-            per_dim=per_dim,
+            per_dim_constraining=self._per_dim_constraining,
         )
 
         # Parametric KL penalties and dual losses (alpha adaptation)
@@ -495,7 +499,7 @@ class MPOLoss(nn.Module):
         stats["kl_mean_rel"] = kl_mean.mean() / self._epsilon_mean
         stats["kl_stddev_rel"] = kl_stddev.mean() / self._epsilon_stddev
 
-        if per_dim:
+        if self._per_dim_constraining:
             kl_mean_batch_mean = kl_mean.mean(dim=0)
             kl_stddev_batch_mean = kl_stddev.mean(dim=0)
             stats["kl_mean_rel_min"] = kl_mean_batch_mean.min() / self._epsilon_mean
@@ -628,17 +632,7 @@ class MPOAgent:
         self.target_critic = copy.deepcopy(self.critic).to(device)
         self.target_critic.obs_net = self.target_obs_encoder
 
-        # --- NEW: value head (V) and its target/optimizer ---
-        # light-weight scalar head that maps obs embedding -> value
-        self.value_head = nn.Linear(policy_hidden[-1], 1).to(device)
-        # small init around zero for stability
-        with torch.no_grad():
-            nn.init.uniform_(self.value_head.weight, a=-1e-4, b=1e-4)
-            if self.value_head.bias is not None:
-                self.value_head.bias.zero_()
-        self.target_value_head = copy.deepcopy(self.value_head).to(device)
-
-        self.mpo_loss = MPOLoss(
+        self.mpo_loss = VMPOLoss(
             action_dim=action_dim,
             per_dim_constraining=per_dim,
             action_penalization=action_penalization,
@@ -655,8 +649,6 @@ class MPOAgent:
         self._critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
         self._policy_optimizer = optim.Adam(self.policy_head.parameters(), lr=lr_policy)
         self._dual_optimizer = optim.Adam(self.mpo_loss.parameters(), lr=lr_dual)
-        # new value optimizer (reuse critic lr by default)
-        self._value_optimizer = optim.Adam(self.value_head.parameters(), lr=lr_critic)
 
         self.replay = TensorDictReplayBuffer(
             storage=LazyTensorStorage(max_size=max_replay_size),
@@ -773,71 +765,21 @@ class MPOAgent:
         td_error_mean = float(td_error.abs().mean().item())
         target_mean = float(target.mean().item())
 
-        # --- NEW: V-MPO value baseline and advantage computation ---
-        # Compute baseline V(next_obs) using online value head (detach embedding to avoid
-        # updating encoder here; we only update value_head weights).
         with torch.no_grad():
-            # Ensure MPO dual log vars are clamped like MPOLoss would (so temperature computed below matches MPOLoss)
-            self.mpo_loss.log_temperature.data = torch.maximum(
-                self.mpo_loss.log_temperature.data,
-                self.mpo_loss.min_log_temperature.to(
-                    self.mpo_loss.log_temperature.dtype
-                ),
-            )
-            self.mpo_loss.log_alpha_mean.data = torch.maximum(
-                self.mpo_loss.log_alpha_mean.data,
-                self.mpo_loss.min_log_alpha.to(self.mpo_loss.log_alpha_mean.dtype),
-            )
-            self.mpo_loss.log_alpha_stddev.data = torch.maximum(
-                self.mpo_loss.log_alpha_stddev.data,
-                self.mpo_loss.min_log_alpha.to(self.mpo_loss.log_alpha_stddev.dtype),
-            )
+            emb_o_t = self.target_obs_encoder(next_obs_b)
+        online_mean, online_scale = self.policy_head(emb_o_t)
 
-        # baseline computed from obs_encoder -> value_head; detach encoder embedding so value update only affects value_head
-        emb_for_value_detached = self.obs_encoder(next_obs_b).detach()
-        v_baseline = (
-            self.value_head(emb_for_value_detached).squeeze(-1).detach()
-        )  # (B,)
+        # target mean/scale already computed as t_mean/t_scale (from above, no_grad)
+        # compute MPO loss with sampled_actions and q_samples
+        policy_loss, policy_stats = self.mpo_loss(
+            sampled_actions, q_samples, online_mean, online_scale, t_mean, t_scale
+        )
 
-        # advantages across sampled actions (N,B)
-        advantages = q_samples - v_baseline.unsqueeze(0)
-
-        # Compute non-parametric weights using MPO's temperature (so value target is consistent)
-        with torch.no_grad():
-            temperature = F.softplus(self.mpo_loss.log_temperature) + _MPO_FLOAT_EPSILON
-            normalized_weights, _loss_temp = compute_weights_and_temperature_loss(
-                q_values=advantages,
-                epsilon=self.mpo_loss._epsilon,
-                temperature=temperature,
-            )
-            # weighted target value for V update
-            target_v = (normalized_weights * q_samples).sum(dim=0)  # (B,)
-
-        # Update value head towards weighted Q-target (MSE). Detach target_v to avoid leakage.
-        self._value_optimizer.zero_grad()
-        # Use detached encoder embedding again to avoid interfering with critic's encoder training here.
-        pred_v = self.value_head(emb_for_value_detached).squeeze(-1)
-        value_loss = 0.5 * ((pred_v - target_v.detach()) ** 2).mean()
-        value_loss.backward()
-        self._value_optimizer.step()
-
-        # --- end value update ---
-
-        # Update critic (as before)
         self._critic_optimizer.zero_grad()
         critic_loss.backward()
         if self.clipping_enabled:
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.clip_norm)
         self._critic_optimizer.step()
-
-        # Compute policy head inputs (use detached encoder embedding; policy_head is updated)
-        emb_for_policy = self.obs_encoder(next_obs_b).detach()
-        online_mean, online_scale = self.policy_head(emb_for_policy)
-
-        # compute MPO loss with advantages (V-MPO uses advantage-weighted E-step)
-        policy_loss, policy_stats = self.mpo_loss(
-            sampled_actions, advantages, online_mean, online_scale, t_mean, t_scale
-        )
 
         self._policy_optimizer.zero_grad()
         self._dual_optimizer.zero_grad()
@@ -859,49 +801,19 @@ class MPOAgent:
         if self._learn_steps % self.target_critic_update_period == 0:
             self.target_critic.critic.load_state_dict(self.critic.critic.state_dict())
             self.target_obs_encoder.load_state_dict(self.obs_encoder.state_dict())
-            # --- NEW: sync target value head ---
-            self.target_value_head.load_state_dict(self.value_head.state_dict())
 
-        # Prepare diagnostics similar to TF names/semantics
-        stats: Dict[str, torch.Tensor] = {}
-        stats["dual_alpha_mean"] = alpha_mean.mean()
-        stats["dual_alpha_stddev"] = alpha_stddev.mean()
-        stats["dual_temperature"] = temperature.mean()
-        stats["loss_policy"] = loss_policy.detach()
-        stats["total_loss"] = loss.detach()
-        stats["loss_alpha"] = (loss_alpha_mean + loss_alpha_stddev).detach()
-        stats["loss_temperature"] = loss_temperature.detach()
-        stats["kl_q_rel"] = kl_nonparametric.mean() / self._epsilon
-        if self._action_penalization and penalty_kl_nonparametric is not None:
-            stats["penalty_kl_q_rel"] = (
-                penalty_kl_nonparametric.mean() / self._epsilon_penalty
-            )
-        stats["kl_mean_rel"] = kl_mean.mean() / self._epsilon_mean
-        stats["kl_stddev_rel"] = kl_stddev.mean() / self._epsilon_stddev
+        fetches = {
+            "policy_loss": float(policy_loss.item()),
+            "critic_loss": float(critic_loss.item()),
+            "total_steps": self._learn_steps,
+            "td_error_mean": td_error_mean,
+            "td_target_mean": target_mean,
+            "q_min": q_min,
+            "q_max": q_max,
+        }
 
-        if per_dim:
-            kl_mean_batch_mean = kl_mean.mean(dim=0)
-            kl_stddev_batch_mean = kl_stddev.mean(dim=0)
-            stats["kl_mean_rel_min"] = kl_mean_batch_mean.min() / self._epsilon_mean
-            stats["kl_mean_rel_max"] = kl_mean_batch_mean.max() / self._epsilon_mean
-            stats["kl_stddev_rel_min"] = (
-                kl_stddev_batch_mean.min() / self._epsilon_stddev
-            )
-            stats["kl_stddev_rel_max"] = (
-                kl_stddev_batch_mean.max() / self._epsilon_stddev
-            )
-
-        stats["q_min"] = q_values.min(dim=0).values.mean()
-        stats["q_max"] = q_values.max(dim=0).values.mean()
-        pi_stddev = online_scale
-        stats["pi_stddev_min"] = pi_stddev.min(dim=-1).values.mean()
-        stats["pi_stddev_max"] = pi_stddev.max(dim=-1).values.mean()
-        stats["pi_stddev_cond"] = (
-            pi_stddev.max(dim=-1).values
-            / (pi_stddev.min(dim=-1).values + _MPO_FLOAT_EPSILON)
-        ).mean()
-
-        return loss, stats
+        fetches.update(policy_stats)
+        return fetches
 
 
 class EnvironmentLoop:
@@ -1365,10 +1277,11 @@ def train(
     clip_norm: float = 40.0,
     eval_interval_steps: int = 5000,
     max_learn_steps_per_call: int = 10,
+    # new params:
     observations_per_iteration: int = 10000,
     learner_steps_per_iteration: int = 1000,
     action_penalization: bool = True,
-    per_dim: bool = True,
+    per_dim_constraining: bool = True,
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -1415,7 +1328,7 @@ def train(
         min_replay_size=min_replay_size,
         clip_norm=clip_norm,
         action_penalization=action_penalization,
-        per_dim=per_dim,
+        per_dim=per_dim_constraining,
     )
 
     stop_event = threading.Event()
@@ -1481,10 +1394,6 @@ def train(
         "_critic_optimizer": agent._critic_optimizer.state_dict(),
         "_policy_optimizer": agent._policy_optimizer.state_dict(),
         "_dual_optimizer": agent._dual_optimizer.state_dict(),
-        # --- NEW: save value head and optimizer state ---
-        "value_head": agent.value_head.state_dict(),
-        "target_value_head": agent.target_value_head.state_dict(),
-        "_value_optimizer": agent._value_optimizer.state_dict(),
         "learn_steps": agent._learn_steps,
         "seed": seed,
         "replay_state": replay_state,
