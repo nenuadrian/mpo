@@ -9,8 +9,8 @@ import os
 import json
 import threading
 
-import dm_env
-from dm_control import suite
+import dm_env # type: ignore
+from dm_control import suite # type: ignore
 
 import numpy as np
 import torch
@@ -20,8 +20,8 @@ import torch.optim as optim
 import wandb
 import torch.distributions as dist
 
-from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage
-from tensordict import TensorDict
+from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage # type: ignore
+from tensordict import TensorDict # type: ignore
 
 _MPO_FLOAT_EPSILON = 1e-8
 
@@ -181,7 +181,7 @@ def _diag_normal_kl(
     p_std: torch.Tensor,
     q_mean: torch.Tensor,
     q_std: torch.Tensor,
-    per_dim: bool,
+    per_dim_constraining: bool,
 ) -> torch.Tensor:
     """
     KL( N(p_mean, p_std^2) || N(q_mean, q_std^2) ) for diagonal Gaussians.
@@ -204,7 +204,7 @@ def _diag_normal_kl(
     frac_term = (var_p + diff.pow(2)) / (2.0 * var_q)
     kl_elem = log_term + frac_term - 0.5  # [B, D]
 
-    if per_dim:
+    if per_dim_constraining:
         return kl_elem  # [B, D]
     else:
         return kl_elem.sum(dim=-1)  # [B]
@@ -448,20 +448,19 @@ class MPOLoss(nn.Module):
         )
 
         # KL computations: target || fixed component (per-dim or aggregated)
-        per_dim = self._per_dim_constraining
         kl_mean = _diag_normal_kl(
             p_mean=target_mean,
             p_std=target_scale,
             q_mean=fixed_stddev_dist.base_dist.loc,
             q_std=fixed_stddev_dist.base_dist.scale,
-            per_dim=per_dim,
+            per_dim_constraining=self._per_dim_constraining,
         )
         kl_stddev = _diag_normal_kl(
             p_mean=target_mean,
             p_std=target_scale,
             q_mean=fixed_mean_dist.base_dist.loc,
             q_std=fixed_mean_dist.base_dist.scale,
-            per_dim=per_dim,
+            per_dim_constraining=self._per_dim_constraining,
         )
 
         # Parametric KL penalties and dual losses (alpha adaptation)
@@ -495,7 +494,7 @@ class MPOLoss(nn.Module):
         stats["kl_mean_rel"] = kl_mean.mean() / self._epsilon_mean
         stats["kl_stddev_rel"] = kl_stddev.mean() / self._epsilon_stddev
 
-        if per_dim:
+        if self._per_dim_constraining:
             kl_mean_batch_mean = kl_mean.mean(dim=0)
             kl_stddev_batch_mean = kl_stddev.mean(dim=0)
             stats["kl_mean_rel_min"] = kl_mean_batch_mean.min() / self._epsilon_mean
