@@ -1446,7 +1446,6 @@ def parse_args():
         default=1000,
         help="Maximum number of learner steps to run each iteration.",
     )
-    # New CLI flags (accept true/false strings)
     parser.add_argument(
         "--action_penalization",
         type=lambda s: s.lower() in ("true", "1", "t", "yes"),
