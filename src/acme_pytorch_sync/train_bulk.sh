@@ -24,5 +24,5 @@ for pair in "${pairs[@]}"; do
     python train_custom_acme_pytorch_mpo.py \
         --env_name "${domain}::${task}" \
         --max_actor_steps 3000000 \
-        --n_step 5 --timeout 1800 --wandb_project "acme_pytorch_mpo_sync_no_action_penalization" --action_penalization false
+        --n_step 5 --wandb_project "acme_pytorch_mpo_sync_no_action_penalization" --action_penalization false
 done
