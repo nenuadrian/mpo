@@ -67,10 +67,10 @@ python src/acme_tf_launchpad/visualize_acme_results.py --output results/acme_tf.
 
 ## II - Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)
 
-Not able to remove dependencies further as Sonnet and Reverb are tightly integrated. But removed Acme and Launchpad dependencies. [src/acme_tf_custom/train.py](src/acme_tf_custom/train.py)
+Not able to remove dependencies further as Sonnet and Reverb are tightly integrated. But removed Acme and Launchpad dependencies. [src/acme_tf_reduced_deps/train.py](src/acme_tf_reduced_deps/train.py)
 
 ```bash
-python src/acme_tf_custom/train.py --max_actor_steps 3000000 --domain cheetah --task run
+python src/acme_tf_reduced_deps/train.py --max_actor_steps 3000000 --domain cheetah --task run
 ```
 
 ### Results II
