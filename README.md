@@ -5,9 +5,9 @@
   - [Using Google DeepMind Acme](#using-google-deepmind-acme)
   - [I - Single file Acme TF with Launchpad and other dm- dependencies (ATFLDM)](#i---single-file-acme-tf-with-launchpad-and-other-dm--dependencies-atfldm)
     - [Results I](#results-i)
-  - [II - Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)](#ii---single-file-acme-tf-with-only-dm-reverb-and-dm-sonnet-atfrs)
+  - [II - Single file Acme TF based on I with only dm-Reverb and dm-Sonnet (ATFRS)](#ii---single-file-acme-tf-based-on-i-with-only-dm-reverb-and-dm-sonnet-atfrs)
     - [Results II](#results-ii)
-  - [III - PyTorch implementation based on ATFRS](#iii---pytorch-implementation-based-on-atfrs)
+  - [III - PyTorch implementation based on II](#iii---pytorch-implementation-based-on-ii)
     - [Results III](#results-iii)
     - [Video generation AcmePyTorch](#video-generation-acmepytorch)
   - [IV - Single-threaded Implementation of III](#iv---single-threaded-implementation-of-iii)
@@ -54,6 +54,10 @@ Somewhat consolidated code from within acme still depending on acme but brought 
 [src/acme_tf_launchpad/train.py](src/acme_tf_launchpad/train.py)
 
 ```bash
+export MUJOCO_GL=egl
+export LD_LIBRARY_PATH=/home/adrian_nenu/miniconda3/envs/acme/lib/
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+
 python src/acme_tf_launchpad/train.py --max_actor_steps 3000000 --domain cheetah --task run
 ```
 
@@ -65,7 +69,7 @@ python src/acme_tf_launchpad/visualize_acme_results.py --output results/acme_tf.
 
 ![Acme Results](results/acme_tf.png)
 
-## II - Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)
+## II - Single file Acme TF based on I with only dm-Reverb and dm-Sonnet (ATFRS)
 
 Not able to remove dependencies further as Sonnet and Reverb are tightly integrated. But removed Acme and Launchpad dependencies. [src/acme_tf_reduced_deps/train.py](src/acme_tf_reduced_deps/train.py)
 
@@ -81,7 +85,7 @@ python src/visualize_wandb.py --project-metric "G_ACME_TF_CUSTOM::evaluator/epis
 
 ![Custom Acme TF Results](results/custom_acme_tf.png)
 
-## III - PyTorch implementation based on ATFRS
+## III - PyTorch implementation based on II
 
 Python 3.10/3.11 is recommended. Based on the TF single file above.
 
