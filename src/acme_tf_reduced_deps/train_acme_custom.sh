@@ -21,7 +21,7 @@ for pair in "${pairs[@]}"; do
     
     echo "Running: ${domain}/${task}"
     
-    python src/acme_tf_custom/train_acme_tf_mpo.py \
+    python train.py \
         --domain "${domain}" \
         --task "${task}" \
         --max_actor_steps 10000000 \

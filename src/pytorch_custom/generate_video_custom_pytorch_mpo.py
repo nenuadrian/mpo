@@ -2,7 +2,7 @@ import argparse
 import os
 
 
-from train_custom_pytorch_mpo import (
+from pytorch_custom.train import (
     GaussianPolicy,
     load_policy_from_checkpoint,
     make_offscreen_env,

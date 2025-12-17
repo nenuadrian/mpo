@@ -51,10 +51,10 @@ python examples/tf/control_suite/lp_mpo.py
 
 Somewhat consolidated code from within acme still depending on acme but brought toegther in one file. Depends on many DM projects such as `dm-reverb`, `dm-env`, `dm-tree`, `dm-launchpad`, `acme`, `sonnet` etc.
 
-[src/acme_tf_launchpad/train_lp_mpo_single_file.py](src/acme_tf_launchpad/train_lp_mpo_single_file.py)
+[src/acme_tf_launchpad/train.py](src/acme_tf_launchpad/train.py)
 
 ```bash
-python src/acme_tf_launchpad/train_lp_mpo_single_file.py --max_actor_steps 3000000 --domain cheetah --task run
+python src/acme_tf_launchpad/train.py --max_actor_steps 3000000 --domain cheetah --task run
 ```
 
 ### Results I
@@ -91,7 +91,7 @@ source .venv_acme_pytorch/bin/activate
 pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb "shimmy[bsuite,atari,dm-control]" opencv-python torchrl
 
 
-python src/acme_pytorch/train_custom_acme_pytorch_mpo.py --max_actor_steps 3000000 --wandb_project acme_pytorch_3 --env_name walker::walk
+python src/acme_pytorch/train.py --max_actor_steps 3000000 --wandb_project acme_pytorch_3 --env_name walker::walk
 ```
 
 ### Results III
@@ -137,7 +137,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb "imageio[ffmpeg]" torchrl
 
-python src/pytorch_custom/train_custom_pytorch_mpo.py --wandb_project custom_mpo9 --max_actor_steps 1500000 --env_names HalfCheetah-v5,Walker2d-v5 --env_iterations 1
+python src/pytorch_custom/train.py --wandb_project custom_mpo9 --max_actor_steps 1500000 --env_names HalfCheetah-v5,Walker2d-v5 --env_iterations 1
 ```
 
 ### Video generation
