@@ -18,6 +18,8 @@
     - [Video generation](#video-generation)
   - [VI - V-MPO based on IV](#vi---v-mpo-based-on-iv)
     - [Results VI](#results-vi)
+  - [VII MoG MPO based on IV](#vii-mog-mpo-based-on-iv)
+    - [Results VII](#results-vii)
   - [Discovery: ACME – Google DM](#discovery-acme--google-dm)
     - [Overview](#overview)
     - [Notes](#notes)
@@ -157,6 +159,18 @@ python src/visualize_wandb.py --project-metric "acme_pytorch_vmpo_sync::eval/epi
 ```
 
 ![Custom Results](results/acme_vmpo_pytorch.png)
+
+## VII MoG MPO based on IV
+
+[src/mog_pytorch/train.py](src/mog_pytorch/train.py)
+
+### Results VII
+
+```bash
+python src/visualize_wandb.py --project-metric "mog_pytorch_sync::eval/episode_return" --entity "adrian-research" --cache-dir logs --show-individual --output results/mog_pytorch.png
+```
+
+![Custom Results](results/mog_pytorch.png)
 
 ## Discovery: ACME – Google DM
 

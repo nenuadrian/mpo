@@ -24,5 +24,5 @@ for pair in "${pairs[@]}"; do
     python train.py \
         --env_name "${domain}::${task}" \
         --max_actor_steps 3000000 \
-        --n_step 5 --wandb_project "mpo_mog_pytorch_sync"
+        --n_step 5 --wandb_project "mog_pytorch_sync"
 done
