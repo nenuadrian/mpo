@@ -3,10 +3,10 @@
 - [On implementing Maximum a Posteriori Policy Optimization (MPO)](#on-implementing-maximum-a-posteriori-policy-optimization-mpo)
   - [Original MPO Paper](#original-mpo-paper)
   - [Using Google DeepMind Acme](#using-google-deepmind-acme)
-    - [I - Single file Acme TF with Launchpad and other dm- dependencies (ATFLDM)](#i---single-file-acme-tf-with-launchpad-and-other-dm--dependencies-atfldm)
-      - [Results I](#results-i)
-    - [II - Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)](#ii---single-file-acme-tf-with-only-dm-reverb-and-dm-sonnet-atfrs)
-      - [Results II](#results-ii)
+  - [I - Single file Acme TF with Launchpad and other dm- dependencies (ATFLDM)](#i---single-file-acme-tf-with-launchpad-and-other-dm--dependencies-atfldm)
+    - [Results I](#results-i)
+  - [II - Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)](#ii---single-file-acme-tf-with-only-dm-reverb-and-dm-sonnet-atfrs)
+    - [Results II](#results-ii)
   - [III - PyTorch implementation based on ATFRS](#iii---pytorch-implementation-based-on-atfrs)
     - [Results III](#results-iii)
     - [Video generation AcmePyTorch](#video-generation-acmepytorch)
@@ -18,7 +18,7 @@
     - [Video generation](#video-generation)
   - [VI - V-MPO based on IV](#vi---v-mpo-based-on-iv)
     - [Results VI](#results-vi)
-  - [VII MoG MPO based on IV](#vii-mog-mpo-based-on-iv)
+  - [VII - MoG MPO based on IV](#vii---mog-mpo-based-on-iv)
     - [Results VII](#results-vii)
   - [Discovery: ACME – Google DM](#discovery-acme--google-dm)
     - [Overview](#overview)
@@ -47,7 +47,7 @@ Very difficult to get it to build. TensorFlow version is only one that I was abl
 python examples/tf/control_suite/lp_mpo.py
 ```
 
-### I - Single file Acme TF with Launchpad and other dm- dependencies (ATFLDM)
+## I - Single file Acme TF with Launchpad and other dm- dependencies (ATFLDM)
 
 Somewhat consolidated code from within acme still depending on acme but brought toegther in one file. Depends on many DM projects such as `dm-reverb`, `dm-env`, `dm-tree`, `dm-launchpad`, `acme`, `sonnet` etc.
 
@@ -57,7 +57,7 @@ Somewhat consolidated code from within acme still depending on acme but brought 
 python src/acme_launchpad_tf/train_lp_mpo_single_file.py --max_actor_steps 3000000 --domain cheetah --task run
 ```
 
-#### Results I
+### Results I
 
 ```bash
 python src/acme_launchpad_tf/visualize_acme_results.py --output results/acme_tf.png --metric episode_return --file "Cartpole_Balance::results/acme/mpo-tf-cartpole-balance.csv" --file "Hopper_Stand::results/acme/mpo-tf-hopper-stand.csv" --file "Hopper_Hop::results/acme/mpo-tf-hopper-hop.csv" --file "Walker_Walk::results/acme/mpo-tf-walker-walk.csv" --file "Walker_Run::results/acme/mpo-tf-walker-run.csv" --file "Walker_Stand::results/acme/mpo-tf-walker-stand.csv" --file "Reacher_Easy::results/acme/mpo-tf-reacher-easy.csv" --file "Reacher_Hard::results/acme/mpo-tf-reacher-hard.csv"  --file "Acrobot_Swingup::results/acme/mpo-tf-acrobot-swingup.csv"   --file "Pendulum_Swingup::results/acme/mpo-tf-pendulum-swingup.csv"  --file "Swimmer_Swimmer6::results/acme/mpo-tf-swimmer-swimmer6.csv" --file "Swimmer_Swimmer15::results/acme/mpo-tf-swimmer-swimmer15.csv" --file "Cheetah_Run::results/acme/mpo-tf-cheetah-run.csv" 
@@ -65,7 +65,7 @@ python src/acme_launchpad_tf/visualize_acme_results.py --output results/acme_tf.
 
 ![Acme Results](results/acme_tf.png)
 
-### II - Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)
+## II - Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)
 
 Not able to remove dependencies further as Sonnet and Reverb are tightly integrated. But removed Acme and Launchpad dependencies. [src/acme_tf_custom/train.py](src/acme_tf_custom/train.py)
 
@@ -73,7 +73,7 @@ Not able to remove dependencies further as Sonnet and Reverb are tightly integra
 python src/acme_tf_custom/train.py --max_actor_steps 3000000 --domain cheetah --task run
 ```
 
-#### Results II
+### Results II
 
 ```bash
 python src/visualize_wandb.py --project-metric "G_ACME_TF_CUSTOM::evaluator/episode_return"  --entity "adrian-research" --cache-dir logs --show-individual --output results/custom_acme_tf.png --ncols 2
@@ -160,7 +160,7 @@ python src/visualize_wandb.py --project-metric "acme_pytorch_vmpo_sync::eval/epi
 
 ![Custom Results](results/acme_vmpo_pytorch.png)
 
-## VII MoG MPO based on IV
+## VII - MoG MPO based on IV
 
 [src/mog_pytorch/train.py](src/mog_pytorch/train.py)
 
