@@ -88,66 +88,6 @@ class LayerNormMLP(nn.Module):
         return x
 
 
-class MultivariateNormalDiagHead(nn.Module):
-    """Produces mean and scale for a diagonal Gaussian."""
-
-    def __init__(
-        self,
-        input_dim: int,
-        action_dim: int,
-        init_scale: float,
-        min_scale: float = 1e-6,
-        tanh_mean: bool = False,
-        fixed_scale: bool = False,
-        use_independent: bool = True,
-    ):
-        super().__init__()
-        self.mean_layer = nn.Linear(input_dim, action_dim)
-        self.fixed_scale = fixed_scale
-        self.tanh_mean = tanh_mean
-        self.init_scale = init_scale
-        self.min_scale = min_scale
-        self.use_independent = use_independent
-        self._fixed_scale = None
-        if not fixed_scale:
-            # output positive scale via softplus of a linear layer
-            self.log_scale_layer = nn.Linear(input_dim, action_dim)
-        else:
-            self.register_buffer("_fixed_scale", torch.tensor(init_scale))
-
-        # make mean bias zero for stable initial means
-        with torch.no_grad():
-            nn.init.uniform_(self.mean_layer.weight, a=-1e-4, b=1e-4)
-            if self.mean_layer.bias is not None:
-                self.mean_layer.bias.zero_()
-            if not fixed_scale:
-                nn.init.uniform_(self.log_scale_layer.weight, a=-1e-4, b=1e-4)
-                if self.log_scale_layer.bias is not None:
-                    self.log_scale_layer.bias.zero_()
-            if self.mean_layer.bias is not None:
-                self.mean_layer.bias.zero_()
-
-    def _make_dist(self, mean: torch.Tensor, scale: torch.Tensor) -> dist.Distribution:
-        if self.use_independent:
-            return dist.Independent(dist.Normal(loc=mean, scale=scale), 1)
-        else:
-            cov = torch.diag_embed(scale.pow(2))
-            return dist.MultivariateNormal(loc=mean, covariance_matrix=cov)
-
-    def forward(self, inputs):
-        mean = self.mean_layer(inputs)
-        if self.tanh_mean:
-            mean = torch.tanh(mean)
-        if self._fixed_scale is not None:
-            scale = torch.ones_like(mean) * float(self._fixed_scale)
-        else:
-            log_scale = self.log_scale_layer(inputs)
-            scale = F.softplus(log_scale)
-            zero = torch.zeros(1, device=scale.device)
-            scale = scale * (self.init_scale / F.softplus(zero)) + self.min_scale
-        return mean, scale
-
-
 class CriticNetwork(nn.Module):
     def __init__(self, input_dim: int, layer_sizes=(512, 512, 256)):
         super().__init__()
@@ -1700,12 +1640,12 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--min_replay_size", type=int, default=512)
     parser.add_argument("--max_replay_size", type=int, default=1_000_000)
-    parser.add_argument("--n_step", type=int, default=5)
+    parser.add_argument("--n_step", type=int, default=4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--num_samples", type=int, default=20)
     parser.add_argument("--target_policy_update_period", type=int, default=25)
     parser.add_argument("--target_critic_update_period", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--lr_dual", type=float, default=1e-2)
     parser.add_argument("--wandb_project", type=str, default="mpo_project")
     parser.add_argument("--wandb_entity", type=str, default="adrian-research")
