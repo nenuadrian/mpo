@@ -7,37 +7,37 @@ import abc
 from absl import app
 from absl import flags
 import numpy as np
-import sonnet as snt
-import launchpad as lp
-import dm_env
-import reverb
+import sonnet as snt  # type: ignore
+import launchpad as lp  # type: ignore
+import dm_env  # type: ignore
+import reverb  # type: ignore
 import pickle
 import wandb
-from dm_control import suite
-import tree
+from dm_control import suite  # type: ignore
+import tree  # type: ignore
 import operator
 
 import acme
-from acme import specs
-from acme import types
-from acme import core
-from acme import adders as acme_adders
-from acme.tf import utils as tf2_utils
-from acme.utils import counting
-from acme.utils import loggers
-from acme import datasets
-from acme.adders import reverb as adders
-from acme.tf import variable_utils as tf2_variable_utils
-from acme.utils import lp_utils
-from acme import wrappers
-from acme.utils import paths
-from acme.utils import signals
-from acme.wrappers import mujoco as mujoco_wrappers
-from acme.utils import observers as observers_lib
+from acme import specs  # type: ignore
+from acme import types  # type: ignore
+from acme import core  # type: ignore
+from acme import adders as acme_adders  # type: ignore
+from acme.tf import utils as tf2_utils  # type: ignore
+from acme.utils import counting  # type: ignore
+from acme.utils import loggers  # type: ignore
+from acme import datasets  # type: ignore
+from acme.adders import reverb as adders  # type: ignore
+from acme.tf import variable_utils as tf2_variable_utils  # type: ignore
+from acme.utils import lp_utils  # type: ignore
+from acme import wrappers  # type: ignore
+from acme.utils import paths  # type: ignore
+from acme.utils import signals  # type: ignore
+from acme.wrappers import mujoco as mujoco_wrappers  # type: ignore
+from acme.utils import observers as observers_lib  # type: ignore
 
-import tensorflow as tf
-import tensorflow_probability as tfp
-import trfl
+import tensorflow as tf  # type: ignore
+import tensorflow_probability as tfp  # type: ignore
+import trfl  # type: ignore
 
 
 tfd = tfp.distributions
@@ -230,6 +230,7 @@ class EnvironmentLoop(core.Worker):
                 episode_count += 1
                 step_count += int(result["episode_length"])
                 # Log the given episode results.
+                wandb.log(result)
                 self._logger.write(result)
 
         return step_count
@@ -1772,6 +1773,7 @@ def _make_environment(
 
 def main(_):
     wandb.init(
+        name=_DOMAIN.value + "_" + _TASK.value + time.strftime("_%Y%m%d_%H%M%S"),
         entity="adrian-research",
         group=_DOMAIN.value + "_" + _TASK.value,
         project="lp_mpo_single_file",
