@@ -354,7 +354,7 @@ def main() -> None:
                 mean_series.values,
                 color=color,
                 linewidth=2,
-                label=f"{project_label} ({metric})",
+                label=f"{project_label[:15]} ({metric})",
             )
             if not std_series.empty:
                 std_bounds = pd.concat(

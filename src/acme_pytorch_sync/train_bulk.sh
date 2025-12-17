@@ -21,7 +21,7 @@ for pair in "${pairs[@]}"; do
     
     echo "Running: ${domain}/${task}"
     
-    python train_custom_acme_pytorch_mpo.py \
+    python train.py \
         --env_name "${domain}::${task}" \
         --max_actor_steps 2000000 \
         --n_step 5 --wandb_project "acme_pytorch_mpo_sync_no_AP_DC" --action_penalization false --per_dim_constraining false

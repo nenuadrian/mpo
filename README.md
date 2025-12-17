@@ -4,16 +4,20 @@
   - [Original MPO Paper](#original-mpo-paper)
   - [Using Google DeepMind Acme](#using-google-deepmind-acme)
     - [I - Single file Acme TF with Launchpad and other dm- dependencies (ATFLDM)](#i---single-file-acme-tf-with-launchpad-and-other-dm--dependencies-atfldm)
-      - [Visualize ATFLDM](#visualize-atfldm)
+      - [Results I](#results-i)
     - [II - Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)](#ii---single-file-acme-tf-with-only-dm-reverb-and-dm-sonnet-atfrs)
-      - [Visualize ATFRS](#visualize-atfrs)
+      - [Results II](#results-ii)
   - [III - PyTorch implementation based on ATFRS](#iii---pytorch-implementation-based-on-atfrs)
-    - [Visualize AcmePyTorch](#visualize-acmepytorch)
+    - [Results III](#results-iii)
     - [Video generation AcmePyTorch](#video-generation-acmepytorch)
   - [IV - Single-threaded Implementation of III](#iv---single-threaded-implementation-of-iii)
+    - [Results IV](#results-iv)
+      - [Without action\_penalization](#without-action_penalization)
+    - [Without action\_penalization and per-dim-constraining](#without-action_penalization-and-per-dim-constraining)
   - [V - Implementation from scratch in PyTorch (not working)](#v---implementation-from-scratch-in-pytorch-not-working)
-    - [Visualize](#visualize)
     - [Video generation](#video-generation)
+  - [VI - V-MPO based on IV](#vi---v-mpo-based-on-iv)
+    - [Results VI](#results-vi)
   - [Discovery: ACME – Google DM](#discovery-acme--google-dm)
     - [Overview](#overview)
     - [Notes](#notes)
@@ -51,7 +55,7 @@ Somewhat consolidated code from within acme still depending on acme but brought 
 python src/acme_launchpad_tf/train_lp_mpo_single_file.py --max_actor_steps 3000000 --domain cheetah --task run
 ```
 
-#### Visualize ATFLDM
+#### Results I
 
 ```bash
 python src/acme_launchpad_tf/visualize_acme_results.py --output results/acme_tf.png --metric episode_return --file "Cartpole_Balance::results/acme/mpo-tf-cartpole-balance.csv" --file "Hopper_Stand::results/acme/mpo-tf-hopper-stand.csv" --file "Hopper_Hop::results/acme/mpo-tf-hopper-hop.csv" --file "Walker_Walk::results/acme/mpo-tf-walker-walk.csv" --file "Walker_Run::results/acme/mpo-tf-walker-run.csv" --file "Walker_Stand::results/acme/mpo-tf-walker-stand.csv" --file "Reacher_Easy::results/acme/mpo-tf-reacher-easy.csv" --file "Reacher_Hard::results/acme/mpo-tf-reacher-hard.csv"  --file "Acrobot_Swingup::results/acme/mpo-tf-acrobot-swingup.csv"   --file "Pendulum_Swingup::results/acme/mpo-tf-pendulum-swingup.csv"  --file "Swimmer_Swimmer6::results/acme/mpo-tf-swimmer-swimmer6.csv" --file "Swimmer_Swimmer15::results/acme/mpo-tf-swimmer-swimmer15.csv" --file "Cheetah_Run::results/acme/mpo-tf-cheetah-run.csv" 
@@ -61,13 +65,13 @@ python src/acme_launchpad_tf/visualize_acme_results.py --output results/acme_tf.
 
 ### II - Single file Acme TF with only dm-Reverb and dm-Sonnet (ATFRS)
 
-Not able to remove dependencies further as Sonnet and Reverb are tightly integrated. But removed Acme and Launchpad dependencies. [src/acme_tf_custom/train_acme_tf_mpo.py](src/acme_tf_custom/train_acme_tf_mpo.py)
+Not able to remove dependencies further as Sonnet and Reverb are tightly integrated. But removed Acme and Launchpad dependencies. [src/acme_tf_custom/train.py](src/acme_tf_custom/train.py)
 
 ```bash
-python src/acme_tf_custom/train_acme_tf_mpo.py --max_actor_steps 3000000 --domain cheetah --task run
+python src/acme_tf_custom/train.py --max_actor_steps 3000000 --domain cheetah --task run
 ```
 
-#### Visualize ATFRS
+#### Results II
 
 ```bash
 python src/visualize_wandb.py --project-metric "G_ACME_TF_CUSTOM::evaluator/episode_return"  --entity "adrian-research" --cache-dir logs --show-individual --output results/custom_acme_tf.png --ncols 2
@@ -88,7 +92,7 @@ pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb 
 python src/acme_pytorch/train_custom_acme_pytorch_mpo.py --max_actor_steps 3000000 --wandb_project acme_pytorch_3 --env_name walker::walk
 ```
 
-### Visualize AcmePyTorch
+### Results III
 
 ```bash
 python src/visualize_wandb.py --project-metric "acme_pytorch_perf::eval/episode_return" --entity "adrian-research" --cache-dir logs --show-individual --output results/custom_acme_pytorch.png
@@ -104,11 +108,25 @@ python src/acme_pytorch/generate_video_acme_pytorch_mpo.py logs/mpo_experiment/i
 
 ## IV - Single-threaded Implementation of III
 
-[src/acme_pytorch_sync/train_custom_acme_pytorch_mpo.py](src/acme_pytorch_sync/train_custom_acme_pytorch_mpo.py)
+[src/acme_pytorch_sync/train.py](src/acme_pytorch_sync/train.py)
 
-Cheetah::run
+### Results IV
 
-![Custom Results](results/custom_acme_pytorch_sync.png)
+#### Without action_penalization
+
+```bash
+python src/visualize_wandb.py --project-metric "acme_pytorch_mpo_sync_no_action_penalization::eval/episode_return"  --entity "adrian-research" --cache-dir logs --show-individual --output results/custom_acme_pytorch_sync_no_ap.png --ncols 2
+```
+
+![Custom Results](results/custom_acme_pytorch_sync_no_ap.png)
+
+### Without action_penalization and per-dim-constraining
+
+```bash
+python src/visualize_wandb.py --project-metric "acme_pytorch_mpo_sync_no_AP_DC::eval/episode_return"  --entity "adrian-research" --cache-dir logs --show-individual --output results/custom_acme_pytorch_sync_no_ap_dc.png --ncols 2
+```
+
+![Custom Results](results/custom_acme_pytorch_sync_no_ap_dc.png)
 
 ## V - Implementation from scratch in PyTorch (not working)
 
@@ -120,14 +138,6 @@ pip install numpy pandas torch matplotlib "gymnasium[mujoco]" tensorboard wandb 
 python src/pytorch_custom/train_custom_pytorch_mpo.py --wandb_project custom_mpo9 --max_actor_steps 1500000 --env_names HalfCheetah-v5,Walker2d-v5 --env_iterations 1
 ```
 
-### Visualize
-
-```bash
-python src/visualize_wandb.py --project-metric "ppo6::eval/mean_reward" --project-metric "custom_mpo6::eval/mean_reward" --entity "adrian-research" --cache-dir logs --show-individual --output results/custom_pytorch.png
-```
-
-![Custom Results](results/custom_pytorch.png)
-
 ### Video generation
 
 ```bash
@@ -135,6 +145,18 @@ python src/pytorch_custom/generate_video_custom_pytorch_mpo.py logs/mpo_experime
 ```
 
 ![MPO Video](assets/cheetah.gif)
+
+## VI - V-MPO based on IV
+
+[src/acme_vmpo_pytorch/train.py](src/acme_vmpo_pytorch/train.py)
+
+### Results VI
+
+```bash
+python src/visualize_wandb.py --project-metric "acme_pytorch_vmpo_sync::eval/episode_return" --entity "adrian-research" --cache-dir logs --show-individual --output results/acme_vmpo_pytorch.png
+```
+
+![Custom Results](results/acme_vmpo_pytorch.png)
 
 ## Discovery: ACME – Google DM
 
