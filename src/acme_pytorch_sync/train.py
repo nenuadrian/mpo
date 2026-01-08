@@ -1253,6 +1253,23 @@ def run_policy_modules(
     return action.cpu().numpy()
 
 
+def get_env_specs(env_name: str) -> Tuple[int, int, np.ndarray, np.ndarray]:
+    """Infer flat obs dim, action dim, and action bounds from dm_control suite."""
+    domain, task = env_name.split("::")
+    probe_env = suite.load(domain, task)
+    obs_spec = probe_env.observation_spec()
+    if isinstance(obs_spec, dict):
+        obs_dim = sum(int(np.prod(sp.shape)) for sp in obs_spec.values())
+    else:
+        obs_dim = int(np.prod(obs_spec.shape))
+    action_spec = probe_env.action_spec()
+    action_dim = int(np.prod(action_spec.shape))
+    action_low = np.array(action_spec.minimum, dtype=np.float32)
+    action_high = np.array(action_spec.maximum, dtype=np.float32)
+    probe_env.close()
+    return obs_dim, action_dim, action_low, action_high
+
+
 def train(
     env_name: str,
     max_actor_steps: int,
@@ -1289,20 +1306,7 @@ def train(
     print(f"Using device: {device}")
 
     # Use dm_control suite to infer observation/action shapes and bounds.
-    domain, task = env_name.split("::")
-    probe_env = suite.load(domain, task)
-    obs_spec = probe_env.observation_spec()
-    # observation spec is often a dict of ArraySpec(s)
-    if isinstance(obs_spec, dict):
-        obs_dim = sum(int(np.prod(sp.shape)) for sp in obs_spec.values())
-    else:
-        obs_dim = int(np.prod(obs_spec.shape))
-    action_spec = probe_env.action_spec()
-    action_dim = int(np.prod(action_spec.shape))
-    action_low = np.array(action_spec.minimum, dtype=np.float32)
-    action_high = np.array(action_spec.maximum, dtype=np.float32)
-    probe_env.close()
-    del probe_env
+    obs_dim, action_dim, action_low, action_high = get_env_specs(env_name)
 
     agent = MPOAgent(
         obs_dim=obs_dim,
