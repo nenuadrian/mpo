@@ -12,13 +12,13 @@ import threading
 import dm_env  # type: ignore
 from dm_control import suite  # type: ignore
 
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
+import numpy as np # type: ignore
+import torch  # type: ignore
+import torch.nn as nn # type: ignore
+import torch.nn.functional as F # type: ignore
+import torch.optim as optim # type: ignore
 import wandb
-import torch.distributions as dist
+import torch.distributions as dist # type: ignore
 
 from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage  # type: ignore
 from tensordict import TensorDict  # type: ignore

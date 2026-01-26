@@ -20,7 +20,9 @@
     - [Results VI](#results-vi)
   - [VII - MoG MPO based on IV](#vii---mog-mpo-based-on-iv)
     - [Results VII](#results-vii)
-  - [Discovery: ACME – Google DM](#discovery-acme--google-dm)
+  - [VIII - StableBaselines3 (V-)MPO](#viii---stablebaselines3-v-mpo)
+  - [IX - NanoChat (V-)MPO](#ix---nanochat-v-mpo)
+  - [Research: ACME – Google DM](#research-acme--google-dm)
     - [Overview](#overview)
     - [Notes](#notes)
     - [Important Code](#important-code)
@@ -34,6 +36,9 @@
       - [Overview rlax](#overview-rlax)
       - [Important Docs and Code](#important-docs-and-code)
   - [Other Implementations](#other-implementations)
+  - [Transformers](#transformers)
+    - [Papers](#papers)
+      - [Reasoning to Learn from Latent Thoughts](#reasoning-to-learn-from-latent-thoughts)
 
 ## Original MPO Paper
 
@@ -176,7 +181,16 @@ python src/visualize_wandb.py --project-metric "mog_pytorch_sync::eval/episode_r
 
 ![Custom Results](results/mog_pytorch.png)
 
-## Discovery: ACME – Google DM
+## VIII - StableBaselines3 (V-)MPO
+
+- [StableBaselines3 MPO implementation](https://github.com/nenuadrian/stable-baselines3/tree/master/stable_baselines3/mpo)
+- [StableBaselines3 V-MPO implementation](https://github.com/nenuadrian/stable-baselines3/tree/master/stable_baselines3/vmpo)
+
+## IX - NanoChat (V-)MPO
+
+[NanoChat Fork](https://github.com/nenuadrian/nanochat/tree/mpo).
+
+## Research: ACME – Google DM
 
 ### Overview
 
@@ -275,3 +289,11 @@ python src/visualize_wandb.py --project-metric "mog_pytorch_sync::eval/episode_r
 
 - **PyTorch (≈5 years old, could not run):**  
   https://github.com/daisatojp/mpo
+
+## Transformers
+
+### Papers
+
+#### Reasoning to Learn from Latent Thoughts
+
+- [https://arxiv.org/abs/2503.18866](https://arxiv.org/abs/2503.18866) uses EM loop - [https://github.com/ryoungj/BoLT](https://github.com/ryoungj/BoLT)

@@ -397,7 +397,7 @@ class ConstructedMDDisentangledTransformer(nn.Module):
             )
             for g in range(1, m + 1):
                 k = g
-                if 0 <= k <= T:
+                if 0 <= k < T:
                     RA1[k, :] = +delta1
             self.l1.head.RA.copy_(RA1)
 
@@ -409,7 +409,7 @@ class ConstructedMDDisentangledTransformer(nn.Module):
             )
             for g in range(1, m + 1):
                 k = g
-                if 0 <= k <= T:
+                if 0 <= k < T:
                     RV1[k, g - 1] = 1.0
             self.l1.head.RV.copy_(RV1)
 
@@ -470,7 +470,7 @@ class ConstructedMDDisentangledTransformer(nn.Module):
             # RA3[k] = [+delta3 on first q dims, beta * e_g on Γ-block]
             for g in range(1, m + 1):
                 k = g
-                if 0 <= k <= T:
+                if 0 <= k < T:
                     v = torch.zeros(
                         d2, dtype=self.log_pi_star.dtype, device=self.log_pi_star.device
                     )
@@ -479,7 +479,7 @@ class ConstructedMDDisentangledTransformer(nn.Module):
                     RA3[k] = v
 
             # All other k get [-delta3 on first q dims] to suppress attention outside lag band
-            for k in range(1, T):
+            for k in range(0, T):
                 if not (1 <= k <= m):
                     v = torch.zeros(
                         d2, dtype=self.log_pi_star.dtype, device=self.log_pi_star.device
