@@ -1,5 +1,6 @@
 import numpy as np
 import copy
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -110,6 +111,8 @@ class AtariTrainer:
         gamma=0.99,
         lam=0.95,
         lr=2.5e-4,
+        n_temperature_epsilon=0.1,
+        eta_initial=1.0,
     ):
         self.env = make_atari_env(game)
         self.policy = CategoricalPolicy(self.env.action_space.n).to(device)
@@ -119,12 +122,13 @@ class AtariTrainer:
         self.opt_pi = optim.Adam(self.policy.parameters(), lr=lr)
         self.opt_v = optim.Adam(self.value.parameters(), lr=lr)
 
-        self.eta = nn.Parameter(torch.tensor(1.0, device=device))
+        self.eta = nn.Parameter(torch.tensor(eta_initial, device=device))
         self.opt_eta = optim.Adam([self.eta], lr=1e-3)
 
         self.rollout_steps = rollout_steps
         self.gamma = gamma
         self.lam = lam
+        self.n_temperature_epsilon = n_temperature_epsilon
 
         self.ep_return = 0.0
         self.ep_length = 0
@@ -215,6 +219,7 @@ class AtariTrainer:
         # measure KL AFTER policy update
         with torch.no_grad():
             new_logits = self.policy(s)
+            max_logit_diff = (new_logits - old_logits).abs().max().item()
 
         old_dist = torch.distributions.Categorical(logits=old_logits)
         new_dist = torch.distributions.Categorical(logits=new_logits)
@@ -224,11 +229,10 @@ class AtariTrainer:
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         # η dual optimisation (E-step temperature)
-        epsilon = 0.1
         T = adv.numel()
 
         eta_loss = eta * (
-            epsilon
+            self.n_temperature_epsilon
             + torch.logsumexp(adv.detach() / eta, dim=0)
             - torch.log(torch.tensor(float(T), device=adv.device))
         )
@@ -257,6 +261,7 @@ class AtariTrainer:
             "eta_loss": eta_loss.item(),
             "kl": float(kl.cpu()),
             "kl_sci": float(f"{kl.item():.6e}"),
+            "max_logit_diff": max_logit_diff,
         }
 
         if episode_returns:
@@ -283,6 +288,24 @@ class AtariTrainer:
 # Main
 # ---------------------------
 if __name__ == "__main__":
-    wandb.init(project="atari-pong-baseline")
-    AtariTrainer(game="Pong").train()
+    parser = argparse.ArgumentParser(description="Train Atari with VMPO")
+    parser.add_argument("--game", type=str, default="Pong")
+    parser.add_argument("--rollout_steps", type=int, default=1024)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--lam", type=float, default=0.95)
+    parser.add_argument("--lr", type=float, default=2.5e-4)
+    parser.add_argument("--n_temperature_epsilon", type=float, default=0.1)
+    parser.add_argument("--iters", type=int, default=10_000)
+    parser.add_argument("--eta_initial", type=float, default=1.0)
+    args = parser.parse_args()
+
+    wandb.init(project="atari-pong-baseline", config=vars(args))
+    AtariTrainer(
+        game=args.game,
+        rollout_steps=args.rollout_steps,
+        gamma=args.gamma,
+        lam=args.lam,
+        lr=args.lr,
+        n_temperature_epsilon=args.n_temperature_epsilon,
+    ).train(iters=args.iters)
     wandb.finish()
