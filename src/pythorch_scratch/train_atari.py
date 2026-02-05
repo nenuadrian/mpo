@@ -135,9 +135,7 @@ class AtariTrainer:
 
     def collect(self):
         obs, acts, rews, dones, vals = [], [], [], [], []
-        print("Collecting rollout...")
         # share of obs
-        print(self.env.observation_space.shape)
 
         s, _ = self.env.reset()
 
