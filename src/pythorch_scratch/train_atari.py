@@ -249,7 +249,8 @@ class AtariTrainer:
             "value_loss": value_loss.item(),
             "eta": eta.item(),
             "eta_loss": eta_loss.item(),
-            "kl": kl.item(),
+            "kl": float(kl.detach().cpu()),
+            "kl_sci": float(f"{kl.item():.6e}"),
         }
         if episode_returns:
             metrics.update(
