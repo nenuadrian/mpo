@@ -1,4 +1,3 @@
-import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,9 +10,6 @@ import wandb
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ---------------------------
-# Atari Environment
-# ---------------------------
 def make_atari_env(game, seed=None):
     env = gym.make(
         f"ALE/{game}-v5",
@@ -139,6 +135,9 @@ class AtariTrainer:
 
     def collect(self):
         obs, acts, rews, dones, vals = [], [], [], [], []
+        print("Collecting rollout...")
+        # share of obs
+        print(self.env.observation_space.shape)
 
         s, _ = self.env.reset()
 
@@ -182,11 +181,11 @@ class AtariTrainer:
         vals.append(v_last)
 
         return (
-            torch.tensor(obs, dtype=torch.float32).to(device),
-            torch.tensor(acts, dtype=torch.long).to(device),
-            torch.tensor(rews, dtype=torch.float32).to(device),
-            torch.tensor(dones, dtype=torch.float32).to(device),
-            torch.tensor(vals, dtype=torch.float32).to(device),
+            torch.from_numpy(np.asarray(obs, dtype=np.float32)).to(device),
+            torch.from_numpy(np.asarray(acts, dtype=np.int64)).to(device),
+            torch.from_numpy(np.asarray(rews, dtype=np.float32)).to(device),
+            torch.from_numpy(np.asarray(dones, dtype=np.float32)).to(device),
+            torch.from_numpy(np.asarray(vals, dtype=np.float32)).to(device),
             episode_returns,
         )
 
@@ -210,9 +209,14 @@ class AtariTrainer:
         self.opt_v.zero_grad()
         value_loss.backward()
         self.opt_v.step()
+        
+        with torch.no_grad():
+            dist = torch.distributions.Categorical(logits=self.policy(s))
+            entropy = dist.entropy().mean()
 
         metrics = {
-            "return": r.sum().item(),
+            "entropy": entropy.item(),
+            "rollout_return": r.sum().item(),
             "policy_loss": policy_loss.item(),
             "value_loss": value_loss.item(),
         }
