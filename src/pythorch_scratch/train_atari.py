@@ -307,5 +307,6 @@ if __name__ == "__main__":
         lam=args.lam,
         lr=args.lr,
         n_temperature_epsilon=args.n_temperature_epsilon,
+        eta_initial=args.eta_initial,
     ).train(iters=args.iters)
     wandb.finish()
