@@ -118,7 +118,7 @@ class AtariTrainer:
     def __init__(
         self,
         game="Pong",
-        rollout_steps=512,
+        rollout_steps=1024,
         gamma=0.99,
         lam=0.95,
         lr=2.5e-4,
