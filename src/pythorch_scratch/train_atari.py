@@ -24,7 +24,7 @@ def make_atari_env(game, seed=None):
         frame_skip=4,
         grayscale_obs=True,
         scale_obs=True,
-        terminal_on_life_loss=False,
+        terminal_on_life_loss=True,
     )
 
     env = FrameStackObservation(env, stack_size=4)
@@ -141,7 +141,7 @@ class AtariTrainer:
             s_t = torch.tensor(s, dtype=torch.float32).unsqueeze(0).to(device)
 
             with torch.no_grad():
-                a = self.policy.sample(s_t).item()
+                a = self.policy_old.sample(s_t).item()
                 v = self.value(s_t).item()
 
             s2, r, terminated, truncated, _ = self.env.step(a)
@@ -188,6 +188,9 @@ class AtariTrainer:
 
         adv, ret = compute_gae(r, v, d, self.gamma, self.lam)
 
+        # normalize advantages - centering
+        adv = adv - adv.mean()
+
         # ---- Policy loss (MPO-style softmax weighting)
         eta = self.eta.exp()  # ensure positivity
         weights = torch.softmax(adv / eta, dim=0)
@@ -211,12 +214,17 @@ class AtariTrainer:
         policy_loss.backward()
         self.opt_pi.step()
 
+        # update reference policy
+        self.policy_old.load_state_dict(self.policy.state_dict())
+
         # ---- Temperature (η) dual loss
         epsilon = 0.1
         eta = self.eta.exp()
         T = adv.numel()
         eta_loss = eta * (
-            epsilon + torch.logsumexp(adv.detach() / eta, dim=0) - np.log(T)
+            epsilon
+            + torch.logsumexp(adv.detach() / eta, dim=0)
+            - torch.log(torch.tensor(float(T), device=adv.device))
         )
 
         self.opt_eta.zero_grad()
@@ -229,8 +237,6 @@ class AtariTrainer:
         self.opt_v.zero_grad()
         value_loss.backward()
         self.opt_v.step()
-
-        self.policy_old.load_state_dict(self.policy.state_dict())
 
         with torch.no_grad():
             dist = torch.distributions.Categorical(logits=self.policy(s))
