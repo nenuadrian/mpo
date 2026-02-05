@@ -149,7 +149,7 @@ class AtariTrainer:
 
             r = np.clip(r, -1.0, 1.0)
 
-            # ---- episode tracking
+            # episode tracking
             self.ep_return += r
             self.ep_length += 1
 
@@ -184,43 +184,49 @@ class AtariTrainer:
         )
 
     def train_once(self):
+        # collect rollout with behaviour policy (policy_old)
         s, a, r, d, v, episode_returns = self.collect()
 
+        # advantages and returns (for policy_old)
         adv, ret = compute_gae(r, v, d, self.gamma, self.lam)
 
-        # normalize advantages - centering
+        # centre advantages (VMPO requires relative scale)
         adv = adv - adv.mean()
 
-        # ---- Policy loss (MPO-style softmax weighting)
-        eta = self.eta.exp()  # ensure positivity
+        # VMPO E-step weights
+        eta = self.eta.exp()
         weights = torch.softmax(adv / eta, dim=0)
 
+        # freeze reference policy logits
         with torch.no_grad():
             old_logits = self.policy_old(s)
 
-        new_logits = self.policy(s)
-        old_dist = torch.distributions.Categorical(logits=old_logits)
-        new_dist = torch.distributions.Categorical(logits=new_logits)
+        # M-step: policy update (weighted MLE)
+        new_logits_pre = self.policy(s)
+        new_dist_pre = torch.distributions.Categorical(logits=new_logits_pre)
+        logp = new_dist_pre.log_prob(a)
 
-        kl = torch.distributions.kl.kl_divergence(old_dist, new_dist).mean()
-
-        logp = new_dist.log_prob(a)
         policy_loss = -(weights.detach() * logp).mean()
-
-        kl_coef = 0.01
-        policy_loss = policy_loss + kl_coef * kl
 
         self.opt_pi.zero_grad()
         policy_loss.backward()
         self.opt_pi.step()
 
-        # update reference policy
+        # measure KL AFTER policy update
+        with torch.no_grad():
+            new_logits = self.policy(s)
+
+        old_dist = torch.distributions.Categorical(logits=old_logits)
+        new_dist = torch.distributions.Categorical(logits=new_logits)
+        kl = torch.distributions.kl.kl_divergence(old_dist, new_dist).mean()
+
+        # now update reference policy (becomes next behaviour policy)
         self.policy_old.load_state_dict(self.policy.state_dict())
 
-        # ---- Temperature (η) dual loss
+        # η dual optimisation (E-step temperature)
         epsilon = 0.1
-        eta = self.eta.exp()
         T = adv.numel()
+
         eta_loss = eta * (
             epsilon
             + torch.logsumexp(adv.detach() / eta, dim=0)
@@ -231,16 +237,16 @@ class AtariTrainer:
         eta_loss.backward()
         self.opt_eta.step()
 
-        # ---- Value loss
+        # value update (policy evaluation)
         value_loss = ((self.value(s) - ret) ** 2).mean()
 
         self.opt_v.zero_grad()
         value_loss.backward()
         self.opt_v.step()
 
+        # diagnostics
         with torch.no_grad():
-            dist = torch.distributions.Categorical(logits=self.policy(s))
-            entropy = dist.entropy().mean()
+            entropy = new_dist.entropy().mean()
 
         metrics = {
             "entropy": entropy.item(),
@@ -249,9 +255,10 @@ class AtariTrainer:
             "value_loss": value_loss.item(),
             "eta": eta.item(),
             "eta_loss": eta_loss.item(),
-            "kl": float(kl.detach().cpu()),
+            "kl": float(kl.cpu()),
             "kl_sci": float(f"{kl.item():.6e}"),
         }
+
         if episode_returns:
             metrics.update(
                 {
@@ -261,6 +268,7 @@ class AtariTrainer:
                     "episodes_in_rollout": len(episode_returns),
                 }
             )
+
         return metrics
 
     def train(self, iters=10_000):
