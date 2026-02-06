@@ -9,8 +9,20 @@ import torch.optim as optim
 import gymnasium as gym
 import shimmy
 import wandb
+import random
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Best-effort determinism (may impact performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def make_dm_control_env(domain, task, seed=None):
@@ -29,7 +41,11 @@ def make_dm_control_env(domain, task, seed=None):
         f"dm_control/{domain}-{task}-v0",
     )
     if seed is not None:
-        env.reset(seed=seed)
+        env.reset(seed=seed)  # seed env RNG once; subsequent reset() uses it
+        try:
+            env.action_space.seed(seed)
+        except Exception:
+            pass
     return env
 
 
@@ -145,8 +161,10 @@ class DMControlTrainer:
         lr=3e-4,
         n_temperature_epsilon=0.1,
         eta_initial=0.0,
+        seed: int = 42,
     ):
-        self.env = make_dm_control_env(domain, task)
+        set_seed(seed)
+        self.env = make_dm_control_env(domain, task, seed=seed)
 
         # Determine observation and action dimensions
         # dm_control obs may be a Dict space
@@ -432,7 +450,11 @@ if __name__ == "__main__":
         default=0.0,
         help="Initial value for log(η) temperature parameter",
     )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
+
+    # Ensure deterministic init before anything else uses RNGs
+    set_seed(args.seed)
 
     wandb.init(
         project="dm-control-vmpo",
@@ -449,5 +471,6 @@ if __name__ == "__main__":
         lr=args.lr,
         n_temperature_epsilon=args.n_temperature_epsilon,
         eta_initial=args.eta_initial,
+        seed=args.seed,
     ).train(iters=args.iters)
     wandb.finish()
