@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import wandb
+import os
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -140,6 +141,7 @@ class DMControlBatchTrainer:
         set_seed(seed)
         self.env = make_dm_control_env(domain, task, seed=seed)
         self.checkpoints_dir = f"checkpoints/{domain}_{task}"
+        os.makedirs(self.checkpoints_dir, exist_ok=True)
 
         if isinstance(self.env.observation_space, gym.spaces.Dict):
             obs_dim = sum(
