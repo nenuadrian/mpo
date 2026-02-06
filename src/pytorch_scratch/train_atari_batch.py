@@ -485,7 +485,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eta_initial",
         type=float,
-        default=1.0,
+        default=0.0,
         help="Initial value for log(η) temperature parameter",
     )
     args = parser.parse_args()
