@@ -138,6 +138,7 @@ class DMControlBatchTrainer:
     ):
         set_seed(seed)
         self.env = make_dm_control_env(domain, task, seed=seed)
+        self.checkpoints_dir = f"checkpoints/{domain}_{task}"
 
         if isinstance(self.env.observation_space, gym.spaces.Dict):
             obs_dim = sum(
@@ -461,6 +462,35 @@ class DMControlBatchTrainer:
             wandb.log(info, step=self.total_env_steps)
             if it % 10 == 0:
                 print(it, info)
+            if it % 100 == 0:
+                self.save_checkpoint(f"{self.checkpoints_dir}/ckpt.pt", it)
+
+    def save_checkpoint(self, path, it):
+        ckpt = {
+            "iteration": it,
+            "policy": self.policy.state_dict(),
+            "policy_old": self.policy_old.state_dict(),
+            "value": self.value.state_dict(),
+            "opt_pi": self.opt_pi.state_dict(),
+            "opt_v": self.opt_v.state_dict(),
+            "opt_eta": self.opt_eta.state_dict(),
+            "opt_alpha_mu": self.opt_alpha_mu.state_dict(),
+            "opt_alpha_sigma": self.opt_alpha_sigma.state_dict(),
+            "eta": self.eta.detach().cpu(),
+            "log_alpha_mu": self.log_alpha_mu.detach().cpu(),
+            "log_alpha_sigma": self.log_alpha_sigma.detach().cpu(),
+            "rng_state": {
+                "torch": torch.get_rng_state(),
+                "cuda": (
+                    torch.cuda.get_rng_state_all()
+                    if torch.cuda.is_available()
+                    else None
+                ),
+                "numpy": np.random.get_state(),
+                "python": random.getstate(),
+            },
+        }
+        torch.save(ckpt, path)
 
 
 if __name__ == "__main__":
