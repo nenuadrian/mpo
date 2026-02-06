@@ -185,7 +185,7 @@ class AtariTrainer:
     def __init__(
         self,
         game="Pong",
-        rollout_steps=1024,
+        rollout_steps=4096,
         gamma=0.99,
         lam=0.95,
         lr=2.5e-4,
@@ -222,6 +222,7 @@ class AtariTrainer:
         # Running episode statistics (accumulated across rollout boundaries)
         self.ep_return = 0.0
         self.ep_length = 0
+        self.total_env_steps = 0
 
     # Data Collection  (rollout with π_old)
 
@@ -270,7 +271,7 @@ class AtariTrainer:
             rews.append(r)
             dones.append(float(done))
             vals.append(v)
-
+            self.total_env_steps += 1
         # Bootstrap value for the last state (needed by GAE to compute the
         # advantage of the final transition in the rollout).
         with torch.no_grad():
@@ -303,26 +304,22 @@ class AtariTrainer:
         # the value network's predictions from the rollout.
         adv, ret = compute_gae(r, v, d, self.gamma, self.lam)
 
-        # Centre advantages so the softmax in the E-step operates on
-        # relative advantage (mean-zero).  This improves numerical
-        # stability and ensures the temperature η controls selectivity
-        # around the mean rather than around zero.
-        adv = adv - adv.mean()
-
-        # E-STEP  –  compute non-parametric variational distribution
-        # The E-step forms a categorical distribution q over the T
-        # rollout samples with:
-        #     q_i  ∝  exp( A_i / η )
-        # Implemented as  softmax( A / η ).
-        #
-        # η (eta) is a learned temperature:
-        #   - Large η → weights are nearly uniform → conservative update.
-        #   - Small η → weights concentrate on high-advantage samples.
-        # η is kept positive by storing it in log-space (self.eta) and
-        # exponentiating here.
-
-        eta = self.eta.exp()
-        weights = torch.softmax(adv / eta, dim=0)
+        with torch.no_grad():
+            # Calculate top 50% threshold
+            top_k_threshold = torch.quantile(adv, 0.5)
+            mask = adv >= top_k_threshold
+            
+            # Select only top-k samples for probability calculation
+            adv_selected = adv[mask]
+            
+            # Centre advantages for numerical stability of softmax
+            # (Note: V-MPO formulation is invariant to shifting A, but float precision isn't)
+            adv_selected = adv_selected - adv_selected.mean()
+            
+            # E-STEP: Compute weights on the subset
+            eta = self.eta.exp()
+            # w_i = exp(A_i / eta) / Z
+            weights = torch.softmax(adv_selected / eta, dim=0)
 
         # Snapshot the behaviour policy's logits (needed for KL after
         # the M-step and for diagnostics).
@@ -433,7 +430,7 @@ class AtariTrainer:
         """Run `iters` VMPO iterations, logging to W&B each step."""
         for it in range(iters):
             info = self.train_once()
-            wandb.log(info)
+            wandb.log(info, step=self.total_env_steps)
             if it % 10 == 0:
                 print(it, info)
 
