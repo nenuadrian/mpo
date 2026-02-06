@@ -280,8 +280,11 @@ class DMControlBatchTrainer:
         # and acts as a trust-region filter.
         with torch.no_grad():
             # 1. Select top-k advantages (top 50%)
-            top_k_threshold = torch.quantile(adv, self.top_k_fraction)
-            mask = adv >= top_k_threshold
+            if self.top_k_fraction < 1.0:
+                top_k_threshold = torch.quantile(adv, self.top_k_fraction)
+                mask = adv >= top_k_threshold
+            else:
+                mask = torch.ones_like(adv, dtype=torch.bool)
 
             # 2. Extract selected advantages
             adv_selected = adv[mask]
@@ -440,7 +443,7 @@ class DMControlBatchTrainer:
             "kl": (total_kl_mu + total_kl_sigma) / self.n_policy_updates,
             "ess": ess.item(),
             "ess_frac": ess_frac.item(),
-            "ess_ration": ess.item() / adv_selected.numel(),
+            "ess_ratio": ess.item() / adv_selected.numel(),
         }
 
         if episode_returns:
