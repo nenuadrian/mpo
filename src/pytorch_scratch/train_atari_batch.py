@@ -266,6 +266,12 @@ class AtariTrainer:
             self.ep_return += r
             self.ep_length += 1
 
+            obs.append(s)
+            acts.append(a)
+            rews.append(r)
+            dones.append(float(done))
+            vals.append(v)
+
             if done:
                 episode_returns.append(self.ep_return)
                 self.ep_return = 0.0
@@ -274,11 +280,6 @@ class AtariTrainer:
             else:
                 s = s2
 
-            obs.append(s)
-            acts.append(a)
-            rews.append(r)
-            dones.append(float(done))
-            vals.append(v)
             self.total_env_steps += 1
         # Bootstrap value for the last state (needed by GAE to compute the
         # advantage of the final transition in the rollout).
@@ -393,15 +394,15 @@ class AtariTrainer:
 
                 total_loss = policy_loss + alpha_loss
 
-                # ---- optimise policy θ ----
+                # θ update
                 self.opt_pi.zero_grad()
-                total_loss.backward(retain_graph=True)
+                (policy_loss + alpha.detach() * kl).backward()
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
                 self.opt_pi.step()
 
-                # ---- optimise α (dual ascent) ----
+                # α update
                 self.opt_alpha.zero_grad()
-                (-alpha_loss).backward()
+                (alpha * (self.eps_alpha - kl.detach())).backward()
                 self.opt_alpha.step()
 
                 total_policy_loss += policy_loss.item()
@@ -460,7 +461,8 @@ class AtariTrainer:
 
         metrics = {
             "entropy": entropy.item(),
-            "rollout_return": r.sum().item(),  # total reward in this rollout
+            "rollout_return": float(np.sum(episode_returns))
+            / max(1, len(episode_returns)),
             "policy_loss": total_policy_loss / n_epochs,  # M-step loss
             "value_loss": total_value_loss / n_epochs,  # critic MSE
             "eta": eta.item(),  # current temperature
