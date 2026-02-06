@@ -209,11 +209,7 @@ class AtariTrainer:
         self.ep_length = 0
         self.total_env_steps = 0
 
-        self.target_update_interval = 4  # T_target (Atari-safe default)
-        self._target_update_counter = 0
-
     # Data Collection  (rollout with π_old)
-
     def collect(self):
         """Collect a fixed-length rollout using the behaviour policy π_old.
 
@@ -292,39 +288,17 @@ class AtariTrainer:
         # the value network's predictions from the rollout.
         adv, ret = compute_gae(r, v, d, self.gamma, self.lam)
 
-        # Advantage Pre-processing (Top-K Masking)
-        # We only want to weight the "good" half of the samples.
-        # This prevents the exponential weights from being dominated by outliers
-        # and acts as a trust-region filter.
-        with torch.no_grad():
-            # Calculate top 50% threshold
-            top_k_threshold = torch.quantile(adv, 0.5)
-            # Create a boolean mask of size (T,)
-            mask = adv >= top_k_threshold
-
-            # Select only top-k advantages
-            adv_selected = adv[mask]
-
-            # Centre advantages for numerical stability of softmax
-            # (Note: V-MPO formulation is invariant to shifting A, but float precision isn't)
-            adv_selected = adv_selected - adv_selected.mean()
-
-            # E-STEP: Compute weights on the subset
-            eta = self.eta.exp()
-            # w_i = exp(A_i / eta) / Z
-            weights_selected = torch.softmax(adv_selected / eta, dim=0)
+        adv = (adv - adv.mean()) / (
+            adv.std() + 1e-8
+        )  # normalise advantages for stability
 
         # M-STEP & Value Update Loop
-        # We iterate multiple times over the batch to fully regress the policy onto the target q.
-
-        n_epochs = 4
-        batch_size = 128  # Mini-batch size
 
         # Prepare datasets:
         # Policy uses ONLY Top-K data (masked)
-        s_top = s[mask]
-        a_top = a[mask]
-        w_top = weights_selected  # These are detached and fixed for the epoch loop
+        s_top = s
+        a_top = a
+        w_top = torch.softmax(adv, dim=0).detach()
 
         # Value function uses ALL data (unmasked)
         s_full = s
@@ -334,6 +308,8 @@ class AtariTrainer:
         total_value_loss = 0.0
         total_kl = 0.0
 
+        n_epochs = 1
+        batch_size = len(s_top)  # Mini-batch size
         for epoch in range(n_epochs):
             # --- Policy Update Loop (on Top-K data) ---
             perm_top = torch.randperm(len(s_top))
@@ -398,27 +374,21 @@ class AtariTrainer:
                 self.opt_v.step()
                 total_value_loss += value_loss.item()
 
-        # Sync Behaviour Policy  π_old ← π_θ
-        # The updated policy becomes the behaviour policy for the next
-        # rollout.  This is the "hard" target-network update.
-        self._target_update_counter += 1
-
-        if self._target_update_counter % self.target_update_interval == 0:
-            self.policy_old.load_state_dict(self.policy.state_dict())
+        self.policy_old.load_state_dict(self.policy.state_dict())
 
         # DUAL η UPDATE  –  E-step temperature optimisation
         # We perform this ONCE per rollout using the cached `adv_selected`.
         # Re-calculate eta from parameter to ensure the graph is connected.
 
         eta = self.eta.exp()
-        T_factor = torch.tensor(float(len(adv_selected)), device=adv.device)
+        T_factor = torch.tensor(float(len(adv)), device=adv.device)
 
         # The dual objective: η * ε + η * log( mean( exp(A/η) ) )
         # Implemented using logsumexp for stability:
         # log( mean( exp(A/η) ) ) = log( sum(exp(A/η)) / N ) = logsumexp(A/η) - log(N)
         eta_loss = eta * (
             self.n_temperature_epsilon
-            + torch.logsumexp(adv_selected.detach() / eta, dim=0)
+            + torch.logsumexp(adv.detach() / eta, dim=0)
             - torch.log(T_factor)
         )
 
