@@ -123,7 +123,7 @@ class DMControlBatchTrainer:
         self,
         domain="cheetah",
         task="run",
-        rollout_steps=2048,
+        rollout_steps=4096,
         gamma=0.99,
         lam=0.95,
         lr=3e-4,
@@ -298,33 +298,33 @@ class DMControlBatchTrainer:
             # --- Policy Update Loop (on Top-K data) ---
 
             # M-STEP: Weighted Maximum Likelihood
-            # New policy
-            new_dist = self.policy.dist(s_top)
-            logp = new_dist.log_prob(a_top).sum(dim=-1)
-
-            # Old policy (detached)
-            with torch.no_grad():
-                old_dist = self.policy_old.dist(s_top)
-
+            # (A) Policy loss — top-k batch
+            new_dist_top = self.policy.dist(s_top)
+            logp = new_dist_top.log_prob(a_top).sum(dim=-1)
             policy_loss = -(q_weights * logp).mean()
 
-            # KL(π_old || π_new)
-            kl = (
-                torch.distributions.kl_divergence(old_dist, new_dist).sum(dim=-1).mean()
+            # (B) KL constraint — full batch
+            with torch.no_grad():
+                old_dist_full = self.policy_old.dist(s)
+            new_dist_full = self.policy.dist(s)
+            kl_full = (
+                torch.distributions.kl_divergence(old_dist_full, new_dist_full)
+                .sum(dim=-1)
+                .mean()
             )
-            total_kl += kl.item()
+            total_kl += kl_full.item()
 
             alpha = self.log_alpha.exp()
 
             # θ update
             self.opt_pi.zero_grad()
-            (policy_loss + alpha.detach() * kl).backward()
+            (policy_loss + alpha.detach() * kl_full).backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
             self.opt_pi.step()
 
             # α update
             self.opt_alpha.zero_grad()
-            (alpha * (self.eps_alpha - kl.detach())).backward()
+            (alpha * (self.eps_alpha - kl_full.detach())).backward()
             self.opt_alpha.step()
 
             total_policy_loss += policy_loss.item()
@@ -377,7 +377,7 @@ class DMControlBatchTrainer:
             "eta": eta.item(),  # current temperature
             "eta_loss": eta_loss.item(),  # dual objective value
             "alpha": self.log_alpha.exp().item(),
-            "kl": total_kl / max(1, len(s_top)),
+            "kl": total_kl / n_epochs,
         }
 
         if episode_returns:
@@ -420,7 +420,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--rollout_steps",
         type=int,
-        default=2048,
+        default=4096,
         help="Number of environment steps per rollout",
     )
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor γ")
