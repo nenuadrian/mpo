@@ -505,7 +505,7 @@ class DMControlBatchTrainer:
     def train(self, iters=10_000):
         for it in range(iters):
             info = self.train_once()
-            if it % 100 == 0:
+            if it % 30 == 0:
                 eval_metrics = self.evaluate(n_episodes=10)
                 info.update(eval_metrics)
             wandb.log(info, step=self.total_env_steps)
