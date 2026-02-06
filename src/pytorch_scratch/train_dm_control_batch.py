@@ -133,6 +133,8 @@ class DMControlBatchTrainer:
         eps_alpha_mu: float = 0.5,
         eps_alpha_sigma: float = 0.01,
         top_k_fraction: float = 1.0,
+        n_value_updates: int = 2,
+        n_policy_updates: int = 4,
     ):
         set_seed(seed)
         self.env = make_dm_control_env(domain, task, seed=seed)
@@ -186,6 +188,9 @@ class DMControlBatchTrainer:
         self.ep_length = 0
         self.total_env_steps = 0
         self.top_k_fraction = top_k_fraction
+
+        self.n_value_updates = n_value_updates
+        self.n_policy_updates = n_policy_updates
 
         self.domain = domain
         self.task = task
@@ -292,8 +297,6 @@ class DMControlBatchTrainer:
         # M-STEP & Value Update Loop
         # We iterate multiple times over the batch to fully regress the policy onto the target q.
 
-        n_epochs = 5
-
         # Prepare datasets:
         # Policy uses ONLY Top-K data (masked)
         s_top = s[mask]
@@ -302,11 +305,10 @@ class DMControlBatchTrainer:
         # Value function uses ALL data (unmasked)
 
         total_policy_loss = 0.0
-        total_value_loss = 0.0
         total_kl_mu = 0.0
         total_kl_sigma = 0.0
 
-        for _ in range(n_epochs):
+        for _ in range(self.n_policy_updates):
             # --- Policy Update Loop (on Top-K data) ---
 
             # M-STEP: Weighted Maximum Likelihood
@@ -375,14 +377,18 @@ class DMControlBatchTrainer:
         # --- Value Update Loop (on ALL data) ---
         # Value function learns from all transitions to properly estimate V(s)
 
-        values = self.value(s)
-        value_loss = ((values - ret) ** 2).mean()
+        total_value_loss = 0.0
 
-        self.opt_v.zero_grad()
-        value_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.5)
-        self.opt_v.step()
-        total_value_loss += value_loss.item()
+        for _ in range(self.n_value_updates):
+            values = self.value(s)
+            value_loss = ((values - ret) ** 2).mean()
+
+            self.opt_v.zero_grad()
+            value_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.5)
+            self.opt_v.step()
+
+            total_value_loss += value_loss.item()
 
         self.policy_old.load_state_dict(self.policy.state_dict())
 
@@ -422,17 +428,18 @@ class DMControlBatchTrainer:
             "entropy": entropy.item(),
             "rollout_return": float(np.sum(episode_returns))
             / max(1, len(episode_returns)),
-            "policy_loss": total_policy_loss / n_epochs,  # M-step loss
-            "value_loss": total_value_loss / n_epochs,  # critic MSE
+            "policy_loss": total_policy_loss / self.n_policy_updates,  # M-step loss
+            "value_loss": total_value_loss / self.n_value_updates,  # critic MSE
             "eta": eta.item(),  # current temperature
             "eta_loss": eta_loss.item(),  # dual objective value
             "alpha_mu": self.log_alpha_mu.exp().item(),
             "alpha_sigma": self.log_alpha_sigma.exp().item(),
-            "kl_mu": total_kl_mu / n_epochs,
-            "kl_sigma": total_kl_sigma / n_epochs,
-            "kl": (total_kl_mu + total_kl_sigma) / n_epochs,
+            "kl_mu": total_kl_mu / self.n_policy_updates,
+            "kl_sigma": total_kl_sigma / self.n_policy_updates,
+            "kl": (total_kl_mu + total_kl_sigma) / self.n_policy_updates,
             "ess": ess.item(),
             "ess_frac": ess_frac.item(),
+            "ess_ration": ess.item() / adv_selected.numel(),
         }
 
         if episode_returns:
