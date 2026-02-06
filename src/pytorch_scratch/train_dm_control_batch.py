@@ -327,19 +327,23 @@ class DMControlBatchTrainer:
             (alpha * (self.eps_alpha - kl_full.detach())).backward()
             self.opt_alpha.step()
 
+            # Projection: enforce α >= 1e-8 (in log-space)
+            with torch.no_grad():
+                self.log_alpha.clamp_(min=np.log(1e-8))
+
             total_policy_loss += policy_loss.item()
 
-            # --- Value Update Loop (on ALL data) ---
-            # Value function learns from all transitions to properly estimate V(s)
+        # --- Value Update Loop (on ALL data) ---
+        # Value function learns from all transitions to properly estimate V(s)
 
-            values = self.value(s)
-            value_loss = ((values - ret) ** 2).mean()
+        values = self.value(s)
+        value_loss = ((values - ret) ** 2).mean()
 
-            self.opt_v.zero_grad()
-            value_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.5)
-            self.opt_v.step()
-            total_value_loss += value_loss.item()
+        self.opt_v.zero_grad()
+        value_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.5)
+        self.opt_v.step()
+        total_value_loss += value_loss.item()
 
         self.policy_old.load_state_dict(self.policy.state_dict())
 
@@ -362,6 +366,13 @@ class DMControlBatchTrainer:
         self.opt_eta.zero_grad()
         eta_loss.backward()
         self.opt_eta.step()
+
+        # Projection: enforce η >= 1e-8 (in log-space)
+        with torch.no_grad():
+            self.eta.clamp_(min=np.log(1e-8))
+
+        # Recompute η for logging after projection/update
+        eta = self.eta.exp()
 
         # Diagnostics / Logging
         with torch.no_grad():
