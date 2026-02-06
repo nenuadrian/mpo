@@ -292,7 +292,6 @@ class DMControlBatchTrainer:
         # Policy uses ONLY Top-K data (masked)
         s_top = s[mask]
         a_top = a[mask]
-        q_top = q_weights[mask]
 
         # Value function uses ALL data (unmasked)
 
@@ -312,7 +311,7 @@ class DMControlBatchTrainer:
             with torch.no_grad():
                 old_dist = self.policy_old.dist(s_top)
 
-            policy_loss = -(q_top * logp).mean()
+            policy_loss = -(q_weights * logp).mean()
 
             # KL(π_old || π_new)
             kl = (
