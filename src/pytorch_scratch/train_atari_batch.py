@@ -318,7 +318,6 @@ class AtariTrainer:
         # We iterate multiple times over the batch to fully regress the policy onto the target q.
 
         n_epochs = 4
-        batch_size = 128  # Mini-batch size
 
         # Prepare datasets:
         # Policy uses ONLY Top-K data (masked)
@@ -336,65 +335,61 @@ class AtariTrainer:
 
         for epoch in range(n_epochs):
             # --- Policy Update Loop (on Top-K data) ---
-            perm_top = torch.randperm(len(s_top))
 
-            for start in range(0, len(s_top), batch_size):
-                idx = perm_top[start : start + batch_size]
-                mb_s = s_top[idx]
-                mb_a = a_top[idx]
-                mb_w = q_top[idx]
+            idx = torch.randperm(len(s_top))
+            mb_s = s_top[idx]
+            mb_a = a_top[idx]
+            mb_w = q_top[idx]
 
-                # M-STEP: Weighted Maximum Likelihood
-                # New policy
-                logits = self.policy(mb_s)
-                dist = torch.distributions.Categorical(logits=logits)
-                logp = dist.log_prob(mb_a)
+            # M-STEP: Weighted Maximum Likelihood
+            # New policy
+            logits = self.policy(mb_s)
+            dist = torch.distributions.Categorical(logits=logits)
+            logp = dist.log_prob(mb_a)
 
-                # Old policy (detached)
-                with torch.no_grad():
-                    old_logits = self.policy_old(mb_s)
-                    old_dist = torch.distributions.Categorical(logits=old_logits)
+            # Old policy (detached)
+            with torch.no_grad():
+                old_logits = self.policy_old(mb_s)
+                old_dist = torch.distributions.Categorical(logits=old_logits)
 
-                # L_pi = - sum( w_i * log pi(a|s) )
-                # Note: mb_w sum is not 1 here due to mini-batching, but gradient scales linearly.
-                # Since weights sum to 1 over the full set, we sum here (not mean).
-                policy_loss = -(mb_w * logp).sum()
+            # L_pi = - sum( w_i * log pi(a|s) )
+            # Note: mb_w sum is not 1 here due to mini-batching, but gradient scales linearly.
+            # Since weights sum to 1 over the full set, we sum here (not mean).
+            policy_loss = -(mb_w * logp).sum()
 
-                # KL(π_old || π_new)
-                kl = torch.distributions.kl_divergence(old_dist, dist).mean()
-                total_kl += kl.item()
+            # KL(π_old || π_new)
+            kl = torch.distributions.kl_divergence(old_dist, dist).mean()
+            total_kl += kl.item()
 
-                alpha = self.log_alpha.exp()
+            alpha = self.log_alpha.exp()
 
-                # θ update
-                self.opt_pi.zero_grad()
-                (policy_loss + alpha.detach() * kl).backward()
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
-                self.opt_pi.step()
+            # θ update
+            self.opt_pi.zero_grad()
+            (policy_loss + alpha.detach() * kl).backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+            self.opt_pi.step()
 
-                # α update
-                self.opt_alpha.zero_grad()
-                (alpha * (self.eps_alpha - kl.detach())).backward()
-                self.opt_alpha.step()
+            # α update
+            self.opt_alpha.zero_grad()
+            (alpha * (self.eps_alpha - kl.detach())).backward()
+            self.opt_alpha.step()
 
-                total_policy_loss += policy_loss.item()
+            total_policy_loss += policy_loss.item()
 
             # --- Value Update Loop (on ALL data) ---
             # Value function learns from all transitions to properly estimate V(s)
-            perm_full = torch.randperm(len(s_full))
-            for start in range(0, len(s_full), batch_size):
-                idx = perm_full[start : start + batch_size]
-                mb_s = s_full[idx]
-                mb_ret = ret_full[idx]
+            idx = torch.randperm(len(s_full))
+            mb_s = s_full[idx]
+            mb_ret = ret_full[idx]
 
-                values = self.value(mb_s)
-                value_loss = ((values - mb_ret) ** 2).mean()
+            values = self.value(mb_s)
+            value_loss = ((values - mb_ret) ** 2).mean()
 
-                self.opt_v.zero_grad()
-                value_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.5)
-                self.opt_v.step()
-                total_value_loss += value_loss.item()
+            self.opt_v.zero_grad()
+            value_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.5)
+            self.opt_v.step()
+            total_value_loss += value_loss.item()
 
         # Sync Behaviour Policy  π_old ← π_θ
         # The updated policy becomes the behaviour policy for the next

@@ -292,7 +292,7 @@ class DMControlBatchTrainer:
         # M-STEP & Value Update Loop
         # We iterate multiple times over the batch to fully regress the policy onto the target q.
 
-        n_epochs = 4
+        n_epochs = 2
 
         # Prepare datasets:
         # Policy uses ONLY Top-K data (masked)
