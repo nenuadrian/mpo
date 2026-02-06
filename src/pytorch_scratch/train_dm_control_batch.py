@@ -269,24 +269,18 @@ class DMControlBatchTrainer:
         # This prevents the exponential weights from being dominated by outliers
         # and acts as a trust-region filter.
         with torch.no_grad():
-            # Calculate top 50% threshold
+            # 1. Select top-k advantages (top 50%)
             top_k_threshold = torch.quantile(adv, 0.5)
-            # Create a boolean mask of size (T,)
             mask = adv >= top_k_threshold
 
-            # Select only top-k advantages
+            # 2. Extract selected advantages
             adv_selected = adv[mask]
 
-            # Centre advantages for numerical stability of softmax
-            # (Note: V-MPO formulation is invariant to shifting A, but float precision isn't)
+            # 3. Centre for numerical stability ONLY
             adv_selected = adv_selected - adv_selected.mean()
-            adv = adv - adv.mean()
-            mask = adv >= adv_selected.median()
-            adv_selected = adv[mask]
 
-            # E-STEP: Compute weights on the subset
+            # 4. E-step weights
             eta = self.eta.exp()
-            # w_i = exp(A_i / eta) / Z
             q_weights = torch.softmax(adv_selected / eta, dim=0)
 
         # M-STEP & Value Update Loop
@@ -324,10 +318,7 @@ class DMControlBatchTrainer:
             with torch.no_grad():
                 old_dist = self.policy_old.dist(mb_s)
 
-            # L_pi = - sum( w_i * log pi(a|s) )
-            # Note: mb_w sum is not 1 here due to mini-batching, but gradient scales linearly.
-            # Since weights sum to 1 over the full set, we sum here (not mean).
-            policy_loss = -(mb_w * logp).sum()
+            policy_loss = -(mb_w * logp).mean()
 
             # KL(π_old || π_new)
             kl = (
