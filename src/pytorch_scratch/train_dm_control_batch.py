@@ -132,7 +132,7 @@ class DMControlBatchTrainer:
         seed: int = 42,
         eps_alpha_mu: float = 0.5,
         eps_alpha_sigma: float = 0.01,
-        top_k_fraction: float = 0.5,
+        top_k_fraction: float = 1.0,
     ):
         set_seed(seed)
         self.env = make_dm_control_env(domain, task, seed=seed)
@@ -286,6 +286,8 @@ class DMControlBatchTrainer:
             # 4. E-step weights
             eta = self.eta.exp()
             q_weights = torch.softmax(adv_selected / eta, dim=0)
+            ess = 1.0 / torch.sum(q_weights**2)
+            ess_frac = ess / q_weights.numel()
 
         # M-STEP & Value Update Loop
         # We iterate multiple times over the batch to fully regress the policy onto the target q.
@@ -413,7 +415,7 @@ class DMControlBatchTrainer:
 
         # Diagnostics / Logging
         with torch.no_grad():
-            new_dist = self.policy.dist(s[:512])
+            new_dist = self.policy.dist(s)
             entropy = new_dist.entropy().sum(dim=-1).mean()
 
         metrics = {
@@ -429,6 +431,8 @@ class DMControlBatchTrainer:
             "kl_mu": total_kl_mu / n_epochs,
             "kl_sigma": total_kl_sigma / n_epochs,
             "kl": (total_kl_mu + total_kl_sigma) / n_epochs,
+            "ess": ess.item(),
+            "ess_frac": ess_frac.item(),
         }
 
         if episode_returns:
@@ -496,7 +500,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eta_initial",
         type=float,
-        default=0.0,
+        default=-1.0,
         help="Initial value for log(η) temperature parameter",
     )
     parser.add_argument(
@@ -546,5 +550,6 @@ if __name__ == "__main__":
         seed=args.seed,
         eps_alpha_mu=args.eps_alpha_mu,
         eps_alpha_sigma=args.eps_alpha_sigma,
+        top_k_fraction=args.top_k_fraction,
     ).train(iters=args.iters)
     wandb.finish()

@@ -432,8 +432,8 @@ class AtariTrainer:
             / max(1, len(episode_returns)),
             "policy_loss": total_policy_loss / n_epochs,  # M-step loss
             "value_loss": total_value_loss / n_epochs,  # critic MSE
-            "eta": eta.item(),  # current temperature
-            "eta_loss": eta_loss.item(),  # dual objective value
+            "eta_temperature": eta.item(),  # current temperature
+            "eta_temperature_loss": eta_loss.item(),  # dual objective value
             "alpha": self.log_alpha.exp().item(),
             "kl": total_kl / max(1, len(s_top)),
         }
