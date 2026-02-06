@@ -511,7 +511,7 @@ class DMControlBatchTrainer:
             wandb.log(info, step=self.total_env_steps)
             if it % 10 == 0:
                 print(it, info)
-            if it % 100 == 0:
+            if it % 30 == 0:
                 self.save_checkpoint(f"{self.checkpoints_dir}/ckpt.pt", it)
 
     def save_checkpoint(self, path, it):

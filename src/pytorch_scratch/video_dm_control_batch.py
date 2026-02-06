@@ -29,8 +29,7 @@ def render_policy(
 ):
     set_seed(seed)
 
-    # --- Load checkpoint ---
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # --- Build env with RGB rendering ---
     env = make_dm_control_env(
