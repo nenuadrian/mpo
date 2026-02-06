@@ -130,6 +130,8 @@ class DMControlBatchTrainer:
         n_temperature_epsilon=0.1,
         eta_initial=0.0,
         seed: int = 42,
+        eps_alpha_mu: float = 0.5,
+        eps_alpha_sigma: float = 0.01,
     ):
         set_seed(seed)
         self.env = make_dm_control_env(domain, task, seed=seed)
@@ -175,8 +177,8 @@ class DMControlBatchTrainer:
         self.opt_alpha_sigma = optim.Adam([self.log_alpha_sigma], lr=1e-3)
 
         # Separate trust-region constraints
-        self.eps_alpha_mu = 0.05
-        self.eps_alpha_sigma = 0.01
+        self.eps_alpha_mu = eps_alpha_mu
+        self.eps_alpha_sigma = eps_alpha_sigma
 
         # Running episode statistics (accumulated across rollout boundaries)
         self.ep_return = 0.0
@@ -501,6 +503,18 @@ if __name__ == "__main__":
         default=42,
         help="Random seed for reproducibility",
     )
+    parser.add_argument(
+        "--eps_alpha_mu",
+        type=float,
+        default=0.5,
+        help="ε_α for mean KL constraint (smaller → more conservative)",
+    )
+    parser.add_argument(
+        "--eps_alpha_sigma",
+        type=float,
+        default=0.01,
+        help="ε_α for variance KL constraint (smaller → more conservative)",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -522,5 +536,7 @@ if __name__ == "__main__":
         n_temperature_epsilon=args.n_temperature_epsilon,
         eta_initial=args.eta_initial,
         seed=args.seed,
+        eps_alpha_mu=args.eps_alpha_mu,
+        eps_alpha_sigma=args.eps_alpha_sigma,
     ).train(iters=args.iters)
     wandb.finish()
