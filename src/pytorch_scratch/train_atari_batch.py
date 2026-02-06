@@ -229,6 +229,9 @@ class AtariTrainer:
         self.ep_length = 0
         self.total_env_steps = 0
 
+        self.target_update_interval = 4  # T_target (Atari-safe default)
+        self._target_update_counter = 0
+
     # Data Collection  (rollout with π_old)
 
     def collect(self):
@@ -423,7 +426,10 @@ class AtariTrainer:
         # Sync Behaviour Policy  π_old ← π_θ
         # The updated policy becomes the behaviour policy for the next
         # rollout.  This is the "hard" target-network update.
-        self.policy_old.load_state_dict(self.policy.state_dict())
+        self._target_update_counter += 1
+
+        if self._target_update_counter % self.target_update_interval == 0:
+            self.policy_old.load_state_dict(self.policy.state_dict())
 
         # DUAL η UPDATE  –  E-step temperature optimisation
         # We perform this ONCE per rollout using the cached `adv_selected`.
