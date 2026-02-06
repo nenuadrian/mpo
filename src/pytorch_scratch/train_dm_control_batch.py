@@ -336,11 +336,9 @@ class DMControlBatchTrainer:
 
             # --- Value Update Loop (on ALL data) ---
             # Value function learns from all transitions to properly estimate V(s)
-            s_top = s[s_top]
-            mb_ret = ret[s_top]
 
             values = self.value(s_top)
-            value_loss = ((values - mb_ret) ** 2).mean()
+            value_loss = ((values - ret) ** 2).mean()
 
             self.opt_v.zero_grad()
             value_loss.backward()
