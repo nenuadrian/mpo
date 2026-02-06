@@ -98,6 +98,10 @@ class GaussianPolicy(nn.Module):
     def sample(self, x):
         return self.dist(x).sample()
 
+    def act_deterministic(self, x):
+        mean, _ = self.forward(x)
+        return mean
+
 
 class ValueNet(nn.Module):
     def __init__(self, obs_dim, hidden=256):
