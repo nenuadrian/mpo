@@ -292,11 +292,9 @@ class DMControlBatchTrainer:
         # Policy uses ONLY Top-K data (masked)
         s_top = s[mask]
         a_top = a[mask]
-        q_top = q_weights
+        q_top = q_weights[mask]
 
         # Value function uses ALL data (unmasked)
-        s_full = s
-        ret_full = ret
 
         total_policy_loss = 0.0
         total_value_loss = 0.0
@@ -304,21 +302,17 @@ class DMControlBatchTrainer:
 
         for _ in range(n_epochs):
             # --- Policy Update Loop (on Top-K data) ---
-            idx = torch.randperm(len(s_top))
-            mb_s = s_top[idx]
-            mb_a = a_top[idx]
-            mb_w = q_top[idx]
 
             # M-STEP: Weighted Maximum Likelihood
             # New policy
-            new_dist = self.policy.dist(mb_s)
-            logp = new_dist.log_prob(mb_a).sum(dim=-1)
+            new_dist = self.policy.dist(s_top)
+            logp = new_dist.log_prob(a_top).sum(dim=-1)
 
             # Old policy (detached)
             with torch.no_grad():
-                old_dist = self.policy_old.dist(mb_s)
+                old_dist = self.policy_old.dist(s_top)
 
-            policy_loss = -(mb_w * logp).mean()
+            policy_loss = -(q_top * logp).mean()
 
             # KL(π_old || π_new)
             kl = (
@@ -343,11 +337,10 @@ class DMControlBatchTrainer:
 
             # --- Value Update Loop (on ALL data) ---
             # Value function learns from all transitions to properly estimate V(s)
-            idx = torch.randperm(len(s_full))
-            mb_s = s_full[idx]
-            mb_ret = ret_full[idx]
+            s_top = s[s_top]
+            mb_ret = ret[s_top]
 
-            values = self.value(mb_s)
+            values = self.value(s_top)
             value_loss = ((values - mb_ret) ** 2).mean()
 
             self.opt_v.zero_grad()
@@ -380,7 +373,7 @@ class DMControlBatchTrainer:
 
         # Diagnostics / Logging
         with torch.no_grad():
-            new_dist = self.policy.dist(s_full[:512])
+            new_dist = self.policy.dist(s[:512])
             entropy = new_dist.entropy().sum(dim=-1).mean()
 
         metrics = {
