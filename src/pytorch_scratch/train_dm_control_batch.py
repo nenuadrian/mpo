@@ -292,6 +292,7 @@ class DMControlBatchTrainer:
         # Policy uses ONLY Top-K data (masked)
         s_top = s[mask]
         a_top = a[mask]
+        ret_top = ret[mask]
 
         # Value function uses ALL data (unmasked)
 
@@ -338,7 +339,7 @@ class DMControlBatchTrainer:
             # Value function learns from all transitions to properly estimate V(s)
 
             values = self.value(s_top)
-            value_loss = ((values - ret) ** 2).mean()
+            value_loss = ((values - ret_top) ** 2).mean()
 
             self.opt_v.zero_grad()
             value_loss.backward()
