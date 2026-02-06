@@ -132,6 +132,7 @@ class DMControlBatchTrainer:
         seed: int = 42,
         eps_alpha_mu: float = 0.5,
         eps_alpha_sigma: float = 0.01,
+        top_k_fraction: float = 0.5,
     ):
         set_seed(seed)
         self.env = make_dm_control_env(domain, task, seed=seed)
@@ -184,6 +185,7 @@ class DMControlBatchTrainer:
         self.ep_return = 0.0
         self.ep_length = 0
         self.total_env_steps = 0
+        self.top_k_fraction = top_k_fraction
 
         self.domain = domain
         self.task = task
@@ -272,7 +274,7 @@ class DMControlBatchTrainer:
         # and acts as a trust-region filter.
         with torch.no_grad():
             # 1. Select top-k advantages (top 50%)
-            top_k_threshold = torch.quantile(adv, 0.5)
+            top_k_threshold = torch.quantile(adv, self.top_k_fraction)
             mask = adv >= top_k_threshold
 
             # 2. Extract selected advantages
@@ -288,7 +290,7 @@ class DMControlBatchTrainer:
         # M-STEP & Value Update Loop
         # We iterate multiple times over the batch to fully regress the policy onto the target q.
 
-        n_epochs = 2
+        n_epochs = 5
 
         # Prepare datasets:
         # Policy uses ONLY Top-K data (masked)
@@ -309,7 +311,7 @@ class DMControlBatchTrainer:
             # (A) Policy loss — top-k batch
             new_dist_top = self.policy.dist(s_top)
             logp = new_dist_top.log_prob(a_top).sum(dim=-1)
-            policy_loss = -(q_weights * logp).mean()
+            policy_loss = -(q_weights * logp).sum()
 
             # (B) KL constraint — full batch
             with torch.no_grad():
@@ -506,14 +508,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eps_alpha_mu",
         type=float,
-        default=0.5,
+        default=1.0,
         help="ε_α for mean KL constraint (smaller → more conservative)",
     )
     parser.add_argument(
         "--eps_alpha_sigma",
         type=float,
-        default=0.01,
+        default=0.1,
         help="ε_α for variance KL constraint (smaller → more conservative)",
+    )
+    parser.add_argument(
+        "--top_k_fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of samples to keep based on advantage (top-k masking for trust-region filtering)",
     )
     args = parser.parse_args()
 
