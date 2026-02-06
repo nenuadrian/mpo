@@ -1,75 +1,58 @@
-# V-MPO (On-Policy Maximum a Posteriori Policy Optimisation) for Atari
+"""V-MPO (On-Policy Maximum a Posteriori Policy Optimisation) for dm_control."""
 
-import numpy as np
-import copy
 import argparse
+import copy
+import random
+
+import gymnasium as gym
+import numpy as np
+import shimmy  # noqa: F401 (needed for dm_control Gymnasium registration)
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import gymnasium as gym
-from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation
-import ale_py
 import wandb
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def make_atari_env(game, seed=None):
-    """Create an Atari environment with standard DeepMind-style preprocessing.
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Best-effort determinism (may impact performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-    Wraps the raw ALE environment with:
-      - AtariPreprocessing: frame-skip of 4 (action repeated 4 frames),
-        grayscale conversion, observation scaling to [0,1], and episode
-        termination on life loss (helps early training signal).
-      - FrameStackObservation: stacks the last 4 frames along the channel
-        dimension so the agent can perceive motion / velocity.
 
-    Sticky actions (repeat_action_probability=0.25) add stochasticity to the
-    environment to reduce over-fitting to deterministic dynamics.
-    """
+def make_dm_control_env(domain, task, seed=None):
+    """Create a dm_control environment via shimmy's Gymnasium wrapper."""
     env = gym.make(
-        f"ALE/{game}-v5",
-        frameskip=1,  # raw env emits every frame
-        repeat_action_probability=0.25,  # 25% chance previous action is repeated (sticky actions)
-        full_action_space=False,  # use minimal action set for this game
+        f"dm_control/{domain}-{task}-v0",
     )
-
-    env = AtariPreprocessing(
-        env,
-        frame_skip=4,  # agent sees every 4th frame
-        grayscale_obs=True,  # convert RGB → single-channel grayscale
-        scale_obs=True,  # scale pixel values to [0, 1]
-        terminal_on_life_loss=True,  # treat life loss as episode end
-    )
-
-    # Stack 4 consecutive (already frame-skipped) observations → (4, 84, 84)
-    env = FrameStackObservation(env, stack_size=4)
-
     if seed is not None:
         env.reset(seed=seed)
-
+        try:
+            env.action_space.seed(seed)
+        except Exception:
+            pass
     return env
+
+
+def flatten_obs(obs):
+    """Flatten a dm_control observation dict/OrderedDict into a 1-D numpy array."""
+    if isinstance(obs, dict):
+        parts = []
+        for key in sorted(obs.keys()):
+            parts.append(np.asarray(obs[key], dtype=np.float32).flatten())
+        return np.concatenate(parts)
+    return np.asarray(obs, dtype=np.float32).flatten()
 
 
 # Generalised Advantage Estimation (GAE)
 def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
-    """Compute GAE-λ advantages and corresponding value-function targets.
-
-    GAE provides a bias–variance trade-off for advantage estimation:
-      A_t^{GAE} = Σ_{l=0}^{T-t-1} (γλ)^l · δ_{t+l}
-    where δ_t = r_t + γ V(s_{t+1}) - V(s_t)  is the 1-step TD error.
-
-    Args:
-        rewards : (T,)   tensor of rewards.
-        values  : (T+1,) tensor of value estimates (includes bootstrap V(s_T)).
-        dones   : (T,)   tensor of done flags (1.0 = episode boundary).
-        gamma   : discount factor.
-        lam     : GAE λ (0 → pure TD, 1 → pure MC).
-
-    Returns:
-        advantages : (T,) GAE advantages.
-        returns    : (T,) targets for value regression  (A_t + V(s_t)).
-    """
+    """Compute GAE-λ advantages and corresponding value-function targets."""
     T = len(rewards)
     advantages = torch.zeros(T, device=values.device)
     gae = 0.0
@@ -79,9 +62,9 @@ def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
     for t in reversed(range(T)):
         # 1-step TD error: δ_t = r_t + γ·V(s_{t+1}) - V(s_t)
         # (1 - done) masks the bootstrap when an episode ended at step t.
-        delta = rewards[t] + gamma * (1 - dones[t]) * values[t + 1] - values[t]
+        delta = rewards[t] + gamma * dones[t] * values[t + 1] - values[t]
         # Recursive GAE accumulation: A_t = δ_t + γλ · A_{t+1}
-        gae = delta + gamma * lam * (1 - dones[t]) * gae
+        gae = delta + gamma * lam * dones[t] * gae
         advantages[t] = gae
 
     # Value-function regression targets: R_t = A_t + V(s_t)
@@ -89,68 +72,45 @@ def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
     return advantages, returns
 
 
-# Policy Network  (π_θ)
-# Outputs a categorical distribution over the discrete action space.
-# Architecture follows the classic "Nature DQN" CNN backbone:
-#   Conv(4→32, 8×8, stride 4) → Conv(32→64, 4×4, stride 2) →
-#   Conv(64→64, 3×3, stride 1) → FC(3136→512) → FC(512→n_actions)
-# The final layer produces raw logits (un-normalised log-probabilities).
-class CategoricalPolicy(nn.Module):
-    def __init__(self, n_actions):
+class GaussianPolicy(nn.Module):
+    """Gaussian policy for continuous action spaces."""
+
+    def __init__(self, obs_dim, act_dim, hidden=256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(4, 32, 8, stride=4),  # (4, 84, 84) → (32, 20, 20)
+            nn.Linear(obs_dim, hidden),
             nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2),  # (32, 20, 20) → (64, 9, 9)
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1),  # (64, 9, 9)  → (64, 7, 7)
-            nn.ReLU(),
-            nn.Flatten(),  # → 64*7*7 = 3136
-            nn.Linear(64 * 7 * 7, 512),
-            nn.ReLU(),
-            nn.Linear(512, n_actions),  # logits over actions
+            nn.Linear(hidden, act_dim),
         )
+        self.log_std = nn.Parameter(torch.zeros(act_dim))
 
     def forward(self, x):
-        """Return raw logits for each action."""
-        return self.net(x)
+        mean = self.net(x)
+        std = self.log_std.exp().expand_as(mean)
+        return mean, std
+
+    def dist(self, x):
+        mean, std = self.forward(x)
+        return torch.distributions.Normal(mean, std)
 
     def sample(self, x):
-        """Sample an action from the categorical distribution."""
-        logits = self.forward(x)
-        dist = torch.distributions.Categorical(logits=logits)
-        return dist.sample()
-
-    def log_prob(self, x, a):
-        """Compute log π_θ(a | s) for given state-action pairs."""
-        logits = self.forward(x)
-        dist = torch.distributions.Categorical(logits=logits)
-        return dist.log_prob(a)
+        return self.dist(x).sample()
 
 
-# Value Network  V_φ(s)
-# Same CNN backbone as the policy but with a single scalar output that
-# estimates the state-value function.  A separate network (not shared with
-# the policy) is used to avoid interference between value and policy
-# gradients.
-class AtariValue(nn.Module):
-    def __init__(self):
+class ValueNet(nn.Module):
+    def __init__(self, obs_dim, hidden=256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(4, 32, 8, stride=4),
+            nn.Linear(obs_dim, hidden),
             nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2),
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(64 * 7 * 7, 512),
-            nn.ReLU(),
-            nn.Linear(512, 1),  # scalar value estimate
+            nn.Linear(hidden, 1),
         )
 
     def forward(self, x):
-        """Return V(s) as a scalar per batch element."""
         return self.net(x).squeeze(-1)
 
 
@@ -160,26 +120,37 @@ class AtariValue(nn.Module):
 #   - Maintains a learned temperature η (stored in log-space for positivity).
 #   - Each iteration: collect → GAE → E-step → M-step → dual η update →
 #     value update → sync π_old ← π_θ.
-class AtariTrainer:
+class DMControlBatchTrainer:
     def __init__(
         self,
-        game="Pong",
-        rollout_steps=4096,
+        domain="cheetah",
+        task="run",
+        rollout_steps=2048,
         gamma=0.99,
         lam=0.95,
-        lr=2.5e-4,
+        lr=3e-4,
         n_temperature_epsilon=0.1,
         eta_initial=0.0,
+        seed: int = 42,
     ):
-        self.env = make_atari_env(game)
+        set_seed(seed)
+        self.env = make_dm_control_env(domain, task, seed=seed)
 
-        # π_θ  – the policy we optimise (M-step target)
-        self.policy = CategoricalPolicy(self.env.action_space.n).to(device)
+        if isinstance(self.env.observation_space, gym.spaces.Dict):
+            obs_dim = sum(
+                int(np.prod(v.shape))
+                for v in self.env.observation_space.spaces.values()
+            )
+        else:
+            obs_dim = int(np.prod(self.env.observation_space.shape))
+
+        act_dim = int(np.prod(self.env.action_space.shape))
+
+        self.policy = GaussianPolicy(obs_dim, act_dim).to(device)
         # π_old – frozen copy used as the behaviour policy for data collection
         #         and as the reference distribution for KL measurement.
         self.policy_old = copy.deepcopy(self.policy).eval()
-        # V_φ  – state-value function (fitted during the value-update step)
-        self.value = AtariValue().to(device)
+        self.value = ValueNet(obs_dim).to(device)
 
         # Separate optimisers for policy, value, and dual variable η
         self.opt_pi = optim.Adam(self.policy.parameters(), lr=lr)
@@ -202,15 +173,15 @@ class AtariTrainer:
         self.log_alpha = nn.Parameter(torch.tensor(np.log(5.0), device=device))
         self.opt_alpha = optim.Adam([self.log_alpha], lr=1e-3)
 
-        self.eps_alpha = 0.01  # KL bound ε_α (Atari-scale safe default)
+        self.eps_alpha = 0.01
 
         # Running episode statistics (accumulated across rollout boundaries)
         self.ep_return = 0.0
         self.ep_length = 0
         self.total_env_steps = 0
 
-        self.target_update_interval = 4  # T_target (Atari-safe default)
-        self._target_update_counter = 0
+        self.domain = domain
+        self.task = task
 
     # Data Collection  (rollout with π_old)
 
@@ -224,6 +195,7 @@ class AtariTrainer:
         obs, acts, rews, dones, vals = [], [], [], [], []
 
         s, _ = self.env.reset()
+        s = flatten_obs(s)
 
         episode_returns = []  # returns of episodes that completed during this rollout
 
@@ -233,15 +205,14 @@ class AtariTrainer:
             # Sample action from the *behaviour* policy π_old (no grad needed)
             # and record the value estimate V(s_t) for GAE.
             with torch.no_grad():
-                a = self.policy_old.sample(s_t).item()
+                a = self.policy_old.sample(s_t).cpu().numpy().squeeze(0)
+                a = np.clip(a, self.env.action_space.low, self.env.action_space.high)
                 v = self.value(s_t).item()
 
             s2, r, terminated, truncated, _ = self.env.step(a)
+            s2 = flatten_obs(s2)
             self.total_env_steps += 1
-            done = terminated or truncated
-
-            # Reward clipping to [-1, 1] (standard Atari normalisation)
-            r = np.clip(r, -1.0, 1.0)
+            done = 0 if terminated else 1
 
             # Accumulate episode-level statistics
             self.ep_return += r
@@ -253,11 +224,12 @@ class AtariTrainer:
             dones.append(float(done))
             vals.append(v)
 
-            if done:
+            if done or truncated:
                 episode_returns.append(self.ep_return)
                 self.ep_return = 0.0
                 self.ep_length = 0
                 s, _ = self.env.reset()
+                s = flatten_obs(s)
             else:
                 s = s2
 
@@ -272,7 +244,7 @@ class AtariTrainer:
 
         return (
             torch.from_numpy(np.asarray(obs, dtype=np.float32)).to(device),
-            torch.from_numpy(np.asarray(acts, dtype=np.int64)).to(device),
+            torch.from_numpy(np.asarray(acts, dtype=np.float32)).to(device),
             torch.from_numpy(np.asarray(rews, dtype=np.float32)).to(device),
             torch.from_numpy(np.asarray(dones, dtype=np.float32)).to(device),
             torch.from_numpy(np.asarray(vals, dtype=np.float32)).to(device),
@@ -308,6 +280,9 @@ class AtariTrainer:
             # Centre advantages for numerical stability of softmax
             # (Note: V-MPO formulation is invariant to shifting A, but float precision isn't)
             adv_selected = adv_selected - adv_selected.mean()
+            adv = adv - adv.mean()
+            mask = adv >= adv_selected.median()
+            adv_selected = adv[mask]
 
             # E-STEP: Compute weights on the subset
             eta = self.eta.exp()
@@ -318,13 +293,12 @@ class AtariTrainer:
         # We iterate multiple times over the batch to fully regress the policy onto the target q.
 
         n_epochs = 4
-        batch_size = 128  # Mini-batch size
 
         # Prepare datasets:
         # Policy uses ONLY Top-K data (masked)
         s_top = s[mask]
         a_top = a[mask]
-        q_top = q_weights[mask]
+        q_top = q_weights
 
         # Value function uses ALL data (unmasked)
         s_full = s
@@ -334,75 +308,64 @@ class AtariTrainer:
         total_value_loss = 0.0
         total_kl = 0.0
 
-        for epoch in range(n_epochs):
+        for _ in range(n_epochs):
             # --- Policy Update Loop (on Top-K data) ---
-            perm_top = torch.randperm(len(s_top))
+            idx = torch.randperm(len(s_top))
+            mb_s = s_top[idx]
+            mb_a = a_top[idx]
+            mb_w = q_top[idx]
 
-            for start in range(0, len(s_top), batch_size):
-                idx = perm_top[start : start + batch_size]
-                mb_s = s_top[idx]
-                mb_a = a_top[idx]
-                mb_w = q_top[idx]
+            # M-STEP: Weighted Maximum Likelihood
+            # New policy
+            new_dist = self.policy.dist(mb_s)
+            logp = new_dist.log_prob(mb_a).sum(dim=-1)
 
-                # M-STEP: Weighted Maximum Likelihood
-                # New policy
-                logits = self.policy(mb_s)
-                dist = torch.distributions.Categorical(logits=logits)
-                logp = dist.log_prob(mb_a)
+            # Old policy (detached)
+            with torch.no_grad():
+                old_dist = self.policy_old.dist(mb_s)
 
-                # Old policy (detached)
-                with torch.no_grad():
-                    old_logits = self.policy_old(mb_s)
-                    old_dist = torch.distributions.Categorical(logits=old_logits)
+            # L_pi = - sum( w_i * log pi(a|s) )
+            # Note: mb_w sum is not 1 here due to mini-batching, but gradient scales linearly.
+            # Since weights sum to 1 over the full set, we sum here (not mean).
+            policy_loss = -(mb_w * logp).sum()
 
-                # L_pi = - sum( w_i * log pi(a|s) )
-                # Note: mb_w sum is not 1 here due to mini-batching, but gradient scales linearly.
-                # Since weights sum to 1 over the full set, we sum here (not mean).
-                policy_loss = -(mb_w * logp).sum()
+            # KL(π_old || π_new)
+            kl = (
+                torch.distributions.kl_divergence(old_dist, new_dist).sum(dim=-1).mean()
+            )
+            total_kl += kl.item()
 
-                # KL(π_old || π_new)
-                kl = torch.distributions.kl_divergence(old_dist, dist).mean()
-                total_kl += kl.item()
+            alpha = self.log_alpha.exp()
 
-                alpha = self.log_alpha.exp()
+            # θ update
+            self.opt_pi.zero_grad()
+            (policy_loss + alpha.detach() * kl).backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+            self.opt_pi.step()
 
-                # θ update
-                self.opt_pi.zero_grad()
-                (policy_loss + alpha.detach() * kl).backward()
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
-                self.opt_pi.step()
+            # α update
+            self.opt_alpha.zero_grad()
+            (alpha * (self.eps_alpha - kl.detach())).backward()
+            self.opt_alpha.step()
 
-                # α update
-                self.opt_alpha.zero_grad()
-                (alpha * (self.eps_alpha - kl.detach())).backward()
-                self.opt_alpha.step()
-
-                total_policy_loss += policy_loss.item()
+            total_policy_loss += policy_loss.item()
 
             # --- Value Update Loop (on ALL data) ---
             # Value function learns from all transitions to properly estimate V(s)
-            perm_full = torch.randperm(len(s_full))
-            for start in range(0, len(s_full), batch_size):
-                idx = perm_full[start : start + batch_size]
-                mb_s = s_full[idx]
-                mb_ret = ret_full[idx]
+            idx = torch.randperm(len(s_full))
+            mb_s = s_full[idx]
+            mb_ret = ret_full[idx]
 
-                values = self.value(mb_s)
-                value_loss = ((values - mb_ret) ** 2).mean()
+            values = self.value(mb_s)
+            value_loss = ((values - mb_ret) ** 2).mean()
 
-                self.opt_v.zero_grad()
-                value_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.5)
-                self.opt_v.step()
-                total_value_loss += value_loss.item()
+            self.opt_v.zero_grad()
+            value_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.5)
+            self.opt_v.step()
+            total_value_loss += value_loss.item()
 
-        # Sync Behaviour Policy  π_old ← π_θ
-        # The updated policy becomes the behaviour policy for the next
-        # rollout.  This is the "hard" target-network update.
-        self._target_update_counter += 1
-
-        if self._target_update_counter % self.target_update_interval == 0:
-            self.policy_old.load_state_dict(self.policy.state_dict())
+        self.policy_old.load_state_dict(self.policy.state_dict())
 
         # DUAL η UPDATE  –  E-step temperature optimisation
         # We perform this ONCE per rollout using the cached `adv_selected`.
@@ -426,10 +389,8 @@ class AtariTrainer:
 
         # Diagnostics / Logging
         with torch.no_grad():
-            # Check entropy on a subset to save compute
-            new_logits = self.policy(s_full[:512])
-            new_dist = torch.distributions.Categorical(logits=new_logits)
-            entropy = new_dist.entropy().mean()
+            new_dist = self.policy.dist(s_full[:512])
+            entropy = new_dist.entropy().sum(dim=-1).mean()
 
         metrics = {
             "entropy": entropy.item(),
@@ -465,17 +426,25 @@ class AtariTrainer:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Atari with VMPO")
+    parser = argparse.ArgumentParser(
+        description="Train dm_control with VMPO (minibatch)"
+    )
     parser.add_argument(
-        "--game",
+        "--domain",
         type=str,
-        default="Pong",
-        help="ALE game name (e.g. Pong, Breakout, SpaceInvaders)",
+        default="cheetah",
+        help="dm_control domain name (e.g. cheetah, walker, cartpole, humanoid)",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="run",
+        help="dm_control task name (e.g. run, walk, swingup, stand)",
     )
     parser.add_argument(
         "--rollout_steps",
         type=int,
-        default=4096,
+        default=2048,
         help="Number of environment steps per rollout",
     )
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor γ")
@@ -485,7 +454,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lr",
         type=float,
-        default=2.5e-4,
+        default=3e-4,
         help="Learning rate for policy and value networks",
     )
     parser.add_argument(
@@ -503,17 +472,32 @@ if __name__ == "__main__":
         default=0.0,
         help="Initial value for log(η) temperature parameter",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility",
+    )
     args = parser.parse_args()
 
-    # Initialise Weights & Biases experiment tracking
-    wandb.init(project="atari-pong-baseline", config=vars(args))
-    AtariTrainer(
-        game=args.game,
+    set_seed(args.seed)
+
+    wandb.init(
+        project="dm-control-vmpo",
+        config=vars(args),
+        group=f"{args.domain}-{args.task}",
+        name=f"{args.domain}-{args.task}-vmpo-batch",
+    )
+
+    DMControlBatchTrainer(
+        domain=args.domain,
+        task=args.task,
         rollout_steps=args.rollout_steps,
         gamma=args.gamma,
         lam=args.lam,
         lr=args.lr,
         n_temperature_epsilon=args.n_temperature_epsilon,
         eta_initial=args.eta_initial,
+        seed=args.seed,
     ).train(iters=args.iters)
     wandb.finish()
