@@ -84,7 +84,8 @@ class GaussianPolicy(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden, act_dim),
         )
-        self.log_std = nn.Parameter(torch.zeros(act_dim))
+        # initialise conservatively
+        self.log_std = nn.Parameter(torch.ones(act_dim) * -1.0)
 
     def forward(self, x):
         mean = self.net(x)
@@ -368,6 +369,10 @@ class DMControlBatchTrainer:
             ).backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
             self.opt_pi.step()
+
+            # hard clamp σ every update
+            with torch.no_grad():
+                self.policy.log_std.clamp_(-5.0, 1.0)
 
             # α updates (dual ascent)
             self.opt_alpha_mu.zero_grad()
