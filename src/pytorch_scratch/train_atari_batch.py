@@ -20,7 +20,6 @@
 #   Value update: regress V(s) towards the GAE returns.
 #   Copy π_θ → π_old for the next iteration.
 
-
 import numpy as np
 import copy
 import argparse
@@ -190,7 +189,7 @@ class AtariTrainer:
         lam=0.95,
         lr=2.5e-4,
         n_temperature_epsilon=0.1,
-        eta_initial=1.0,
+        eta_initial=0.0,
     ):
         self.env = make_atari_env(game)
 
@@ -304,118 +303,129 @@ class AtariTrainer:
         # the value network's predictions from the rollout.
         adv, ret = compute_gae(r, v, d, self.gamma, self.lam)
 
-        # Centre advantages so the softmax in the E-step operates on
-        # relative advantage (mean-zero).  This improves numerical
-        # stability and ensures the temperature η controls selectivity
-        # around the mean rather than around zero.
-        adv = adv - adv.mean()
-
-        # E-STEP  –  compute non-parametric variational distribution
-        # The E-step forms a categorical distribution q over the T
-        # rollout samples with:
-        #     q_i  ∝  exp( A_i / η )
-        # Implemented as  softmax( A / η ).
-        #
-        # η (eta) is a learned temperature:
-        #   - Large η → weights are nearly uniform → conservative update.
-        #   - Small η → weights concentrate on high-advantage samples.
-        # η is kept positive by storing it in log-space (self.eta) and
-        # exponentiating here.
-
-        eta = self.eta.exp()
-        weights = torch.softmax(adv / eta, dim=0)
-
-        # Snapshot the behaviour policy's logits (needed for KL after
-        # the M-step and for diagnostics).
+        # Advantage Pre-processing (Top-K Masking)
+        # We only want to weight the "good" half of the samples.
+        # This prevents the exponential weights from being dominated by outliers
+        # and acts as a trust-region filter.
         with torch.no_grad():
-            old_logits = self.policy_old(s)
+            # Calculate top 50% threshold
+            top_k_threshold = torch.quantile(adv, 0.5)
+            # Create a boolean mask of size (T,)
+            mask = adv >= top_k_threshold
 
-        # M-STEP  –  weighted maximum-likelihood policy update
-        # Minimise  L_π = - Σ_i  w_i · log π_θ(a_i | s_i)
-        # where w_i are the E-step weights (detached – treated as
-        # constants w.r.t. θ).  This is equivalent to fitting π_θ to
-        # the advantage-weighted sample distribution q from the E-step.
+            # Select only top-k advantages
+            adv_selected = adv[mask]
 
-        new_logits_pre = self.policy(s)
-        new_dist_pre = torch.distributions.Categorical(logits=new_logits_pre)
-        logp = new_dist_pre.log_prob(a)
+            # Centre advantages for numerical stability of softmax
+            # (Note: V-MPO formulation is invariant to shifting A, but float precision isn't)
+            adv_selected = adv_selected - adv_selected.mean()
 
-        policy_loss = -(weights.detach() * logp).mean()
+            # E-STEP: Compute weights on the subset
+            eta = self.eta.exp()
+            # w_i = exp(A_i / eta) / Z
+            weights_selected = torch.softmax(adv_selected / eta, dim=0)
 
-        self.opt_pi.zero_grad()
-        policy_loss.backward()
-        self.opt_pi.step()
+        # M-STEP & Value Update Loop
+        # We iterate multiple times over the batch to fully regress the policy onto the target q.
 
-        # KL Divergence Measurement  (diagnostic, post M-step)
+        n_epochs = 4
+        batch_size = 128  # Mini-batch size
 
-        # Measure KL( π_old || π_θ ) *after* the policy gradient step
-        # to monitor how much the policy changed this iteration.
-        with torch.no_grad():
-            new_logits = self.policy(s)
-            max_logit_diff = (new_logits - old_logits).abs().max().item()
+        # Prepare datasets:
+        # Policy uses ONLY Top-K data (masked)
+        s_top = s[mask]
+        a_top = a[mask]
+        w_top = weights_selected  # These are detached and fixed for the epoch loop
 
-        old_dist = torch.distributions.Categorical(logits=old_logits)
-        new_dist = torch.distributions.Categorical(logits=new_logits)
-        kl = torch.distributions.kl.kl_divergence(old_dist, new_dist).mean()
+        # Value function uses ALL data (unmasked)
+        s_full = s
+        ret_full = ret
+
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+
+        for epoch in range(n_epochs):
+            # --- Policy Update Loop (on Top-K data) ---
+            perm_top = torch.randperm(len(s_top))
+
+            for start in range(0, len(s_top), batch_size):
+                idx = perm_top[start : start + batch_size]
+                mb_s = s_top[idx]
+                mb_a = a_top[idx]
+                mb_w = w_top[idx]
+
+                # M-STEP: Weighted Maximum Likelihood
+                logits = self.policy(mb_s)
+                dist = torch.distributions.Categorical(logits=logits)
+                logp = dist.log_prob(mb_a)
+
+                # L_pi = - sum( w_i * log pi(a|s) )
+                # Note: mb_w sum is not 1 here due to mini-batching, but gradient scales linearly.
+                # Since weights sum to 1 over the full set, we sum here (not mean).
+                policy_loss = -(mb_w * logp).sum()
+
+                self.opt_pi.zero_grad()
+                policy_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                self.opt_pi.step()
+                total_policy_loss += policy_loss.item()
+
+            # --- Value Update Loop (on ALL data) ---
+            # Value function learns from all transitions to properly estimate V(s)
+            perm_full = torch.randperm(len(s_full))
+            for start in range(0, len(s_full), batch_size):
+                idx = perm_full[start : start + batch_size]
+                mb_s = s_full[idx]
+                mb_ret = ret_full[idx]
+
+                values = self.value(mb_s)
+                value_loss = ((values - mb_ret) ** 2).mean()
+
+                self.opt_v.zero_grad()
+                value_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.5)
+                self.opt_v.step()
+                total_value_loss += value_loss.item()
 
         # Sync Behaviour Policy  π_old ← π_θ
-
         # The updated policy becomes the behaviour policy for the next
         # rollout.  This is the "hard" target-network update.
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         # DUAL η UPDATE  –  E-step temperature optimisation
+        # We perform this ONCE per rollout using the cached `adv_selected`.
+        # Re-calculate eta from parameter to ensure the graph is connected.
 
-        # η is optimised by minimising the dual function that enforces
-        # the KL constraint  KL(q || uniform) ≤ ε_η  on the E-step
-        # weight distribution.
-        #
-        # The dual objective (derived via Lagrangian relaxation) is:
-        #   g(η) = η · ε_η  +  η · log( (1/T) Σ_i exp(A_i / η) )
-        #        = η · [ ε_η  +  logsumexp(A / η) - log T ]
-        #
-        # Minimising g(η) w.r.t. η tightens or loosens the temperature
-        # to satisfy the constraint.  Advantages are detached so the
-        # gradient flows only through η.
+        eta = self.eta.exp()
+        T_factor = torch.tensor(float(len(adv_selected)), device=adv.device)
 
-        T = adv.numel()
-
+        # The dual objective: η * ε + η * log( mean( exp(A/η) ) )
+        # Implemented using logsumexp for stability:
+        # log( mean( exp(A/η) ) ) = log( sum(exp(A/η)) / N ) = logsumexp(A/η) - log(N)
         eta_loss = eta * (
             self.n_temperature_epsilon
-            + torch.logsumexp(adv.detach() / eta, dim=0)
-            - torch.log(torch.tensor(float(T), device=adv.device))
+            + torch.logsumexp(adv_selected.detach() / eta, dim=0)
+            - torch.log(T_factor)
         )
 
         self.opt_eta.zero_grad()
         eta_loss.backward()
         self.opt_eta.step()
 
-        # VALUE UPDATE  –  policy evaluation / critic fitting
-        # Standard MSE regression of V_φ(s) towards the GAE returns R_t.
-        # This is independent of the E/M steps and simply improves the
-        # baseline for the next iteration's advantage estimates.
-
-        value_loss = ((self.value(s) - ret) ** 2).mean()
-
-        self.opt_v.zero_grad()
-        value_loss.backward()
-        self.opt_v.step()
-
         # Diagnostics / Logging
-
         with torch.no_grad():
-            entropy = new_dist.entropy().mean()  # policy entropy (exploration health)
+            # Check entropy on a subset to save compute
+            new_logits = self.policy(s_full[:512])
+            new_dist = torch.distributions.Categorical(logits=new_logits)
+            entropy = new_dist.entropy().mean()
 
         metrics = {
             "entropy": entropy.item(),
             "rollout_return": r.sum().item(),  # total reward in this rollout
-            "policy_loss": policy_loss.item(),  # M-step loss
-            "value_loss": value_loss.item(),  # critic MSE
+            "policy_loss": total_policy_loss / n_epochs,  # M-step loss
+            "value_loss": total_value_loss / n_epochs,  # critic MSE
             "eta": eta.item(),  # current temperature
             "eta_loss": eta_loss.item(),  # dual objective value
-            "kl": float(kl.cpu()),  # KL(π_old || π_θ)
-            "kl_sci": float(f"{kl.item():.6e}"),  # KL in scientific notation
-            "max_logit_diff": max_logit_diff,  # largest per-action logit change
         }
 
         if episode_returns:
@@ -450,7 +460,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--rollout_steps",
         type=int,
-        default=1024,
+        default=4096,
         help="Number of environment steps per rollout",
     )
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor γ")
