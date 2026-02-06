@@ -26,10 +26,11 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def make_dm_control_env(domain, task, seed=None):
+def make_dm_control_env(domain, task, seed=None, render_mode=None):
     """Create a dm_control environment via shimmy's Gymnasium wrapper."""
     env = gym.make(
         f"dm_control/{domain}-{task}-v0",
+        render_mode=render_mode,
     )
     if seed is not None:
         env.reset(seed=seed)
