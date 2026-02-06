@@ -257,6 +257,7 @@ class AtariTrainer:
                 v = self.value(s_t).item()
 
             s2, r, terminated, truncated, _ = self.env.step(a)
+            self.total_env_steps += 1
             done = terminated or truncated
 
             # Reward clipping to [-1, 1] (standard Atari normalisation)
@@ -280,7 +281,6 @@ class AtariTrainer:
             else:
                 s = s2
 
-            self.total_env_steps += 1
         # Bootstrap value for the last state (needed by GAE to compute the
         # advantage of the final transition in the rollout).
         with torch.no_grad():
