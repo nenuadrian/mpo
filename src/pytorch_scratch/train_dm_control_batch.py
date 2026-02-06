@@ -432,39 +432,82 @@ class DMControlBatchTrainer:
             entropy = new_dist.entropy().sum(dim=-1).mean()
 
         metrics = {
-            "entropy": entropy.item(),
-            "rollout_return": float(np.sum(episode_returns))
+            "train/entropy": entropy.item(),
+            "train/rollout_return": float(np.sum(episode_returns))
             / max(1, len(episode_returns)),
-            "policy_loss": total_policy_loss / self.n_policy_updates,  # M-step loss
-            "value_loss": total_value_loss / self.n_value_updates,  # critic MSE
-            "eta": eta.item(),  # current temperature
-            "eta_loss": eta_loss.item(),  # dual objective value
-            "alpha_mu": self.log_alpha_mu.exp().item(),
-            "alpha_sigma": self.log_alpha_sigma.exp().item(),
-            "kl_mu": total_kl_mu / self.n_policy_updates,
-            "kl_sigma": total_kl_sigma / self.n_policy_updates,
-            "kl": (total_kl_mu + total_kl_sigma) / self.n_policy_updates,
-            "ess": ess.item(),
-            "ess_frac": ess_frac.item(),
-            "ess_ratio": ess.item() / adv_selected.numel(),
+            "train/policy_loss": total_policy_loss
+            / self.n_policy_updates,  # M-step loss
+            "train/value_loss": total_value_loss / self.n_value_updates,  # critic MSE
+            "train/eta": eta.item(),  # current temperature
+            "train/eta_loss": eta_loss.item(),  # dual objective value
+            "train/alpha_mu": self.log_alpha_mu.exp().item(),
+            "train/alpha_sigma": self.log_alpha_sigma.exp().item(),
+            "train/kl_mu": total_kl_mu / self.n_policy_updates,
+            "train/kl_sigma": total_kl_sigma / self.n_policy_updates,
+            "train/kl": (total_kl_mu + total_kl_sigma) / self.n_policy_updates,
+            "train/ess": ess.item(),
+            "train/ess_frac": ess_frac.item(),
+            "train/ess_ratio": ess.item() / adv_selected.numel(),
         }
 
         if episode_returns:
             metrics.update(
                 {
-                    "episode_return_mean": np.mean(episode_returns),
-                    "episode_return_max": np.max(episode_returns),
-                    "episode_return_min": np.min(episode_returns),
-                    "episodes_in_rollout": len(episode_returns),
+                    "train/episode_return_mean": np.mean(episode_returns),
+                    "train/episode_return_max": np.max(episode_returns),
+                    "train/episode_return_min": np.min(episode_returns),
+                    "train/episodes_in_rollout": len(episode_returns),
                 }
             )
 
         return metrics
 
+    def evaluate(self, n_episodes=10, max_steps=1000):
+        env = make_dm_control_env(self.domain, self.task)
+        returns = []
+
+        for _ in range(n_episodes):
+            obs, _ = env.reset()
+            obs = flatten_obs(obs)
+            ep_return = 0.0
+
+            for _ in range(max_steps):
+                obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    mean, _ = self.policy(obs_t)
+                    action = mean.cpu().numpy().squeeze(0)
+
+                action = np.clip(
+                    action,
+                    env.action_space.low,
+                    env.action_space.high,
+                )
+
+                obs, reward, terminated, truncated, _ = env.step(action)
+                obs = flatten_obs(obs)
+
+                ep_return += reward
+                if terminated or truncated:
+                    break
+
+            returns.append(ep_return)
+
+        env.close()
+
+        return {
+            "eval/return_mean": float(np.mean(returns)),
+            "eval/return_std": float(np.std(returns)),
+            "eval/return_min": float(np.min(returns)),
+            "eval/return_max": float(np.max(returns)),
+        }
+
     def train(self, iters=10_000):
-        """Run `iters` VMPO iterations, logging to W&B each step."""
         for it in range(iters):
             info = self.train_once()
+            if it % 100 == 0:
+                eval_metrics = self.evaluate(n_episodes=10)
+                info.update(eval_metrics)
             wandb.log(info, step=self.total_env_steps)
             if it % 10 == 0:
                 print(it, info)
