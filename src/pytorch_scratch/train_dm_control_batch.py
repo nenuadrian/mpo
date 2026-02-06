@@ -51,24 +51,22 @@ def flatten_obs(obs):
 
 
 # Generalised Advantage Estimation (GAE)
-def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
-    """Compute GAE-λ advantages and corresponding value-function targets."""
+def compute_gae(rewards, values, next_values, bootstrap_masks, gamma=0.99, lam=0.95):
+    """Compute GAE-λ advantages and corresponding value-function targets.
+
+    bootstrap_masks[t] = 0 → terminated=True (true terminal): no bootstrap
+    bootstrap_masks[t] = 1 → non-terminal or truncated=True (time-limit): bootstrap
+    """
     T = len(rewards)
     advantages = torch.zeros(T, device=values.device)
     gae = 0.0
 
-    # Walk backwards through the rollout to accumulate the
-    # exponentially-weighted sum of TD errors.
     for t in reversed(range(T)):
-        # 1-step TD error: δ_t = r_t + γ·V(s_{t+1}) - V(s_t)
-        # (1 - done) masks the bootstrap when an episode ended at step t.
-        delta = rewards[t] + gamma * dones[t] * values[t + 1] - values[t]
-        # Recursive GAE accumulation: A_t = δ_t + γλ · A_{t+1}
-        gae = delta + gamma * lam * dones[t] * gae
+        delta = rewards[t] + gamma * bootstrap_masks[t] * next_values[t] - values[t]
+        gae = delta + gamma * lam * bootstrap_masks[t] * gae
         advantages[t] = gae
 
-    # Value-function regression targets: R_t = A_t + V(s_t)
-    returns = advantages + values[:-1]
+    returns = advantages + values
     return advantages, returns
 
 
@@ -188,22 +186,20 @@ class DMControlBatchTrainer:
     def collect(self):
         """Collect a fixed-length rollout using the behaviour policy π_old.
 
-        Returns tensors of observations, actions, rewards, done flags,
-        value estimates (T+1 entries – includes bootstrap), and a list of
+        Returns tensors of observations, actions, rewards, bootstrap masks,
+        value estimates V(s_t), next value estimates V(s_{t+1}), and a list of
         completed episode returns for logging.
         """
-        obs, acts, rews, dones, vals = [], [], [], [], []
+        obs, acts, rews, bootstrap_masks, vals, next_vals = [], [], [], [], [], []
 
         s, _ = self.env.reset()
         s = flatten_obs(s)
 
-        episode_returns = []  # returns of episodes that completed during this rollout
+        episode_returns = []
 
         for _ in range(self.rollout_steps):
             s_t = torch.tensor(s, dtype=torch.float32).unsqueeze(0).to(device)
 
-            # Sample action from the *behaviour* policy π_old (no grad needed)
-            # and record the value estimate V(s_t) for GAE.
             with torch.no_grad():
                 a = self.policy_old.sample(s_t).cpu().numpy().squeeze(0)
                 a = np.clip(a, self.env.action_space.low, self.env.action_space.high)
@@ -212,19 +208,28 @@ class DMControlBatchTrainer:
             s2, r, terminated, truncated, _ = self.env.step(a)
             s2 = flatten_obs(s2)
             self.total_env_steps += 1
-            done = 0 if terminated else 1
 
-            # Accumulate episode-level statistics
+            # Gymnasium gives both for a reason:
+            # - terminated => true terminal => do NOT bootstrap
+            # - truncated  => time limit    => DO bootstrap, but still reset
+            bootstrap_mask = 0.0 if terminated else 1.0
+
+            with torch.no_grad():
+                v_next = self.value(
+                    torch.tensor(s2, dtype=torch.float32).unsqueeze(0).to(device)
+                ).item()
+
             self.ep_return += r
             self.ep_length += 1
 
             obs.append(s)
             acts.append(a)
             rews.append(r)
-            dones.append(float(done))
+            bootstrap_masks.append(bootstrap_mask)
             vals.append(v)
+            next_vals.append(v_next)
 
-            if done or truncated:
+            if terminated or truncated:
                 episode_returns.append(self.ep_return)
                 self.ep_return = 0.0
                 self.ep_length = 0
@@ -233,21 +238,13 @@ class DMControlBatchTrainer:
             else:
                 s = s2
 
-        # Bootstrap value for the last state (needed by GAE to compute the
-        # advantage of the final transition in the rollout).
-        with torch.no_grad():
-            v_last = self.value(
-                torch.tensor(s, dtype=torch.float32).unsqueeze(0).to(device)
-            ).item()
-
-        vals.append(v_last)  # vals has T+1 entries
-
         return (
             torch.from_numpy(np.asarray(obs, dtype=np.float32)).to(device),
             torch.from_numpy(np.asarray(acts, dtype=np.float32)).to(device),
             torch.from_numpy(np.asarray(rews, dtype=np.float32)).to(device),
-            torch.from_numpy(np.asarray(dones, dtype=np.float32)).to(device),
+            torch.from_numpy(np.asarray(bootstrap_masks, dtype=np.float32)).to(device),
             torch.from_numpy(np.asarray(vals, dtype=np.float32)).to(device),
+            torch.from_numpy(np.asarray(next_vals, dtype=np.float32)).to(device),
             episode_returns,
         )
 
@@ -257,12 +254,10 @@ class DMControlBatchTrainer:
         """
 
         # Data Collection  –  rollout with behaviour policy π_old
-        s, a, r, d, v, episode_returns = self.collect()
+        s, a, r, bootstrap_masks, v, v_next, episode_returns = self.collect()
 
         # Advantage Estimation (GAE-λ)
-        # Compute advantages A_t and value-regression targets R_t using
-        # the value network's predictions from the rollout.
-        adv, ret = compute_gae(r, v, d, self.gamma, self.lam)
+        adv, ret = compute_gae(r, v, v_next, bootstrap_masks, self.gamma, self.lam)
 
         # Advantage Pre-processing (Top-K Masking)
         # We only want to weight the "good" half of the samples.
@@ -292,7 +287,6 @@ class DMControlBatchTrainer:
         # Policy uses ONLY Top-K data (masked)
         s_top = s[mask]
         a_top = a[mask]
-        ret_top = ret[mask]
 
         # Value function uses ALL data (unmasked)
 
@@ -338,8 +332,8 @@ class DMControlBatchTrainer:
             # --- Value Update Loop (on ALL data) ---
             # Value function learns from all transitions to properly estimate V(s)
 
-            values = self.value(s_top)
-            value_loss = ((values - ret_top) ** 2).mean()
+            values = self.value(s)
+            value_loss = ((values - ret) ** 2).mean()
 
             self.opt_v.zero_grad()
             value_loss.backward()
