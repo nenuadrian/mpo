@@ -168,10 +168,15 @@ class DMControlBatchTrainer:
         self.n_temperature_epsilon = n_temperature_epsilon
 
         # Parametric KL multiplier α (stored in log-space for positivity)
-        self.log_alpha = nn.Parameter(torch.tensor(np.log(5.0), device=device))
-        self.opt_alpha = optim.Adam([self.log_alpha], lr=1e-3)
+        self.log_alpha_mu = nn.Parameter(torch.tensor(np.log(5.0), device=device))
+        self.log_alpha_sigma = nn.Parameter(torch.tensor(np.log(1.0), device=device))
 
-        self.eps_alpha = 0.01
+        self.opt_alpha_mu = optim.Adam([self.log_alpha_mu], lr=1e-3)
+        self.opt_alpha_sigma = optim.Adam([self.log_alpha_sigma], lr=1e-3)
+
+        # Separate trust-region constraints
+        self.eps_alpha_mu = 0.05
+        self.eps_alpha_sigma = 0.01
 
         # Running episode statistics (accumulated across rollout boundaries)
         self.ep_return = 0.0
@@ -292,7 +297,8 @@ class DMControlBatchTrainer:
 
         total_policy_loss = 0.0
         total_value_loss = 0.0
-        total_kl = 0.0
+        total_kl_mu = 0.0
+        total_kl_sigma = 0.0
 
         for _ in range(n_epochs):
             # --- Policy Update Loop (on Top-K data) ---
@@ -305,31 +311,58 @@ class DMControlBatchTrainer:
 
             # (B) KL constraint — full batch
             with torch.no_grad():
-                old_dist_full = self.policy_old.dist(s)
-            new_dist_full = self.policy.dist(s)
-            kl_full = (
-                torch.distributions.kl_divergence(old_dist_full, new_dist_full)
+                mu_old, std_old = self.policy_old(s)
+            mu_old = mu_old.detach()
+            std_old = std_old.detach()
+            log_std_old = std_old.log()
+
+            mu_new, std_new = self.policy(s)
+            log_std_new = std_new.log()
+
+            # Mean KL (behavioural shift only; uses old variance)
+            kl_mu = 0.5 * (((mu_new - mu_old) ** 2) / (std_old**2)).sum(dim=-1).mean()
+
+            # Variance KL (shape change only)
+            kl_sigma = (
+                0.5
+                * (
+                    (std_old**2) / (std_new**2)
+                    - 1.0
+                    + 2.0 * (log_std_new - log_std_old)
+                )
                 .sum(dim=-1)
                 .mean()
             )
-            total_kl += kl_full.item()
 
-            alpha = self.log_alpha.exp()
+            total_kl_mu += kl_mu.item()
+            total_kl_sigma += kl_sigma.item()
+
+            alpha_mu = self.log_alpha_mu.exp()
+            alpha_sigma = self.log_alpha_sigma.exp()
 
             # θ update
             self.opt_pi.zero_grad()
-            (policy_loss + alpha.detach() * kl_full).backward()
+            (
+                policy_loss
+                + alpha_mu.detach() * kl_mu
+                + alpha_sigma.detach() * kl_sigma
+            ).backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
             self.opt_pi.step()
 
-            # α update
-            self.opt_alpha.zero_grad()
-            (alpha * (self.eps_alpha - kl_full.detach())).backward()
-            self.opt_alpha.step()
+            # α updates (dual ascent)
+            self.opt_alpha_mu.zero_grad()
+            (alpha_mu * (self.eps_alpha_mu - kl_mu.detach())).backward()
+            self.opt_alpha_mu.step()
+
+            self.opt_alpha_sigma.zero_grad()
+            (alpha_sigma * (self.eps_alpha_sigma - kl_sigma.detach())).backward()
+            self.opt_alpha_sigma.step()
 
             # Projection: enforce α >= 1e-8 (in log-space)
             with torch.no_grad():
-                self.log_alpha.clamp_(min=np.log(1e-8))
+                self.log_alpha_mu.clamp_(min=np.log(1e-8))
+                self.log_alpha_sigma.clamp_(min=np.log(1e-8))
 
             total_policy_loss += policy_loss.item()
 
@@ -387,8 +420,11 @@ class DMControlBatchTrainer:
             "value_loss": total_value_loss / n_epochs,  # critic MSE
             "eta": eta.item(),  # current temperature
             "eta_loss": eta_loss.item(),  # dual objective value
-            "alpha": self.log_alpha.exp().item(),
-            "kl": total_kl / n_epochs,
+            "alpha_mu": self.log_alpha_mu.exp().item(),
+            "alpha_sigma": self.log_alpha_sigma.exp().item(),
+            "kl_mu": total_kl_mu / n_epochs,
+            "kl_sigma": total_kl_sigma / n_epochs,
+            "kl": (total_kl_mu + total_kl_sigma) / n_epochs,
         }
 
         if episode_returns:
