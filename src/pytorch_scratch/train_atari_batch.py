@@ -1,24 +1,4 @@
 # V-MPO (On-Policy Maximum a Posteriori Policy Optimisation) for Atari
-#
-# V-MPO is a two-step EM-style policy-optimisation algorithm:
-#
-#   E-step  – Compute non-parametric, advantage-weighted sample distribution.
-#             A temperature parameter η (eta) controls how "selective" the
-#             weighting is.  η is itself optimised via a dual objective that
-#             enforces a soft KL constraint (ε_η) on the sample weights.
-#
-#   M-step  – Fit the parametric policy π_θ to the weighted samples produced
-#             by the E-step via supervised (weighted) maximum-likelihood.
-#
-# The overall loop is:
-#   Collect rollout data with the current behaviour policy π_old.
-#   Estimate advantages with GAE.
-#   E-step: form sample weights from advantages / η  (softmax).
-#   M-step: minimise  -Σ w_i · log π_θ(a_i | s_i).
-#   Dual update: optimise η to keep the weight distribution close to
-#      uniform (bounded information loss).
-#   Value update: regress V(s) towards the GAE returns.
-#   Copy π_θ → π_old for the next iteration.
 
 import numpy as np
 import copy
