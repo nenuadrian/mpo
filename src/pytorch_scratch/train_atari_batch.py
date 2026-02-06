@@ -218,6 +218,12 @@ class AtariTrainer:
         # Smaller → more uniform weights → more conservative updates.
         self.n_temperature_epsilon = n_temperature_epsilon
 
+        # Parametric KL multiplier α (stored in log-space for positivity)
+        self.log_alpha = nn.Parameter(torch.tensor(np.log(5.0), device=device))
+        self.opt_alpha = optim.Adam([self.log_alpha], lr=1e-3)
+
+        self.eps_alpha = 0.01  # KL bound ε_α (Atari-scale safe default)
+
         # Running episode statistics (accumulated across rollout boundaries)
         self.ep_return = 0.0
         self.ep_length = 0
@@ -295,7 +301,6 @@ class AtariTrainer:
         """
 
         # Data Collection  –  rollout with behaviour policy π_old
-
         s, a, r, d, v, episode_returns = self.collect()
 
         # Advantage Estimation (GAE-λ)
@@ -343,6 +348,7 @@ class AtariTrainer:
 
         total_policy_loss = 0.0
         total_value_loss = 0.0
+        total_kl = 0.0
 
         for epoch in range(n_epochs):
             # --- Policy Update Loop (on Top-K data) ---
@@ -355,19 +361,46 @@ class AtariTrainer:
                 mb_w = w_top[idx]
 
                 # M-STEP: Weighted Maximum Likelihood
+                # New policy
                 logits = self.policy(mb_s)
                 dist = torch.distributions.Categorical(logits=logits)
                 logp = dist.log_prob(mb_a)
+
+                # Old policy (detached)
+                with torch.no_grad():
+                    old_logits = self.policy_old(mb_s)
+                    old_dist = torch.distributions.Categorical(logits=old_logits)
 
                 # L_pi = - sum( w_i * log pi(a|s) )
                 # Note: mb_w sum is not 1 here due to mini-batching, but gradient scales linearly.
                 # Since weights sum to 1 over the full set, we sum here (not mean).
                 policy_loss = -(mb_w * logp).sum()
 
+                # KL(π_old || π_new)
+                kl = torch.distributions.kl_divergence(old_dist, dist).mean()
+                total_kl += kl.item()
+
+                alpha = self.log_alpha.exp()
+                kl_detached = kl.detach()
+
+                # V-MPO parametric KL loss (Eq. 5)
+                alpha_loss = (
+                    alpha * (self.eps_alpha - kl_detached) + alpha.detach() * kl
+                )
+
+                total_loss = policy_loss + alpha_loss
+
+                # ---- optimise policy θ ----
                 self.opt_pi.zero_grad()
-                policy_loss.backward()
+                total_loss.backward(retain_graph=True)
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
                 self.opt_pi.step()
+
+                # ---- optimise α (dual ascent) ----
+                self.opt_alpha.zero_grad()
+                (-alpha_loss).backward()
+                self.opt_alpha.step()
+
                 total_policy_loss += policy_loss.item()
 
             # --- Value Update Loop (on ALL data) ---
@@ -426,6 +459,8 @@ class AtariTrainer:
             "value_loss": total_value_loss / n_epochs,  # critic MSE
             "eta": eta.item(),  # current temperature
             "eta_loss": eta_loss.item(),  # dual objective value
+            "alpha": self.log_alpha.exp().item(),
+            "kl": total_kl / max(1, len(s_top)),
         }
 
         if episode_returns:
