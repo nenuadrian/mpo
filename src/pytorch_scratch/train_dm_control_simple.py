@@ -434,7 +434,12 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    wandb.init(project="dm-control-vmpo", config=vars(args))
+    wandb.init(
+        project="dm-control-vmpo",
+        config=vars(args),
+        group=f"{args.domain}-{args.task}",
+        name=f"{args.domain}-{args.task}-vmpo",
+    )
     DMControlTrainer(
         domain=args.domain,
         task=args.task,
