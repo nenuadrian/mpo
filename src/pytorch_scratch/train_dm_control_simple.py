@@ -353,12 +353,15 @@ class DMControlVmpoTrainer:
 
             # 2. Extract selected advantages
             adv_selected = adv[mask]
+            s_top = s[mask]
+            a_top = a[mask]
 
             # 3. Centre for numerical stability ONLY
             if self.total_env_steps < 1_000_000:
                 adv_selected = adv_selected - adv_selected.mean()
 
             # 4. E-step weights
+            
             eta = self.eta.exp()
             with torch.no_grad():
                 dist_old = self.policy_old.dist(s_top)
@@ -370,11 +373,6 @@ class DMControlVmpoTrainer:
 
         # M-STEP & Value Update Loop
         # We iterate multiple times over the batch to fully regress the policy onto the target q.
-
-        # Prepare datasets:
-        # Policy uses ONLY Top-K data (masked)
-        s_top = s[mask]
-        a_top = a[mask]
 
         # Value function uses ALL data (unmasked)
 
