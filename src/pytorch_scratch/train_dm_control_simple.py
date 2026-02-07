@@ -1,15 +1,17 @@
-# V-MPO (On-Policy Maximum a Posteriori Policy Optimisation) for dm_control
+"""V-MPO (On-Policy Maximum a Posteriori Policy Optimisation) for dm_control."""
 
-import numpy as np
-import copy
 import argparse
+import copy
+import random
+
+import gymnasium as gym
+import numpy as np
+import shimmy  # noqa: F401 (needed for dm_control Gymnasium registration)
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import gymnasium as gym
-import shimmy
 import wandb
-import random
+import os
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -25,23 +27,14 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def make_dm_control_env(domain, task, seed=None):
-    """Create a dm_control environment via shimmy's Gymnasium wrapper.
-
-    Args:
-        domain: dm_control domain name (e.g. 'cheetah', 'walker', 'cartpole').
-        task:   dm_control task name (e.g. 'run', 'walk', 'swingup').
-        seed:   optional random seed.
-
-    Returns:
-        A Gymnasium-compatible environment with continuous observation and
-        action spaces.
-    """
+def make_dm_control_env(domain, task, seed=None, render_mode=None):
+    """Create a dm_control environment via shimmy's Gymnasium wrapper."""
     env = gym.make(
         f"dm_control/{domain}-{task}-v0",
+        render_mode=render_mode,
     )
     if seed is not None:
-        env.reset(seed=seed)  # seed env RNG once; subsequent reset() uses it
+        env.reset(seed=seed)
         try:
             env.action_space.seed(seed)
         except Exception:
@@ -60,42 +53,28 @@ def flatten_obs(obs):
 
 
 # Generalised Advantage Estimation (GAE)
-def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
+def compute_gae(rewards, values, next_values, bootstrap_masks, gamma=0.99, lam=0.95):
     """Compute GAE-λ advantages and corresponding value-function targets.
 
-    GAE provides a bias–variance trade-off for advantage estimation:
-      A_t^{GAE} = Σ_{l=0}^{T-t-1} (γλ)^l · δ_{t+l}
-    where δ_t = r_t + γ V(s_{t+1}) - V(s_t)  is the 1-step TD error.
-
-    Args:
-        rewards : (T,)   tensor of rewards.
-        values  : (T+1,) tensor of value estimates (includes bootstrap V(s_T)).
-        dones   : (T,)   tensor of done flags (1.0 = episode boundary).
-        gamma   : discount factor.
-        lam     : GAE λ (0 → pure TD, 1 → pure MC).
-
-    Returns:
-        advantages : (T,) GAE advantages.
-        returns    : (T,) targets for value regression  (A_t + V(s_t)).
+    bootstrap_masks[t] = 0 → terminated=True (true terminal): no bootstrap
+    bootstrap_masks[t] = 1 → non-terminal or truncated=True (time-limit): bootstrap
     """
     T = len(rewards)
     advantages = torch.zeros(T, device=values.device)
     gae = 0.0
 
     for t in reversed(range(T)):
-        delta = rewards[t] + gamma * (1 - dones[t]) * values[t + 1] - values[t]
-        gae = delta + gamma * lam * (1 - dones[t]) * gae
+        delta = rewards[t] + gamma * bootstrap_masks[t] * next_values[t] - values[t]
+        gae = delta + gamma * lam * bootstrap_masks[t] * gae
         advantages[t] = gae
 
-    returns = advantages + values[:-1]
+    returns = advantages + values
     return advantages, returns
 
 
-# Policy Network  (π_θ)
-# Outputs a Gaussian distribution over the continuous action space.
-# Architecture: MLP with two hidden layers (256 units each).
-# Outputs mean and a state-independent log_std parameter.
 class GaussianPolicy(nn.Module):
+    """Gaussian policy for continuous action spaces."""
+
     def __init__(self, obs_dim, act_dim, hidden=256):
         super().__init__()
         self.net = nn.Sequential(
@@ -103,36 +82,28 @@ class GaussianPolicy(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, act_dim),  # mean of Gaussian
+            nn.Linear(hidden, act_dim),
         )
-        # State-independent log standard deviation
-        self.log_std = nn.Parameter(torch.zeros(act_dim))
+        # initialise conservatively
+        self.log_std = nn.Parameter(torch.ones(act_dim) * -1.0)
 
     def forward(self, x):
-        """Return (mean, std) for each batch element."""
         mean = self.net(x)
         std = self.log_std.exp().expand_as(mean)
         return mean, std
 
     def dist(self, x):
-        """Return a Normal distribution for the given observations."""
         mean, std = self.forward(x)
         return torch.distributions.Normal(mean, std)
 
     def sample(self, x):
-        """Sample an action and return it (no gradient)."""
-        d = self.dist(x)
-        return d.sample()
+        return self.dist(x).sample()
 
-    def log_prob(self, x, a):
-        """Compute log π_θ(a | s) for given state-action pairs.
-        Returns per-sample log-prob (sum over action dimensions)."""
-        d = self.dist(x)
-        return d.log_prob(a).sum(dim=-1)
+    def act_deterministic(self, x):
+        mean, _ = self.forward(x)
+        return mean
 
 
-# Value Network  V_φ(s)
-# MLP with two hidden layers (256 units each), scalar output.
 class ValueNet(nn.Module):
     def __init__(self, obs_dim, hidden=256):
         super().__init__()
@@ -145,29 +116,39 @@ class ValueNet(nn.Module):
         )
 
     def forward(self, x):
-        """Return V(s) as a scalar per batch element."""
         return self.net(x).squeeze(-1)
 
 
 # VMPO Trainer
-class DMControlTrainer:
+# Orchestrates the full VMPO training loop:
+#   - Maintains two copies of the policy: π_θ (updated) and π_old (behaviour).
+#   - Maintains a learned temperature η (stored in log-space for positivity).
+#   - Each iteration: collect → GAE → E-step → M-step → dual η update →
+#     value update → sync π_old ← π_θ.
+class DMControlBatchTrainer:
     def __init__(
         self,
-        domain="cheetah",
-        task="run",
-        rollout_steps=2048,
-        gamma=0.99,
-        lam=0.95,
-        lr=3e-4,
-        n_temperature_epsilon=0.1,
-        eta_initial=0.0,
-        seed: int = 42,
+        domain: str,
+        task: str,
+        rollout_steps: int,
+        gamma: float,
+        lam: float,
+        lr: float,
+        n_temperature_epsilon: float,
+        eta_initial: float,
+        seed: int,
+        eps_alpha_mu: float,
+        eps_alpha_sigma: float,
+        top_k_fraction: float,
+        n_value_updates: int,
+        n_policy_updates: int,
+        eta_lr: float,
     ):
         set_seed(seed)
         self.env = make_dm_control_env(domain, task, seed=seed)
+        self.checkpoints_dir = f"checkpoints/{domain}_{task}"
+        os.makedirs(self.checkpoints_dir, exist_ok=True)
 
-        # Determine observation and action dimensions
-        # dm_control obs may be a Dict space
         if isinstance(self.env.observation_space, gym.spaces.Dict):
             obs_dim = sum(
                 int(np.prod(v.shape))
@@ -177,44 +158,63 @@ class DMControlTrainer:
             obs_dim = int(np.prod(self.env.observation_space.shape))
 
         act_dim = int(np.prod(self.env.action_space.shape))
-        self.act_low = torch.tensor(
-            self.env.action_space.low, dtype=torch.float32, device=device
-        )
-        self.act_high = torch.tensor(
-            self.env.action_space.high, dtype=torch.float32, device=device
-        )
 
-        # π_θ  – the policy we optimise (M-step target)
         self.policy = GaussianPolicy(obs_dim, act_dim).to(device)
-        # π_old – frozen copy used as the behaviour policy
+        # π_old – frozen copy used as the behaviour policy for data collection
+        #         and as the reference distribution for KL measurement.
         self.policy_old = copy.deepcopy(self.policy).eval()
-        # V_φ  – state-value function
         self.value = ValueNet(obs_dim).to(device)
 
+        # Separate optimisers for policy, value, and dual variable η
         self.opt_pi = optim.Adam(self.policy.parameters(), lr=lr)
         self.opt_v = optim.Adam(self.value.parameters(), lr=lr)
 
-        # η (eta) – the E-step temperature (log-space)
+        # η (eta) – the E-step temperature, stored in log-space so that
+        # exp(self.eta) is always positive.  Optimised with its own Adam.
         self.eta = nn.Parameter(torch.tensor(eta_initial, device=device))
-        self.opt_eta = optim.Adam([self.eta], lr=1e-3)
+        self.opt_eta = optim.Adam([self.eta], lr=eta_lr)
 
+        # Rollout / GAE hyper-parameters
         self.rollout_steps = rollout_steps
         self.gamma = gamma
         self.lam = lam
+        # ε_η  – the KL bound on the E-step weight distribution.
+        # Smaller → more uniform weights → more conservative updates.
         self.n_temperature_epsilon = n_temperature_epsilon
 
-        # Parametric KL multiplier α (log-space)
-        self.log_alpha = nn.Parameter(torch.tensor(np.log(5.0), device=device))
-        self.opt_alpha = optim.Adam([self.log_alpha], lr=1e-3)
-        self.eps_alpha = 0.01
+        # Parametric KL multiplier α (stored in log-space for positivity)
+        self.log_alpha_mu = nn.Parameter(torch.tensor(np.log(5.0), device=device))
+        self.log_alpha_sigma = nn.Parameter(torch.tensor(np.log(1.0), device=device))
 
+        self.opt_alpha_mu = optim.Adam([self.log_alpha_mu], lr=lr)
+        self.opt_alpha_sigma = optim.Adam([self.log_alpha_sigma], lr=lr)
+
+        # Separate trust-region constraints
+        self.eps_alpha_mu = eps_alpha_mu
+        self.eps_alpha_sigma = eps_alpha_sigma
+
+        # Running episode statistics (accumulated across rollout boundaries)
         self.ep_return = 0.0
         self.ep_length = 0
         self.total_env_steps = 0
+        self.top_k_fraction = top_k_fraction
+
+        self.n_value_updates = n_value_updates
+        self.n_policy_updates = n_policy_updates
+
+        self.domain = domain
+        self.task = task
+
+    # Data Collection  (rollout with π_old)
 
     def collect(self):
-        """Collect a fixed-length rollout using the behaviour policy π_old."""
-        obs, acts, rews, dones, vals = [], [], [], [], []
+        """Collect a fixed-length rollout using the behaviour policy π_old.
+
+        Returns tensors of observations, actions, rewards, bootstrap masks,
+        value estimates V(s_t), next value estimates V(s_{t+1}), and a list of
+        completed episode returns for logging.
+        """
+        obs, acts, rews, bootstrap_masks, vals, next_vals = [], [], [], [], [], []
 
         s, _ = self.env.reset()
         s = flatten_obs(s)
@@ -226,14 +226,22 @@ class DMControlTrainer:
 
             with torch.no_grad():
                 a = self.policy_old.sample(s_t).cpu().numpy().squeeze(0)
-                # Clip action to valid range
                 a = np.clip(a, self.env.action_space.low, self.env.action_space.high)
                 v = self.value(s_t).item()
 
             s2, r, terminated, truncated, _ = self.env.step(a)
             s2 = flatten_obs(s2)
             self.total_env_steps += 1
-            done = terminated or truncated
+
+            # Gymnasium gives both for a reason:
+            # - terminated => true terminal => do NOT bootstrap
+            # - truncated  => time limit    => DO bootstrap, but still reset
+            bootstrap_mask = 0.0 if terminated else 1.0
+
+            with torch.no_grad():
+                v_next = self.value(
+                    torch.tensor(s2, dtype=torch.float32).unsqueeze(0).to(device)
+                ).item()
 
             self.ep_return += r
             self.ep_length += 1
@@ -241,10 +249,11 @@ class DMControlTrainer:
             obs.append(s)
             acts.append(a)
             rews.append(r)
-            dones.append(float(done))
+            bootstrap_masks.append(bootstrap_mask)
             vals.append(v)
+            next_vals.append(v_next)
 
-            if done:
+            if terminated or truncated:
                 episode_returns.append(self.ep_return)
                 self.ep_return = 0.0
                 self.ep_length = 0
@@ -253,113 +262,166 @@ class DMControlTrainer:
             else:
                 s = s2
 
-        with torch.no_grad():
-            v_last = self.value(
-                torch.tensor(s, dtype=torch.float32).unsqueeze(0).to(device)
-            ).item()
-
-        vals.append(v_last)
-
         return (
             torch.from_numpy(np.asarray(obs, dtype=np.float32)).to(device),
             torch.from_numpy(np.asarray(acts, dtype=np.float32)).to(device),
             torch.from_numpy(np.asarray(rews, dtype=np.float32)).to(device),
-            torch.from_numpy(np.asarray(dones, dtype=np.float32)).to(device),
+            torch.from_numpy(np.asarray(bootstrap_masks, dtype=np.float32)).to(device),
             torch.from_numpy(np.asarray(vals, dtype=np.float32)).to(device),
+            torch.from_numpy(np.asarray(next_vals, dtype=np.float32)).to(device),
             episode_returns,
         )
 
     def train_once(self):
-        """Execute one full VMPO iteration."""
+        """Execute one full VMPO iteration:
+        collect → GAE → E-step → M-step → dual η update → value update.
+        """
 
-        s, a, r, d, v, episode_returns = self.collect()
+        # Data Collection  –  rollout with behaviour policy π_old
+        s, a, r, bootstrap_masks, v, v_next, episode_returns = self.collect()
 
-        adv, ret = compute_gae(r, v, d, self.gamma, self.lam)
+        # Advantage Estimation (GAE-λ)
+        adv, ret = compute_gae(r, v, v_next, bootstrap_masks, self.gamma, self.lam)
 
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        # Advantage Pre-processing (Top-K Masking)
+        # We only want to weight the "good" half of the samples.
+        # This prevents the exponential weights from being dominated by outliers
+        # and acts as a trust-region filter.
+        with torch.no_grad():
+            # 1. Select top-k advantages (top 50%)
+            if self.top_k_fraction < 1.0:
+                top_k_threshold = torch.quantile(adv, self.top_k_fraction)
+                mask = adv >= top_k_threshold
+            else:
+                mask = torch.ones_like(adv, dtype=torch.bool)
 
-        # M-STEP & Value Update
-        s_top = s
-        a_top = a
-        w_top = torch.softmax(adv, dim=0).detach()
+            # 2. Extract selected advantages
+            adv_selected = adv[mask]
 
-        s_full = s
-        ret_full = ret
+            # 3. Centre for numerical stability ONLY
+            adv_selected = adv_selected - adv_selected.mean()
+
+            # 4. E-step weights
+            eta = self.eta.exp()
+            q_weights = torch.softmax(adv_selected / eta, dim=0)
+            ess = 1.0 / torch.sum(q_weights**2)
+            ess_frac = ess / q_weights.numel()
+
+        # M-STEP & Value Update Loop
+        # We iterate multiple times over the batch to fully regress the policy onto the target q.
+
+        # Prepare datasets:
+        # Policy uses ONLY Top-K data (masked)
+        s_top = s[mask]
+        a_top = a[mask]
+
+        # Value function uses ALL data (unmasked)
 
         total_policy_loss = 0.0
-        total_value_loss = 0.0
-        total_kl = 0.0
+        total_kl_mu = 0.0
+        total_kl_sigma = 0.0
 
-        n_epochs = 1
-        batch_size = len(s_top)
-        for epoch in range(n_epochs):
-            perm_top = torch.randperm(len(s_top))
+        for _ in range(self.n_policy_updates):
+            # --- Policy Update Loop (on Top-K data) ---
 
-            for start in range(0, len(s_top), batch_size):
-                idx = perm_top[start : start + batch_size]
-                mb_s = s_top[idx]
-                mb_a = a_top[idx]
-                mb_w = w_top[idx]
+            # M-STEP: Weighted Maximum Likelihood
+            # (A) Policy loss — top-k batch
+            new_dist_top = self.policy.dist(s_top)
+            logp = new_dist_top.log_prob(a_top).sum(dim=-1)
+            policy_loss = -(q_weights * logp).sum()
 
-                # New policy
-                new_dist = self.policy.dist(mb_s)
-                logp = new_dist.log_prob(mb_a).sum(dim=-1)
+            # (B) KL constraint — full batch
+            with torch.no_grad():
+                mu_old, std_old = self.policy_old(s)
+            mu_old = mu_old.detach()
+            std_old = std_old.detach()
+            log_std_old = std_old.log()
 
-                # Old policy (detached)
-                with torch.no_grad():
-                    old_dist = self.policy_old.dist(mb_s)
+            mu_new, std_new = self.policy(s)
+            log_std_new = std_new.log()
 
-                # L_pi = - sum( w_i * log pi(a|s) )
-                policy_loss = -(mb_w * logp).sum()
+            # Mean KL (behavioural shift only; uses old variance)
+            kl_mu = 0.5 * (((mu_new - mu_old) ** 2) / (std_old**2)).sum(dim=-1).mean()
 
-                # KL(π_old || π_new) — sum over action dims, mean over batch
-                kl = (
-                    torch.distributions.kl_divergence(old_dist, new_dist)
-                    .sum(dim=-1)
-                    .mean()
+            # Variance KL (shape change only)
+            kl_sigma = (
+                0.5
+                * (
+                    (std_old**2) / (std_new**2)
+                    - 1.0
+                    + 2.0 * (log_std_new - log_std_old)
                 )
-                total_kl += kl.item()
+                .sum(dim=-1)
+                .mean()
+            )
 
-                alpha = self.log_alpha.exp()
+            total_kl_mu += kl_mu.item()
+            total_kl_sigma += kl_sigma.item()
 
-                # θ update
-                self.opt_pi.zero_grad()
-                (policy_loss + alpha.detach() * kl).backward()
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
-                self.opt_pi.step()
+            alpha_mu = self.log_alpha_mu.exp()
+            alpha_sigma = self.log_alpha_sigma.exp()
 
-                # α update
-                self.opt_alpha.zero_grad()
-                (alpha * (self.eps_alpha - kl.detach())).backward()
-                self.opt_alpha.step()
+            # θ update
+            self.opt_pi.zero_grad()
+            (
+                policy_loss
+                + alpha_mu.detach() * kl_mu
+                + alpha_sigma.detach() * kl_sigma
+            ).backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+            self.opt_pi.step()
 
-                total_policy_loss += policy_loss.item()
+            # hard clamp σ every update
+            with torch.no_grad():
+                self.policy.log_std.clamp_(-5.0, 1.0)
 
-            # --- Value Update Loop ---
-            perm_full = torch.randperm(len(s_full))
-            for start in range(0, len(s_full), batch_size):
-                idx = perm_full[start : start + batch_size]
-                mb_s = s_full[idx]
-                mb_ret = ret_full[idx]
+            # α updates (dual ascent)
+            self.opt_alpha_mu.zero_grad()
+            (alpha_mu * (self.eps_alpha_mu - kl_mu.detach())).backward()
+            self.opt_alpha_mu.step()
 
-                values = self.value(mb_s)
-                value_loss = ((values - mb_ret) ** 2).mean()
+            self.opt_alpha_sigma.zero_grad()
+            (alpha_sigma * (self.eps_alpha_sigma - kl_sigma.detach())).backward()
+            self.opt_alpha_sigma.step()
 
-                self.opt_v.zero_grad()
-                value_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.5)
-                self.opt_v.step()
-                total_value_loss += value_loss.item()
+            # Projection: enforce α >= 1e-8 (in log-space)
+            with torch.no_grad():
+                self.log_alpha_mu.clamp_(min=np.log(1e-8))
+                self.log_alpha_sigma.clamp_(min=np.log(1e-8))
+
+            total_policy_loss += policy_loss.item()
+
+        # --- Value Update Loop (on ALL data) ---
+        # Value function learns from all transitions to properly estimate V(s)
+
+        total_value_loss = 0.0
+
+        for _ in range(self.n_value_updates):
+            values = self.value(s)
+            value_loss = ((values - ret) ** 2).mean()
+
+            self.opt_v.zero_grad()
+            value_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.5)
+            self.opt_v.step()
+
+            total_value_loss += value_loss.item()
 
         self.policy_old.load_state_dict(self.policy.state_dict())
 
-        # DUAL η UPDATE
-        eta = self.eta.exp()
-        T_factor = torch.tensor(float(len(adv)), device=adv.device)
+        # DUAL η UPDATE  –  E-step temperature optimisation
+        # We perform this ONCE per rollout using the cached `adv_selected`.
+        # Re-calculate eta from parameter to ensure the graph is connected.
 
+        eta = self.eta.exp()
+        T_factor = torch.tensor(float(len(adv_selected)), device=adv.device)
+
+        # The dual objective: η * ε + η * log( mean( exp(A/η) ) )
+        # Implemented using logsumexp for stability:
+        # log( mean( exp(A/η) ) ) = log( sum(exp(A/η)) / N ) = logsumexp(A/η) - log(N)
         eta_loss = eta * (
             self.n_temperature_epsilon
-            + torch.logsumexp(adv.detach() / eta, dim=0)
+            + torch.logsumexp(adv_selected.detach() / eta, dim=0)
             - torch.log(T_factor)
         )
 
@@ -367,46 +429,131 @@ class DMControlTrainer:
         eta_loss.backward()
         self.opt_eta.step()
 
-        # Diagnostics
+        # Projection: enforce η >= 1e-8 (in log-space)
         with torch.no_grad():
-            new_dist = self.policy.dist(s_full[:512])
+            self.eta.clamp_(min=np.log(1e-8))
+
+        # Recompute η for logging after projection/update
+        eta = self.eta.exp()
+
+        # Diagnostics / Logging
+        with torch.no_grad():
+            new_dist = self.policy.dist(s)
             entropy = new_dist.entropy().sum(dim=-1).mean()
 
         metrics = {
-            "entropy": entropy.item(),
-            "rollout_return": float(np.sum(episode_returns))
+            "train/entropy": entropy.item(),
+            "train/rollout_return": float(np.sum(episode_returns))
             / max(1, len(episode_returns)),
-            "policy_loss": total_policy_loss / n_epochs,
-            "value_loss": total_value_loss / n_epochs,
-            "eta": eta.item(),
-            "eta_loss": eta_loss.item(),
-            "alpha": self.log_alpha.exp().item(),
-            "kl": total_kl / max(1, len(s_top)),
+            "train/policy_loss": total_policy_loss
+            / self.n_policy_updates,  # M-step loss
+            "train/value_loss": total_value_loss / self.n_value_updates,  # critic MSE
+            "train/eta": eta.item(),  # current temperature
+            "train/eta_loss": eta_loss.item(),  # dual objective value
+            "train/alpha_mu": self.log_alpha_mu.exp().item(),
+            "train/alpha_sigma": self.log_alpha_sigma.exp().item(),
+            "train/kl_mu": total_kl_mu / self.n_policy_updates,
+            "train/kl_sigma": total_kl_sigma / self.n_policy_updates,
+            "train/kl": (total_kl_mu + total_kl_sigma) / self.n_policy_updates,
+            "train/ess": ess.item(),
+            "train/ess_frac": ess_frac.item(),
+            "train/ess_ratio": ess.item() / adv_selected.numel(),
         }
 
         if episode_returns:
             metrics.update(
                 {
-                    "episode_return_mean": np.mean(episode_returns),
-                    "episode_return_max": np.max(episode_returns),
-                    "episode_return_min": np.min(episode_returns),
-                    "episodes_in_rollout": len(episode_returns),
+                    "train/episode_return_mean": np.mean(episode_returns),
+                    "train/episode_return_max": np.max(episode_returns),
+                    "train/episode_return_min": np.min(episode_returns),
+                    "train/episodes_in_rollout": len(episode_returns),
                 }
             )
 
         return metrics
 
+    def evaluate(self, n_episodes=10, max_steps=1000):
+        env = make_dm_control_env(self.domain, self.task)
+        returns = []
+
+        for _ in range(n_episodes):
+            obs, _ = env.reset()
+            obs = flatten_obs(obs)
+            ep_return = 0.0
+
+            for _ in range(max_steps):
+                obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    mean, _ = self.policy(obs_t)
+                    action = mean.cpu().numpy().squeeze(0)
+
+                action = np.clip(
+                    action,
+                    env.action_space.low,
+                    env.action_space.high,
+                )
+
+                obs, reward, terminated, truncated, _ = env.step(action)
+                obs = flatten_obs(obs)
+
+                ep_return += reward
+                if terminated or truncated:
+                    break
+
+            returns.append(ep_return)
+
+        env.close()
+
+        return {
+            "eval/return_mean": float(np.mean(returns)),
+            "eval/return_std": float(np.std(returns)),
+            "eval/return_min": float(np.min(returns)),
+            "eval/return_max": float(np.max(returns)),
+        }
+
     def train(self, iters=10_000):
-        """Run `iters` VMPO iterations, logging to W&B each step."""
         for it in range(iters):
             info = self.train_once()
+            if it % 30 == 0:
+                eval_metrics = self.evaluate(n_episodes=10)
+                info.update(eval_metrics)
             wandb.log(info, step=self.total_env_steps)
             if it % 10 == 0:
                 print(it, info)
+            if it % 30 == 0:
+                self.save_checkpoint(f"{self.checkpoints_dir}/ckpt.pt", it)
+
+    def save_checkpoint(self, path, it):
+        ckpt = {
+            "iteration": it,
+            "policy": self.policy.state_dict(),
+            "policy_old": self.policy_old.state_dict(),
+            "value": self.value.state_dict(),
+            "opt_pi": self.opt_pi.state_dict(),
+            "opt_v": self.opt_v.state_dict(),
+            "opt_eta": self.opt_eta.state_dict(),
+            "opt_alpha_mu": self.opt_alpha_mu.state_dict(),
+            "opt_alpha_sigma": self.opt_alpha_sigma.state_dict(),
+            "eta": self.eta.detach().cpu(),
+            "log_alpha_mu": self.log_alpha_mu.detach().cpu(),
+            "log_alpha_sigma": self.log_alpha_sigma.detach().cpu(),
+            "rng_state": {
+                "torch": torch.get_rng_state(),
+                "cuda": (
+                    torch.cuda.get_rng_state_all()
+                    if torch.cuda.is_available()
+                    else None
+                ),
+                "numpy": np.random.get_state(),
+                "python": random.getstate(),
+            },
+        }
+        torch.save(ckpt, path)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train dm_control with VMPO")
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--domain",
         type=str,
@@ -422,7 +569,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--rollout_steps",
         type=int,
-        default=2048,
+        default=4096,
         help="Number of environment steps per rollout",
     )
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor γ")
@@ -438,7 +585,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_temperature_epsilon",
         type=float,
-        default=0.1,
+        default=0.5,
         help="ε_η – KL bound on E-step weight distribution",
     )
     parser.add_argument(
@@ -447,22 +594,63 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eta_initial",
         type=float,
-        default=0.0,
+        default=-1.0,
         help="Initial value for log(η) temperature parameter",
     )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility",
+    )
+    parser.add_argument(
+        "--eps_alpha_mu",
+        type=float,
+        default=1.0,
+        help="ε_α for mean KL constraint (smaller → more conservative)",
+    )
+    parser.add_argument(
+        "--eps_alpha_sigma",
+        type=float,
+        default=0.1,
+        help="ε_α for variance KL constraint (smaller → more conservative)",
+    )
+    parser.add_argument(
+        "--top_k_fraction",
+        type=float,
+        default=0.5,
+        help="Fraction of samples to keep based on advantage (top-k masking for trust-region filtering)",
+    )
+    parser.add_argument(
+        "--n_value_updates",
+        type=int,
+        default=2,
+        help="Number of value function updates per iteration",
+    )
+    parser.add_argument(
+        "--n_policy_updates",
+        type=int,
+        default=4,
+        help="Number of policy updates per iteration",
+    )
+    parser.add_argument(
+        "--eta_lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate for dual variable η",
+    )
     args = parser.parse_args()
 
-    # Ensure deterministic init before anything else uses RNGs
     set_seed(args.seed)
 
     wandb.init(
         project="dm-control-vmpo",
         config=vars(args),
         group=f"{args.domain}-{args.task}",
-        name=f"{args.domain}-{args.task}-vmpo",
+        name=f"{args.domain}-{args.task}-vmpo-eta{args.eta_initial}-topk{args.top_k_fraction}-eps{args.n_temperature_epsilon}-seed{args.seed}",
     )
-    DMControlTrainer(
+
+    DMControlBatchTrainer(
         domain=args.domain,
         task=args.task,
         rollout_steps=args.rollout_steps,
@@ -472,5 +660,11 @@ if __name__ == "__main__":
         n_temperature_epsilon=args.n_temperature_epsilon,
         eta_initial=args.eta_initial,
         seed=args.seed,
+        eps_alpha_mu=args.eps_alpha_mu,
+        eps_alpha_sigma=args.eps_alpha_sigma,
+        top_k_fraction=args.top_k_fraction,
+        n_value_updates=args.n_value_updates,
+        n_policy_updates=args.n_policy_updates,
+        eta_lr=args.eta_lr,
     ).train(iters=args.iters)
     wandb.finish()
