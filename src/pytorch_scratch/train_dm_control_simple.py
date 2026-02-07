@@ -361,7 +361,7 @@ class DMControlVmpoTrainer:
                 adv_selected = adv_selected - adv_selected.mean()
 
             # 4. E-step weights
-            
+
             eta = self.eta.exp()
             with torch.no_grad():
                 dist_old = self.policy_old.dist(s_top)
@@ -637,7 +637,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eps_alpha_mu",
         type=float,
-        default=0.05,
+        default=0.1,
         help="ε_α for mean KL constraint (smaller → more conservative)",
     )
     parser.add_argument(
@@ -673,7 +673,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--t_target",
         type=int,
-        default=16,
+        default=7,
     )
     args = parser.parse_args()
 
