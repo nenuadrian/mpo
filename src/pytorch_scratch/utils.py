@@ -42,7 +42,7 @@ def make_dm_control_env(domain, task, seed=None, render_mode=None):
     return env
 
 
-def evaluate(policy, domain: str, task: str, n_episodes=10, max_steps=1000):
+def evaluate(device, policy, domain: str, task: str, n_episodes=10, max_steps=1000):
     env = make_dm_control_env(domain, task)
     returns = []
 

@@ -2,12 +2,12 @@ import argparse
 import copy
 import random
 
-import gymnasium as gym
-import numpy as np
-import shimmy  # noqa: F401 (needed for dm_control Gymnasium registration)
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import gymnasium as gym  # type: ignore
+import numpy as np  # type: ignore
+import shimmy  # type: ignore
+import torch  # type: ignore
+import torch.nn as nn  # type: ignore
+import torch.optim as optim  # type: ignore
 import wandb
 import os
 
@@ -545,10 +545,10 @@ class DMControlVmpoTrainer:
             info = self.train_once()
             if it % 30 == 0:
                 eval_metrics = evaluate(
-                    self.policy, self.domain, self.task, n_episodes=10
+                    device, self.policy, self.domain, self.task, n_episodes=10
                 )
                 info.update(eval_metrics)
-            wandb.log(info, step=self.total_env_steps)
+            wandb.log(info, step=self.total_env_steps)  # type: ignore
             if it % 10 == 0:
                 print(it, info)
             if it % 30 == 0:
@@ -677,7 +677,7 @@ if __name__ == "__main__":
 
     set_seed(args.seed)
 
-    wandb.init(
+    wandb.init(  # type: ignore
         project="dm-control-vmpo",
         config=vars(args),
         group=f"{args.domain}-{args.task}",
@@ -702,4 +702,4 @@ if __name__ == "__main__":
         eta_lr=args.eta_lr,
         t_target=args.t_target,
     ).train(iters=args.iters)
-    wandb.finish()
+    wandb.finish()  # type: ignore
