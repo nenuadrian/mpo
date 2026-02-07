@@ -214,7 +214,7 @@ class DMControlVmpoTrainer:
     def train_once(self):
 
         # Data Collection  –  rollout with behaviour policy π_old
-        s, a, r, reset_masks, trunc_bootstrap_masks, v, v_next, episode_returns = (
+        s_all, a_all, r, reset_masks, trunc_bootstrap_masks, v, v_next, episode_returns = (
             self.collect()
         )
 
@@ -249,13 +249,11 @@ class DMControlVmpoTrainer:
         # Advantages
         adv = returns - v
 
-        # Advantage Pre-processing (Top-K Masking)
-        # We only want to weight the "good" half of the samples.
-        # This prevents the exponential weights from being dominated by outliers
-        # and acts as a trust-region filter.
-
-        # 3. Centre for numerical stability ONLY
-        adv = adv - adv.mean()
+        k = adv.numel() // 2
+        topk_vals, topk_idx = torch.topk(adv, k, sorted=False)
+        adv = topk_vals - topk_vals.mean()
+        s   = s_all[topk_idx]
+        a   = a_all[topk_idx]
 
         # 4. E-step weights
         eta = self.eta.exp()
@@ -267,34 +265,24 @@ class DMControlVmpoTrainer:
         # M-STEP & Value Update Loop
         # We iterate multiple times over the batch to fully regress the policy onto the target q.
 
-        # Prepare datasets:
-        # Policy uses ONLY Top-K data (masked)
-        s_top = s
-        a_top = a
-
-        # Value function uses ALL data (unmasked)
-
         total_policy_loss = 0.0
         total_kl_mu = 0.0
         total_kl_sigma = 0.0
 
         for _ in range(self.n_policy_updates):
-            # --- Policy Update Loop (on Top-K data) ---
-
             # M-STEP: Weighted Maximum Likelihood
-            # (A) Policy loss — top-k batch
-            new_dist_top = self.policy.dist(s_top)
-            logp = new_dist_top.log_prob(a_top).sum(dim=-1)
+            new_dist = self.policy.dist(s)
+            logp = new_dist.log_prob(a).sum(dim=-1)
             policy_loss = -(q_weights * logp).sum()
 
             # (B) KL constraint — full batch
             with torch.no_grad():
-                mu_old, std_old = self.policy_old(s)
+                mu_old, std_old = self.policy_old(s_all)
             mu_old = mu_old.detach()
             std_old = std_old.detach()
             log_std_old = std_old.log()
 
-            mu_new, std_new = self.policy(s)
+            mu_new, std_new = self.policy(s_all)
             log_std_new = std_new.log()
 
             # Mean KL (behavioural shift only; uses old variance)
@@ -346,11 +334,10 @@ class DMControlVmpoTrainer:
 
         # --- Value Update Loop (on ALL data) ---
         # Value function learns from all transitions to properly estimate V(s)
-
         total_value_loss = 0.0
 
         for _ in range(self.n_value_updates):
-            values = self.value(s)
+            values = self.value(s_all)
             value_loss = ((values - returns) ** 2).mean()
 
             self.opt_v.zero_grad()
@@ -360,12 +347,10 @@ class DMControlVmpoTrainer:
 
             total_value_loss += value_loss.item()
 
-        self.policy_old.load_state_dict(self.policy.state_dict())
 
         # DUAL η UPDATE  –  E-step temperature optimisation
         # We perform this ONCE per rollout using the cached `adv`.
         # Re-calculate eta from parameter to ensure the graph is connected.
-
         eta = self.eta.exp()
         log_batch_size = torch.tensor(float(len(adv)), device=adv.device)
 
@@ -388,10 +373,11 @@ class DMControlVmpoTrainer:
 
         # Recompute η for logging after projection/update
         eta = self.eta.exp()
+        self.policy_old.load_state_dict(self.policy.state_dict())
 
         # Diagnostics / Logging
         with torch.no_grad():
-            new_dist = self.policy.dist(s)
+            new_dist = self.policy.dist(s_all)
             entropy = new_dist.entropy().sum(dim=-1).mean()
 
         metrics = {
@@ -519,7 +505,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eps_alpha_sigma",
         type=float,
-        default=0.1,
+        default=0.01,
         help="ε_α for variance KL constraint (smaller → more conservative)",
     )
     parser.add_argument(
