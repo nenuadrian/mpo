@@ -237,7 +237,8 @@ class DMControlVmpoTrainer:
 
         # 4. E-step weights
         eta = self.eta.exp()
-        q_weights = torch.softmax(adv / eta, dim=0)
+        with torch.no_grad():
+            q_weights = torch.softmax(adv / eta, dim=0)
         ess = 1.0 / torch.sum(q_weights**2)
         ess_frac = ess / q_weights.numel()
 
