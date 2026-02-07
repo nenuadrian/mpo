@@ -113,18 +113,16 @@ class PopArt:
 
 
 class GaussianPolicy(nn.Module):
-    """Gaussian policy for continuous action spaces."""
-
     def __init__(self, obs_dim, act_dim, hidden1=512, hidden2=256):
         super().__init__()
+
         self.trunk = nn.Sequential(
             nn.Linear(obs_dim, hidden1),
             nn.ReLU(),
             nn.Linear(hidden1, hidden2),
             nn.ReLU(),
-            nn.Linear(hidden2, act_dim),
         )
-        # initialise conservatively
+
         self.mu_head = nn.Linear(hidden2, act_dim)
         self.log_std_head = nn.Linear(hidden2, act_dim)
 
@@ -132,12 +130,7 @@ class GaussianPolicy(nn.Module):
         h = self.trunk(x)
         mu = self.mu_head(h)
         log_std = self.log_std_head(h).clamp(-5.0, 1.0)
-        std = log_std.exp()
-        return mu, std
-
-    def dist(self, x):
-        mu, std = self.forward(x)
-        return torch.distributions.Normal(mu, std)
+        return mu, log_std.exp()
 
     def sample(self, x):
         return self.dist(x).sample()
@@ -420,10 +413,6 @@ class DMControlVmpoTrainer:
             ).backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
             self.opt_pi.step()
-
-            # hard clamp σ every update
-            with torch.no_grad():
-                self.policy.log_std.clamp_(-5.0, 1.0)
 
             # α updates (dual ascent)
             self.opt_alpha_mu.zero_grad()

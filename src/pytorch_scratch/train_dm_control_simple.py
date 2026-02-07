@@ -17,18 +17,16 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class GaussianPolicy(nn.Module):
-    """Gaussian policy for continuous action spaces."""
-
     def __init__(self, obs_dim, act_dim, hidden1=512, hidden2=256):
         super().__init__()
+
         self.trunk = nn.Sequential(
             nn.Linear(obs_dim, hidden1),
             nn.ReLU(),
             nn.Linear(hidden1, hidden2),
             nn.ReLU(),
-            nn.Linear(hidden2, act_dim),
         )
-        # initialise conservatively
+
         self.mu_head = nn.Linear(hidden2, act_dim)
         self.log_std_head = nn.Linear(hidden2, act_dim)
 
@@ -36,8 +34,7 @@ class GaussianPolicy(nn.Module):
         h = self.trunk(x)
         mu = self.mu_head(h)
         log_std = self.log_std_head(h).clamp(-5.0, 1.0)
-        std = log_std.exp()
-        return mu, std
+        return mu, log_std.exp()
 
     def dist(self, x):
         mu, std = self.forward(x)
@@ -143,7 +140,15 @@ class DMControlVmpoTrainer:
         self.task = task
 
     def collect(self):
-        obs, acts, rews, bootstrap_masks, vals, next_vals = [], [], [], [], [], []
+        obs, acts, rews, reset_masks, trunc_bootstrap_masks, vals, next_vals = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
 
         s, _ = self.env.reset()
         s = flatten_obs(s)
@@ -163,9 +168,10 @@ class DMControlVmpoTrainer:
             self.total_env_steps += 1
 
             # Gymnasium gives both for a reason:
-            # - terminated => true terminal => do NOT bootstrap
-            # - truncated  => time limit    => DO bootstrap, but still reset
-            bootstrap_mask = 0.0 if terminated else 1.0
+            # - terminated => true terminal => reset, do NOT bootstrap
+            # - truncated  => time limit    => reset, but DO bootstrap from V(s_{t+1})
+            reset_mask = 0.0 if (terminated or truncated) else 1.0
+            trunc_bootstrap_mask = 1.0 if truncated else 0.0
 
             with torch.no_grad():
                 v_next = self.value(
@@ -178,7 +184,8 @@ class DMControlVmpoTrainer:
             obs.append(s)
             acts.append(a)
             rews.append(r)
-            bootstrap_masks.append(bootstrap_mask)
+            reset_masks.append(reset_mask)
+            trunc_bootstrap_masks.append(trunc_bootstrap_mask)
             vals.append(v)
             next_vals.append(v_next)
 
@@ -195,7 +202,10 @@ class DMControlVmpoTrainer:
             torch.from_numpy(np.asarray(obs, dtype=np.float32)).to(device),
             torch.from_numpy(np.asarray(acts, dtype=np.float32)).to(device),
             torch.from_numpy(np.asarray(rews, dtype=np.float32)).to(device),
-            torch.from_numpy(np.asarray(bootstrap_masks, dtype=np.float32)).to(device),
+            torch.from_numpy(np.asarray(reset_masks, dtype=np.float32)).to(device),
+            torch.from_numpy(np.asarray(trunc_bootstrap_masks, dtype=np.float32)).to(
+                device
+            ),
             torch.from_numpy(np.asarray(vals, dtype=np.float32)).to(device),
             torch.from_numpy(np.asarray(next_vals, dtype=np.float32)).to(device),
             episode_returns,
@@ -204,24 +214,37 @@ class DMControlVmpoTrainer:
     def train_once(self):
 
         # Data Collection  –  rollout with behaviour policy π_old
-        s, a, r, bootstrap_masks, v, v_next, episode_returns = self.collect()
+        s, a, r, reset_masks, trunc_bootstrap_masks, v, v_next, episode_returns = (
+            self.collect()
+        )
 
         # --- N-step Monte Carlo returns (V-MPO style) ---
 
         T = r.shape[0]
         returns = torch.zeros(T, device=device)
 
-        G = 0.0
+        # Correct episodic n-step estimator:
+        # - reset return accumulator at any episode boundary (terminated OR truncated)
+        # - bootstrap at time-limit truncations via V(s_{t+1})
+        # - bootstrap once at the end of the rollout only if the rollout ended mid-episode
+        G = torch.tensor(0.0, device=device)
         for t in reversed(range(T)):
-            G = r[t] + self.gamma * bootstrap_masks[t] * G
+            if reset_masks[t].item() == 0.0:
+                G = torch.tensor(0.0, device=device)
+
+            G = r[t] + self.gamma * G
+
+            # Time-limit truncation: include V(s_{t+1}) but do not leak across the reset.
+            if trunc_bootstrap_masks[t].item() == 1.0:
+                G = G + self.gamma * v_next[t]
+
             returns[t] = G
 
-        # Single bootstrap from the last value estimate
-        returns += (
-            (self.gamma ** torch.arange(T, device=device))
-            * v_next[-1]
-            * bootstrap_masks[-1]
-        )
+        # Rollout-end bootstrap: only for the final, non-terminal segment.
+        # final_segment_mask[t] = Π_{k=t}^{T-1} reset_masks[k]
+        final_segment_mask = torch.cumprod(reset_masks.flip(0), dim=0).flip(0)
+        discounts_to_end = self.gamma ** (T - torch.arange(T, device=device))
+        returns = returns + final_segment_mask * discounts_to_end * v_next[-1]
 
         # Advantages
         adv = returns - v
@@ -304,10 +327,6 @@ class DMControlVmpoTrainer:
             ).backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
             self.opt_pi.step()
-
-            # hard clamp σ every update
-            with torch.no_grad():
-                self.policy.log_std.clamp_(-5.0, 1.0)
 
             # α updates (dual ascent)
             self.opt_alpha_mu.zero_grad()
