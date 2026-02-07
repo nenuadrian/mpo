@@ -16,48 +16,32 @@ from utils import set_seed, make_dm_control_env, evaluate, flatten_obs
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def compute_gae(rewards, values, next_values, bootstrap_masks, gamma=0.99, lam=0.95):
-    """Compute GAE-λ advantages and corresponding value-function targets.
-
-    bootstrap_masks[t] = 0 → terminated=True (true terminal): no bootstrap
-    bootstrap_masks[t] = 1 → non-terminal or truncated=True (time-limit): bootstrap
-    """
-    T = len(rewards)
-    advantages = torch.zeros(T, device=values.device)
-    gae = 0.0
-
-    for t in reversed(range(T)):
-        delta = rewards[t] + gamma * bootstrap_masks[t] * next_values[t] - values[t]
-        gae = delta + gamma * lam * bootstrap_masks[t] * gae
-        advantages[t] = gae
-
-    returns = advantages + values
-    return advantages, returns
-
-
 class GaussianPolicy(nn.Module):
     """Gaussian policy for continuous action spaces."""
 
-    def __init__(self, obs_dim, act_dim, hidden=256):
+    def __init__(self, obs_dim, act_dim, hidden1=512, hidden2=256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
+            nn.Linear(obs_dim, hidden1),
             nn.ReLU(),
-            nn.Linear(hidden, hidden),
+            nn.Linear(hidden1, hidden2),
             nn.ReLU(),
-            nn.Linear(hidden, act_dim),
+            nn.Linear(hidden2, act_dim),
         )
         # initialise conservatively
-        self.log_std = nn.Parameter(torch.ones(act_dim) * -1.0)
+        self.mu_head = nn.Linear(hidden2, act_dim)
+        self.log_std_head = nn.Linear(hidden2, act_dim)
 
     def forward(self, x):
-        mean = self.net(x)
-        std = self.log_std.exp().expand_as(mean)
-        return mean, std
+        h = self.trunk(x)
+        mu = self.mu_head(h)
+        log_std = self.log_std_head(h).clamp(-5.0, 1.0)
+        std = log_std.exp()
+        return mu, std
 
     def dist(self, x):
-        mean, std = self.forward(x)
-        return torch.distributions.Normal(mean, std)
+        mu, std = self.forward(x)
+        return torch.distributions.Normal(mu, std)
 
     def sample(self, x):
         return self.dist(x).sample()
@@ -68,14 +52,14 @@ class GaussianPolicy(nn.Module):
 
 
 class ValueNet(nn.Module):
-    def __init__(self, obs_dim, hidden=256):
+    def __init__(self, obs_dim, hidden1=512, hidden2=256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden),
+            nn.Linear(obs_dim, hidden1),
             nn.ReLU(),
-            nn.Linear(hidden, hidden),
+            nn.Linear(hidden1, hidden2),
             nn.ReLU(),
-            nn.Linear(hidden, 1),
+            nn.Linear(hidden2, 1),
         )
 
     def forward(self, x):
@@ -89,7 +73,6 @@ class DMControlVmpoTrainer:
         task: str,
         rollout_steps: int,
         gamma: float,
-        lam: float,
         lr: float,
         n_temperature_epsilon: float,
         eta_initial: float,
@@ -133,7 +116,6 @@ class DMControlVmpoTrainer:
         # Rollout / GAE hyper-parameters
         self.rollout_steps = rollout_steps
         self.gamma = gamma
-        self.lam = lam
         # ε_η  – the KL bound on the E-step weight distribution.
         # Smaller → more uniform weights → more conservative updates.
         self.n_temperature_epsilon = n_temperature_epsilon
@@ -224,8 +206,25 @@ class DMControlVmpoTrainer:
         # Data Collection  –  rollout with behaviour policy π_old
         s, a, r, bootstrap_masks, v, v_next, episode_returns = self.collect()
 
-        # Advantage Estimation (GAE-λ)
-        adv, ret = compute_gae(r, v, v_next, bootstrap_masks, self.gamma, self.lam)
+        # --- N-step Monte Carlo returns (V-MPO style) ---
+
+        T = r.shape[0]
+        returns = torch.zeros(T, device=device)
+
+        G = 0.0
+        for t in reversed(range(T)):
+            G = r[t] + self.gamma * bootstrap_masks[t] * G
+            returns[t] = G
+
+        # Single bootstrap from the last value estimate
+        returns += (
+            (self.gamma ** torch.arange(T, device=device))
+            * v_next[-1]
+            * bootstrap_masks[-1]
+        )
+
+        # Advantages
+        adv = returns - v
 
         # Advantage Pre-processing (Top-K Masking)
         # We only want to weight the "good" half of the samples.
@@ -333,7 +332,7 @@ class DMControlVmpoTrainer:
 
         for _ in range(self.n_value_updates):
             values = self.value(s)
-            value_loss = ((values - ret) ** 2).mean()
+            value_loss = ((values - returns) ** 2).mean()
 
             self.opt_v.zero_grad()
             value_loss.backward()
@@ -467,9 +466,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor γ")
     parser.add_argument(
-        "--lam", type=float, default=0.95, help="GAE λ (bias-variance trade-off)"
-    )
-    parser.add_argument(
         "--lr",
         type=float,
         default=3e-4,
@@ -541,7 +537,6 @@ if __name__ == "__main__":
         task=args.task,
         rollout_steps=args.rollout_steps,
         gamma=args.gamma,
-        lam=args.lam,
         lr=args.lr,
         n_temperature_epsilon=args.n_temperature_epsilon,
         eta_initial=args.eta_initial,
