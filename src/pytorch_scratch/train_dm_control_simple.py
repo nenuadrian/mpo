@@ -159,8 +159,6 @@ class DMControlVmpoTrainer:
 
         self.domain = domain
         self.task = task
-        
-        self.learn_iter = 0
 
     def collect(self):
         obs, acts, rews, bootstrap_masks, vals, next_vals = [], [], [], [], [], []
@@ -223,7 +221,6 @@ class DMControlVmpoTrainer:
 
     def train_once(self):
 
-        self.learn_iter += 1
         # Data Collection  –  rollout with behaviour policy π_old
         s, a, r, bootstrap_masks, v, v_next, episode_returns = self.collect()
 
@@ -345,8 +342,7 @@ class DMControlVmpoTrainer:
 
             total_value_loss += value_loss.item()
 
-        if self.learn_iter % 5 == 0:
-            self.policy_old.load_state_dict(self.policy.state_dict())
+        self.policy_old.load_state_dict(self.policy.state_dict())
 
         # DUAL η UPDATE  –  E-step temperature optimisation
         # We perform this ONCE per rollout using the cached `adv`.
