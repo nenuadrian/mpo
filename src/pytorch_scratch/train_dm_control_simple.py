@@ -260,7 +260,7 @@ class DMControlVmpoTrainer:
         self.domain = domain
         self.task = task
 
-        self.popart = PopArt(device=device, beta=1e-3, eps_var=1e-6, sigma_min=1e-2)
+        self.popart = PopArt(device=device, beta=3e-4, eps_var=1e-6, sigma_min=1e-4)
 
         self.learn_iter = 0
         self.T_target = t_target
@@ -635,7 +635,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eps_alpha_mu",
         type=float,
-        default=1.0,
+        default=0.05,
         help="ε_α for mean KL constraint (smaller → more conservative)",
     )
     parser.add_argument(
@@ -671,7 +671,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--t_target",
         type=int,
-        default=5,
+        default=16,
     )
     args = parser.parse_args()
 
