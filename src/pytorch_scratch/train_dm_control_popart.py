@@ -132,6 +132,10 @@ class GaussianPolicy(nn.Module):
         log_std = self.log_std_head(h).clamp(-5.0, 1.0)
         return mu, log_std.exp()
 
+    def dist(self, x):
+        mu, std = self.forward(x)
+        return torch.distributions.Normal(mu, std)
+
     def sample(self, x):
         return self.dist(x).sample()
 
