@@ -128,20 +128,21 @@ class ValueNet(nn.Module):
 class DMControlBatchTrainer:
     def __init__(
         self,
-        domain="cheetah",
-        task="run",
-        rollout_steps=4096,
-        gamma=0.99,
-        lam=0.95,
-        lr=3e-4,
-        n_temperature_epsilon=0.1,
-        eta_initial=0.0,
-        seed: int = 42,
-        eps_alpha_mu: float = 0.5,
-        eps_alpha_sigma: float = 0.01,
-        top_k_fraction: float = 1.0,
-        n_value_updates: int = 2,
-        n_policy_updates: int = 4,
+        domain: str,
+        task: str,
+        rollout_steps: int,
+        gamma: float,
+        lam: float,
+        lr: float,
+        n_temperature_epsilon: float,
+        eta_initial: float,
+        seed: int,
+        eps_alpha_mu: float,
+        eps_alpha_sigma: float,
+        top_k_fraction: float,
+        n_value_updates: int,
+        n_policy_updates: int,
+        eta_lr: float,
     ):
         set_seed(seed)
         self.env = make_dm_control_env(domain, task, seed=seed)
@@ -171,7 +172,7 @@ class DMControlBatchTrainer:
         # η (eta) – the E-step temperature, stored in log-space so that
         # exp(self.eta) is always positive.  Optimised with its own Adam.
         self.eta = nn.Parameter(torch.tensor(eta_initial, device=device))
-        self.opt_eta = optim.Adam([self.eta], lr=1e-3)
+        self.opt_eta = optim.Adam([self.eta], lr=eta_lr)
 
         # Rollout / GAE hyper-parameters
         self.rollout_steps = rollout_steps
@@ -185,8 +186,8 @@ class DMControlBatchTrainer:
         self.log_alpha_mu = nn.Parameter(torch.tensor(np.log(5.0), device=device))
         self.log_alpha_sigma = nn.Parameter(torch.tensor(np.log(1.0), device=device))
 
-        self.opt_alpha_mu = optim.Adam([self.log_alpha_mu], lr=1e-3)
-        self.opt_alpha_sigma = optim.Adam([self.log_alpha_sigma], lr=1e-3)
+        self.opt_alpha_mu = optim.Adam([self.log_alpha_mu], lr=lr)
+        self.opt_alpha_sigma = optim.Adam([self.log_alpha_sigma], lr=lr)
 
         # Separate trust-region constraints
         self.eps_alpha_mu = eps_alpha_mu
@@ -586,7 +587,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_temperature_epsilon",
         type=float,
-        default=0.1,
+        default=0.5,
         help="ε_η – KL bound on E-step weight distribution",
     )
     parser.add_argument(
@@ -619,8 +620,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--top_k_fraction",
         type=float,
-        default=1.0,
+        default=0.5,
         help="Fraction of samples to keep based on advantage (top-k masking for trust-region filtering)",
+    )
+    parser.add_argument(
+        "--n_value_updates",
+        type=int,
+        default=2,
+        help="Number of value function updates per iteration",
+    )
+    parser.add_argument(
+        "--n_policy_updates",
+        type=int,
+        default=4,
+        help="Number of policy updates per iteration",
+    )
+    parser.add_argument(
+        "--eta_lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate for dual variable η",
     )
     args = parser.parse_args()
 
@@ -646,5 +665,8 @@ if __name__ == "__main__":
         eps_alpha_mu=args.eps_alpha_mu,
         eps_alpha_sigma=args.eps_alpha_sigma,
         top_k_fraction=args.top_k_fraction,
+        n_value_updates=args.n_value_updates,
+        n_policy_updates=args.n_policy_updates,
+        eta_lr=args.eta_lr,
     ).train(iters=args.iters)
     wandb.finish()
