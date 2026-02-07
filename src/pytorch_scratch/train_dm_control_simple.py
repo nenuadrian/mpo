@@ -532,7 +532,7 @@ if __name__ == "__main__":
         project="dm-control-vmpo",
         config=vars(args),
         group=f"{args.domain}-{args.task}",
-        name=f"{args.domain}-{args.task}-vmpo-eta{args.eta_initial}-topk{args.top_k_fraction}-eps{args.n_temperature_epsilon}-seed{args.seed}",
+        name=f"{args.domain}-{args.task}-vmpo-eta{args.eta_initial}-eps{args.n_temperature_epsilon}-seed{args.seed}",
     )
 
     DMControlVmpoTrainer(
@@ -547,7 +547,6 @@ if __name__ == "__main__":
         seed=args.seed,
         eps_alpha_mu=args.eps_alpha_mu,
         eps_alpha_sigma=args.eps_alpha_sigma,
-        top_k_fraction=args.top_k_fraction,
         n_value_updates=args.n_value_updates,
         n_policy_updates=args.n_policy_updates,
         eta_lr=args.eta_lr,
