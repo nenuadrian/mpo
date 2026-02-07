@@ -147,19 +147,16 @@ class GaussianPolicy(nn.Module):
 class ValueNet(nn.Module):
     def __init__(self, obs_dim, hidden1=512, hidden2=256):
         super().__init__()
-        self.net = nn.Sequential(
+        self.body = nn.Sequential(
             nn.Linear(obs_dim, hidden1),
             nn.ReLU(),
             nn.Linear(hidden1, hidden2),
             nn.ReLU(),
-            nn.Linear(hidden2, 1),
         )
+        self.head = nn.Linear(hidden2, 1)
 
     def forward(self, x):
-        return self.net(x).squeeze(-1)
-    
-    def head(self):
-        return self.net[-1]
+        return self.head(self.body(x)).squeeze(-1)
 
 
 class DMControlVmpoTrainer:
