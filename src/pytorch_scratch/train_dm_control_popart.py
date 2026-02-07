@@ -157,6 +157,9 @@ class ValueNet(nn.Module):
 
     def forward(self, x):
         return self.net(x).squeeze(-1)
+    
+    def head(self):
+        return self.net[-1]
 
 
 class DMControlVmpoTrainer:
