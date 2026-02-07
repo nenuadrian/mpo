@@ -1,5 +1,3 @@
-"""V-MPO (On-Policy Maximum a Posteriori Policy Optimisation) for dm_control."""
-
 import argparse
 import copy
 import random
@@ -13,46 +11,11 @@ import torch.optim as optim
 import wandb
 import os
 
+from utils import set_seed, make_dm_control_env, evaluate, flatten_obs
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    # Best-effort determinism (may impact performance)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def make_dm_control_env(domain, task, seed=None, render_mode=None):
-    """Create a dm_control environment via shimmy's Gymnasium wrapper."""
-    env = gym.make(
-        f"dm_control/{domain}-{task}-v0",
-        render_mode=render_mode,
-    )
-    if seed is not None:
-        env.reset(seed=seed)
-        try:
-            env.action_space.seed(seed)
-        except Exception:
-            pass
-    return env
-
-
-def flatten_obs(obs):
-    """Flatten a dm_control observation dict/OrderedDict into a 1-D numpy array."""
-    if isinstance(obs, dict):
-        parts = []
-        for key in sorted(obs.keys()):
-            parts.append(np.asarray(obs[key], dtype=np.float32).flatten())
-        return np.concatenate(parts)
-    return np.asarray(obs, dtype=np.float32).flatten()
-
-
-# Generalised Advantage Estimation (GAE)
 def compute_gae(rewards, values, next_values, bootstrap_masks, gamma=0.99, lam=0.95):
     """Compute GAE-λ advantages and corresponding value-function targets.
 
@@ -119,13 +82,7 @@ class ValueNet(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-# VMPO Trainer
-# Orchestrates the full VMPO training loop:
-#   - Maintains two copies of the policy: π_θ (updated) and π_old (behaviour).
-#   - Maintains a learned temperature η (stored in log-space for positivity).
-#   - Each iteration: collect → GAE → E-step → M-step → dual η update →
-#     value update → sync π_old ← π_θ.
-class DMControlBatchTrainer:
+class DMControlVmpoTrainer:
     def __init__(
         self,
         domain: str,
@@ -205,15 +162,7 @@ class DMControlBatchTrainer:
         self.domain = domain
         self.task = task
 
-    # Data Collection  (rollout with π_old)
-
     def collect(self):
-        """Collect a fixed-length rollout using the behaviour policy π_old.
-
-        Returns tensors of observations, actions, rewards, bootstrap masks,
-        value estimates V(s_t), next value estimates V(s_{t+1}), and a list of
-        completed episode returns for logging.
-        """
         obs, acts, rews, bootstrap_masks, vals, next_vals = [], [], [], [], [], []
 
         s, _ = self.env.reset()
@@ -472,51 +421,13 @@ class DMControlBatchTrainer:
 
         return metrics
 
-    def evaluate(self, n_episodes=10, max_steps=1000):
-        env = make_dm_control_env(self.domain, self.task)
-        returns = []
-
-        for _ in range(n_episodes):
-            obs, _ = env.reset()
-            obs = flatten_obs(obs)
-            ep_return = 0.0
-
-            for _ in range(max_steps):
-                obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
-
-                with torch.no_grad():
-                    mean, _ = self.policy(obs_t)
-                    action = mean.cpu().numpy().squeeze(0)
-
-                action = np.clip(
-                    action,
-                    env.action_space.low,
-                    env.action_space.high,
-                )
-
-                obs, reward, terminated, truncated, _ = env.step(action)
-                obs = flatten_obs(obs)
-
-                ep_return += reward
-                if terminated or truncated:
-                    break
-
-            returns.append(ep_return)
-
-        env.close()
-
-        return {
-            "eval/return_mean": float(np.mean(returns)),
-            "eval/return_std": float(np.std(returns)),
-            "eval/return_min": float(np.min(returns)),
-            "eval/return_max": float(np.max(returns)),
-        }
-
     def train(self, iters=10_000):
         for it in range(iters):
             info = self.train_once()
             if it % 30 == 0:
-                eval_metrics = self.evaluate(n_episodes=10)
+                eval_metrics = evaluate(
+                    self.policy, self.domain, self.task, n_episodes=10
+                )
                 info.update(eval_metrics)
             wandb.log(info, step=self.total_env_steps)
             if it % 10 == 0:
@@ -557,14 +468,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--domain",
         type=str,
-        default="cheetah",
-        help="dm_control domain name (e.g. cheetah, walker, cartpole, humanoid)",
     )
     parser.add_argument(
         "--task",
         type=str,
-        default="run",
-        help="dm_control task name (e.g. run, walk, swingup, stand)",
     )
     parser.add_argument(
         "--rollout_steps",
@@ -601,7 +508,6 @@ if __name__ == "__main__":
         "--seed",
         type=int,
         default=42,
-        help="Random seed for reproducibility",
     )
     parser.add_argument(
         "--eps_alpha_mu",
@@ -650,7 +556,7 @@ if __name__ == "__main__":
         name=f"{args.domain}-{args.task}-vmpo-eta{args.eta_initial}-topk{args.top_k_fraction}-eps{args.n_temperature_epsilon}-seed{args.seed}",
     )
 
-    DMControlBatchTrainer(
+    DMControlVmpoTrainer(
         domain=args.domain,
         task=args.task,
         rollout_steps=args.rollout_steps,

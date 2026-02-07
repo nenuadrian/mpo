@@ -5,15 +5,11 @@ import gymnasium as gym
 import numpy as np
 import shimmy  # noqa: F401
 import torch
-import torch.nn as nn
 import imageio
 
-from train_dm_control_batch import (
-    make_dm_control_env,
-    flatten_obs,
-    GaussianPolicy,
-    set_seed,
-)
+from train_dm_control_simple import GaussianPolicy
+
+from utils import set_seed, make_dm_control_env, flatten_obs
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
