@@ -1,0 +1,42 @@
+site_name: MPO Research Report
+site_description: On implementing Maximum a Posteriori Policy Optimization (MPO)
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Full Report: report.md
+  - Source Folders:
+      - acme_pytorch: src/acme_pytorch.md
+      - acme_pytorch_sync: src/acme_pytorch_sync.md
+      - acme_tf_launchpad: src/acme_tf_launchpad.md
+      - acme_tf_reduced_deps: src/acme_tf_reduced_deps.md
+      - acme_vmpo_pytorch: src/acme_vmpo_pytorch.md
+      - mog_pytorch: src/mog_pytorch.md
+      - pytorch_custom: src/pytorch_custom.md
+      - pytorch_scratch: src/pytorch_scratch.md
+      - transformer_bandits: src/transformer_bandits.md
+      - transformer_md: src/transformer_md.md
+      - transformer_mpo_control: src/transformer_mpo_control.md
