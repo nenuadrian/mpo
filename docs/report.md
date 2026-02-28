@@ -56,7 +56,7 @@ python examples/tf/control_suite/lp_mpo.py
 
 Somewhat consolidated code from within acme still depending on acme but brought toegther in one file. Depends on many DM projects such as `dm-reverb`, `dm-env`, `dm-tree`, `dm-launchpad`, `acme`, `sonnet` etc.
 
-[src/acme_tf_launchpad/train.py](src/acme_tf_launchpad/train.py)
+[src/acme_tf_launchpad](src/acme_tf_launchpad.md)
 
 ```bash
 export MUJOCO_GL=egl
@@ -76,7 +76,7 @@ python src/acme_tf_launchpad/visualize_acme_results.py --output results/acme_tf.
 
 ## II - Single file Acme TF based on I with only dm-Reverb and dm-Sonnet (ATFRS)
 
-Not able to remove dependencies further as Sonnet and Reverb are tightly integrated. But removed Acme and Launchpad dependencies. [src/acme_tf_reduced_deps/train.py](src/acme_tf_reduced_deps/train.py)
+Not able to remove dependencies further as Sonnet and Reverb are tightly integrated. But removed Acme and Launchpad dependencies. [src/acme_tf_reduced_deps](src/acme_tf_reduced_deps.md)
 
 ```bash
 python src/acme_tf_reduced_deps/train.py --max_actor_steps 3000000 --domain cheetah --task run
@@ -119,7 +119,7 @@ python src/acme_pytorch/generate_video_acme_pytorch_mpo.py logs/mpo_experiment/i
 
 ## IV - Single-threaded Implementation of III
 
-[src/acme_pytorch_sync/train.py](src/acme_pytorch_sync/train.py)
+[src/acme_pytorch_sync](src/acme_pytorch_sync.md)
 
 ### Results IV
 
@@ -159,7 +159,7 @@ python src/pytorch_custom/generate_video_custom_pytorch_mpo.py logs/mpo_experime
 
 ## VI - V-MPO based on IV
 
-[src/acme_vmpo_pytorch/train.py](src/acme_vmpo_pytorch/train.py)
+[src/acme_vmpo_pytorch](src/acme_vmpo_pytorch.md)
 
 ### Results VI
 
@@ -171,7 +171,7 @@ python src/visualize_wandb.py --project-metric "acme_pytorch_vmpo_sync::eval/epi
 
 ## VII - MoG MPO based on IV
 
-[src/mog_pytorch/train.py](src/mog_pytorch/train.py)
+[src/mog_pytorch](src/mog_pytorch.md)
 
 ### Results VII
 

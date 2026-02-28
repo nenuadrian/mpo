@@ -19,6 +19,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      MKDOCS_THEME: material
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
