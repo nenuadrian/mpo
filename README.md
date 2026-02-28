@@ -1,5 +1,7 @@
 # On implementing Maximum a Posteriori Policy Optimization (MPO)
 
+[![Deploy Docs](https://github.com/nenuadrian/mpo/actions/workflows/deploy-docs.yml/badge.svg)](https://github.com/nenuadrian/mpo/actions/workflows/deploy-docs.yml)
+
 - [On implementing Maximum a Posteriori Policy Optimization (MPO)](#on-implementing-maximum-a-posteriori-policy-optimization-mpo)
   - [Original MPO Paper](#original-mpo-paper)
   - [Using Google DeepMind Acme](#using-google-deepmind-acme)
